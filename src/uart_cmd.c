@@ -1,0 +1,193 @@
+#include "uart_cmd.h"
+#include "config.h"
+
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "pico/stdlib.h"
+#include "pico/error.h"
+#include "hardware/gpio.h"
+#include "hardware/uart.h"
+
+#ifndef M65_ENABLE_USB_CDC
+#define M65_ENABLE_USB_CDC 1
+#endif
+
+typedef enum {
+    CMD_SRC_UART = 0,
+    CMD_SRC_USB  = 1,
+} cmd_source_t;
+
+static cmd_source_t last_cmd_source = CMD_SRC_UART;
+
+void uart_cmd_init(void)
+{
+    uart_init(M65_UART_ID, M65_UART_BAUD);
+    gpio_set_function(M65_UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(M65_UART_RX_PIN, GPIO_FUNC_UART);
+    uart_set_format(M65_UART_ID, 8, 1, UART_PARITY_NONE);
+    uart_set_hw_flow(M65_UART_ID, false, false);
+    uart_set_fifo_enabled(M65_UART_ID, true);
+}
+
+static bool feed_line_char(char c, char *buf, size_t buflen, size_t *pos)
+{
+    if (c == '\r') return false;
+    if (c == '\n') {
+        buf[*pos] = 0;
+        *pos = 0;
+        return true;
+    }
+    if (*pos + 1 < buflen) {
+        buf[(*pos)++] = c;
+    } else {
+        // Overflow: drop the partial line. The eventual newline returns blank.
+        *pos = 0;
+    }
+    return false;
+}
+
+bool uart_cmd_read_line(char *buf, size_t buflen)
+{
+    static size_t uart_pos = 0;
+    static size_t usb_pos = 0;
+
+    if (!buf || buflen == 0) return false;
+
+    while (uart_is_readable(M65_UART_ID)) {
+        char c = (char)uart_getc(M65_UART_ID);
+        if (feed_line_char(c, buf, buflen, &uart_pos)) {
+            last_cmd_source = CMD_SRC_UART;
+            return true;
+        }
+    }
+
+#if M65_ENABLE_USB_CDC
+    // Pull USB CDC/stdin data in chunks through the Pico SDK stdio layer.
+    // This avoids the byte-at-a-time getchar_timeout_us() path without
+    // taking ownership of TinyUSB descriptors directly.
+    char tmp[128];
+    int n = 0;
+    while ((n = stdio_get_until(tmp, (int)sizeof tmp, get_absolute_time())) > 0) {
+        for (int i = 0; i < n; i++) {
+            if (feed_line_char(tmp[i], buf, buflen, &usb_pos)) {
+                last_cmd_source = CMD_SRC_USB;
+                return true;
+            }
+        }
+    }
+#endif
+
+    return false;
+}
+
+static bool read_uart_bytes_bulk(uint8_t *buf, size_t len, uint32_t timeout_ms)
+{
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    size_t pos = 0;
+
+    while (pos < len) {
+        while (pos < len && uart_is_readable(M65_UART_ID)) {
+            buf[pos++] = (uint8_t)uart_getc(M65_UART_ID);
+            deadline = make_timeout_time_ms(timeout_ms); // timeout is an inter-byte gap timeout
+        }
+        if (pos >= len) break;
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) return false;
+        tight_loop_contents();
+    }
+
+    return true;
+}
+
+static bool read_usb_bytes_bulk(uint8_t *buf, size_t len, uint32_t timeout_ms)
+{
+#if M65_ENABLE_USB_CDC
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    size_t pos = 0;
+
+    while (pos < len) {
+        size_t want = len - pos;
+        if (want > 8192) want = 8192;
+
+        int n = stdio_get_until((char *)(buf + pos), (int)want, deadline);
+        if (n > 0) {
+            pos += (size_t)n;
+            deadline = make_timeout_time_ms(timeout_ms); // timeout is a quiet-gap timeout
+            continue;
+        }
+
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) return false;
+        tight_loop_contents();
+    }
+
+    return true;
+#else
+    (void)buf; (void)len; (void)timeout_ms;
+    return false;
+#endif
+}
+
+bool uart_cmd_read_bytes(uint8_t *buf, size_t len, uint32_t timeout_ms)
+{
+    if (!buf && len) return false;
+    if (len == 0) return true;
+
+    if (last_cmd_source == CMD_SRC_USB) {
+        return read_usb_bytes_bulk(buf, len, timeout_ms);
+    }
+    return read_uart_bytes_bulk(buf, len, timeout_ms);
+}
+
+void uart_cmd_puts(const char *s)
+{
+    if (!s) return;
+
+    // Broadcast replies to both command ports. That is deliberately simple:
+    // native MEGA65-side UART control and PC-side USB CDC both see the same log.
+    uart_puts(M65_UART_ID, s);
+#if M65_ENABLE_USB_CDC
+    // pico_enable_stdio_usb() routes stdout to USB CDC. Keep replies simple;
+    // only the binary receive path needs chunking.
+    fputs(s, stdout);
+    fflush(stdout);
+#endif
+}
+
+void uart_cmd_printf(const char *fmt, ...)
+{
+    char tmp[384];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    uart_cmd_puts(tmp);
+}
+
+char *trim_line(char *s)
+{
+    if (!s) return s;
+    while (*s && isspace((unsigned char)*s)) s++;
+    char *e = s + strlen(s);
+    while (e > s && isspace((unsigned char)e[-1])) *--e = 0;
+    return s;
+}
+
+char *unquote_filename(char *s)
+{
+    s = trim_line(s);
+    if (!s || !*s) return s;
+    if (*s == '"' || *s == '\'') {
+        char q = *s++;
+        char *w = s;
+        char *r = s;
+        while (*r && *r != q) {
+            if (*r == '\\' && r[1]) r++;
+            *w++ = *r++;
+        }
+        *w = 0;
+        return s;
+    }
+    return s;
+}
