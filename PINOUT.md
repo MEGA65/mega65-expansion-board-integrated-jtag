@@ -8,8 +8,8 @@ J2/XMOD pin names from the standard XMOD firmware mapping.
 
 | Pico GPIO | Firmware signal | Direction at Pico | Suggested target/socket connection |
 |---:|---|---|---|
-| GP0 | UART TX | output | Whatever UART adaptor you choose -- not the M65 TE0790 header |
-| GP1 | UART RX | input | Whatever UART adaptor you choose -- not the M65 TE0790 header |
+| GP0 | UART TX | output | J2 **B** / UART TXD output from adapter, to target RX |
+| GP1 | UART RX | input | J2 **A** / UART RXD input to adapter, from target TX |
 | GP2 | SD SCK | output | microSD SCK |
 | GP3 | SD MOSI | output | microSD MOSI / CMD in SPI mode |
 | GP4 | SD MISO | input | microSD MISO / DAT0 in SPI mode |
@@ -19,6 +19,8 @@ J2/XMOD pin names from the standard XMOD firmware mapping.
 | GP8 | JTAG TDI | output | J2 **F** / TDI, through hijack switch |
 | GP9 | JTAG TDO | input | J2 **D** / TDO; can normally be shared/listened to |
 | GP10 | JTAG_HIJACK | output | control input of external JTAG mux/switch |
+| GP11 | DONE | input | FPGA DONE, optional; set to 255 in config.h if absent |
+| GP12 | INIT_B | input | FPGA INIT_B, optional; set to 255 in config.h if absent |
 
 Also connect Pico GND to J2 pin **1/GND**. Do not power the Pico from arbitrary
 JTAG pins unless you have deliberately designed the power path. The Pico is 3.3 V

@@ -37,6 +37,27 @@ static void list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
     uart_cmd_printf("%s %lu %s\n", is_dir ? "DIR" : "CORE", (unsigned long)size, name);
 }
 
+static void print_xilinx_status(const char *prefix, const jtag_status_t *st)
+{
+    if (!st) {
+        uart_cmd_printf("%s invalid\n", prefix);
+        return;
+    }
+
+    uint32_t stat = st->stat;
+    uart_cmd_printf(
+        "%s idcode=%08lx bootsts=%s%08lx stat=%s%08lx bypass=%s%08lx done=%lu release_done=%lu eos=%lu startup=%lu\n",
+        prefix,
+        (unsigned long)st->idcode,
+        st->bootsts_valid ? "" : "?", (unsigned long)st->bootsts,
+        st->stat_valid ? "" : "?", (unsigned long)st->stat,
+        st->bypass_valid ? "" : "?", (unsigned long)st->bypass,
+        (unsigned long)((stat >> 14) & 1u),
+        (unsigned long)((stat >> 13) & 1u),
+        (unsigned long)((stat >> 4) & 1u),
+        (unsigned long)((stat >> 18) & 7u));
+}
+
 static void cmd_help(void)
 {
     uart_cmd_puts(
@@ -44,10 +65,12 @@ static void cmd_help(void)
         "V                         version\n"
         "L [path]                  list .BIT/.COR/.M65J files and dirs\n"
         "I <file>                  inspect core file\n"
+        "T <file>                  read core payload from SD/FAT and discard; speed test\n"
         "P <file>                  hijack JTAG and program core from SD/FAT\n"
         "S <length> <idcode>        stream raw Xilinx payload over this serial link\n"
         "N <length>                 receive/discard bytes; serial throughput test\n"
         "J                         read JTAG IDCODE, using hijack\n"
+        "X                         read Xilinx BOOTSTS/STAT/BYPASS via CFG_OUT\n"
         "H 1|0                     manually assert/release JTAG hijack\n"
         "M                         mount/remount SD card\n"
         "?                         help\n"
@@ -109,6 +132,16 @@ static void cmd_jtag_id(void)
     uint32_t id = jtag_read_idcode();
     jtag_hijack_release();
     uart_cmd_printf("OK J %08lx\n", (unsigned long)id);
+}
+
+static void cmd_xilinx_status(void)
+{
+    jtag_status_t st;
+    jtag_hijack_claim();
+    bool ok = jtag_read_xilinx_status(&st);
+    jtag_hijack_release();
+    if (ok) print_xilinx_status("OK X", &st);
+    else uart_cmd_printf("ERR X %s\n", jtag_last_error());
 }
 
 static void cmd_hijack(char *arg)
@@ -246,10 +279,88 @@ static void cmd_stream_program(char *arg)
     gpio_put(M65_LED_PIN, 0);
 
     if (ok) {
+        jtag_status_t st;
+        if (jtag_get_last_status(&st)) print_xilinx_status("XSTAT S", &st);
         uart_cmd_puts("OK S DONE\n");
     } else {
         uart_cmd_printf("ERR S %s\n", jtag_last_error());
     }
+}
+
+
+static void cmd_test_read(char *arg)
+{
+    if (!ensure_mount()) return;
+    char *name = unquote_filename(arg);
+    if (!name[0]) {
+        uart_cmd_puts("ERR T missing filename\n");
+        return;
+    }
+
+    core_file_t cf;
+    if (!core_open(&cf, name)) {
+        uart_cmd_printf("ERR T %s\n", core_last_error());
+        return;
+    }
+
+    uart_cmd_printf("OK T OPEN %s kind=%s payload_offset=%lu payload_length=%lu expected_idcode=%08lx\n",
+                    cf.path,
+                    core_kind_name(cf.kind),
+                    (unsigned long)cf.payload_offset,
+                    (unsigned long)cf.payload_length,
+                    (unsigned long)cf.expected_idcode);
+
+    if (!core_rewind_payload(&cf)) {
+        uart_cmd_printf("ERR T rewind failed: %s\n", storage_last_error());
+        core_close(&cf);
+        return;
+    }
+
+    static uint8_t buf[8192];
+    uint32_t remaining = cf.payload_length;
+    uint32_t done = 0;
+    absolute_time_t start = get_absolute_time();
+
+    gpio_put(M65_LED_PIN, 1);
+    while (remaining) {
+        size_t want = remaining > sizeof buf ? sizeof buf : remaining;
+        size_t got = 0;
+        if (!core_read_payload(&cf, buf, want, &got)) {
+            gpio_put(M65_LED_PIN, 0);
+            uart_cmd_printf("ERR T read failed at %lu/%lu: %s\n",
+                            (unsigned long)done,
+                            (unsigned long)cf.payload_length,
+                            storage_last_error());
+            core_close(&cf);
+            return;
+        }
+        if (got == 0) {
+            gpio_put(M65_LED_PIN, 0);
+            uart_cmd_printf("ERR T short read at %lu/%lu\n",
+                            (unsigned long)done,
+                            (unsigned long)cf.payload_length);
+            core_close(&cf);
+            return;
+        }
+        done += (uint32_t)got;
+        remaining -= (uint32_t)got;
+        if ((done & 0x3ffffu) == 0 || done == cf.payload_length) {
+            uart_cmd_printf("READ %lu/%lu\n",
+                            (unsigned long)done,
+                            (unsigned long)cf.payload_length);
+        }
+    }
+    gpio_put(M65_LED_PIN, 0);
+
+    int64_t us = absolute_time_diff_us(start, get_absolute_time());
+    if (us <= 0) us = 1;
+    uint32_t kb_s = (uint32_t)(((uint64_t)cf.payload_length * 1000000ull) / ((uint64_t)us * 1024ull));
+    uart_cmd_printf("OK T DONE bytes=%lu time_us=%lld rate_kBps=%lu\n",
+                    (unsigned long)cf.payload_length,
+                    (long long)us,
+                    (unsigned long)kb_s);
+
+    core_close(&cf);
 }
 
 static void cmd_program(char *arg)
@@ -287,6 +398,8 @@ static void cmd_program(char *arg)
     gpio_put(M65_LED_PIN, 0);
 
     if (ok) {
+        jtag_status_t st;
+        if (jtag_get_last_status(&st)) print_xilinx_status("XSTAT P", &st);
         uart_cmd_puts("OK P DONE\n");
     } else {
         uart_cmd_printf("ERR P %s\n", jtag_last_error());
@@ -307,10 +420,12 @@ static void dispatch(char *line)
     case 'V': cmd_version(); break;
     case 'L': cmd_list(arg); break;
     case 'I': cmd_info(arg); break;
+    case 'T': cmd_test_read(arg); break;
     case 'P': cmd_program(arg); break;
     case 'S': cmd_stream_program(arg); break;
     case 'N': cmd_sink_stream(arg); break;
     case 'J': cmd_jtag_id(); break;
+    case 'X': cmd_xilinx_status(); break;
     case 'H': cmd_hijack(arg); break;
     case 'M': cmd_mount(); break;
     case '?': cmd_help(); break;

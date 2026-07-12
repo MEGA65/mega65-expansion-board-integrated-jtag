@@ -21,7 +21,8 @@
 #define M65_SD_MOSI_PIN      3u
 #define M65_SD_MISO_PIN      4u
 #define M65_SD_CS_PIN        5u
-#define M65_SD_SPI_BAUD      12500000u
+// #define M65_SD_SPI_BAUD      12500000u
+#define M65_SD_SPI_BAUD      33000000u
 
 // Pico-side JTAG pins.
 #define M65_JTAG_TCK_PIN     6u
@@ -43,4 +44,12 @@
 // This is a loop count, not an exact frequency. Use a scope and tune it.
 #define M65_JTAG_DELAY_LOOPS 0u
 
-#define M65_VERSION_STRING   "pico-m65jtag 0.9-stdiobulk"
+// Conservative JTAG configuration close-out. Some bitstreams appear to need
+// more post-JSTART clocks before the FPGA has fully completed startup. These
+// are intentionally generous for bring-up; trim later once behaviour is known.
+#define M65_JTAG_POST_JSTART_IDLE_CLOCKS     100000u
+#define M65_JTAG_POST_ISC_NOOP_IDLE_CLOCKS   4096u
+#define M65_JTAG_POST_BYPASS_IDLE_CLOCKS     1024u
+#define M65_JTAG_POST_TAP_RESET_IDLE_CLOCKS  1024u
+
+#define M65_VERSION_STRING   "pico-m65jtag 1.2-xstatus"

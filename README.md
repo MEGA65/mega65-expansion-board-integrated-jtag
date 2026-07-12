@@ -167,3 +167,38 @@ The JTAG bit ordering is:
 - IR instructions: LSB-first
 - IDCODE/status DR reads: LSB-first
 - Xilinx CFG_IN payload bytes: MSB-first per byte
+
+## v1.2 Xilinx status / close-out diagnostics
+
+This build keeps the v1.1 conservative post-configuration close-out and adds
+Xilinx configuration-register diagnostics via JTAG `CFG_IN`/`CFG_OUT`.
+
+New command:
+
+```text
+X                         read JTAG IDCODE plus Xilinx BOOTSTS/STAT/BYPASS
+```
+
+After `P <file>` or `stream <local.bit>`, the firmware now prints a diagnostic
+line before the terminal `OK ... DONE` line:
+
+```text
+XSTAT P idcode=13636093 bootsts=xxxxxxxx stat=xxxxxxxx bypass=xxxxxxxx done=1 release_done=1 eos=1 startup=...
+OK P DONE
+```
+
+or for streamed host payloads:
+
+```text
+XSTAT S ...
+OK S DONE
+```
+
+The `done`, `release_done`, `eos`, and `startup` fields are decoded from the
+raw STAT word using the same fields that the original `mega65-tools` JTAG path
+logged.  The raw `bootsts` and `stat` values are the important data for comparing
+a working MEGA65 core with a failing AExp/Amiga core.
+
+Caveat: the CFG_OUT readback path is still a first-cut single-device-chain
+implementation.  The raw values are diagnostic; if they look byte/bit-swapped,
+compare working-vs-failing runs rather than trusting the decoded fields yet.

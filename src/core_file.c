@@ -74,18 +74,25 @@ static bool parse_xilinx_bit_at(core_file_t *cf, uint32_t base)
         return false;
     }
 
-    // There is normally a second short header item before tagged fields begin.
+    // Xilinx .bit files normally have:
+    //   uint16 magic_len
+    //   magic bytes
+    //   uint16 0x0001
+    //   'a' uint16 design_name_len design_name
+    //   'b' uint16 part_len        part
+    //   'c' uint16 date_len        date
+    //   'd' uint16 time_len        time
+    //   'e' uint32 payload_len     raw config payload
+    //
+    // Do NOT treat the 0x0001 marker as a length field. Doing so skips
+    // the following 'a' tag and makes the next byte appear to be tag 0x00.
     if (!read_exact(&cf->file, b, 2)) {
-        set_err("cannot read .bit secondary header length");
+        set_err("cannot read .bit marker");
         return false;
     }
-    n = be16(b);
-    if (n > 1024) {
-        set_err("bad .bit secondary header length");
-        return false;
-    }
-    if (!skip_bytes(&cf->file, n)) {
-        set_err("cannot skip .bit secondary header");
+    uint16_t marker = be16(b);
+    if (marker != 1) {
+        set_err("bad .bit marker after magic");
         return false;
     }
 
@@ -122,6 +129,9 @@ static bool parse_xilinx_bit_at(core_file_t *cf, uint32_t base)
                 }
                 storage_seek(&cf->file, save);
             }
+            // 0xffffffff is normally a Xilinx dummy word near the start of
+            // the payload, not a useful expected IDCODE. Treat it as unknown.
+            if (cf->expected_idcode == 0xffffffffu) cf->expected_idcode = 0;
             return true;
         } else {
             set_err("unknown .bit field tag before payload");
@@ -130,6 +140,39 @@ static bool parse_xilinx_bit_at(core_file_t *cf, uint32_t base)
     }
 
     set_err(".bit payload field not found");
+    return false;
+}
+
+
+static bool find_xilinx_bit_wrapper(core_file_t *cf, uint32_t start, uint32_t limit, uint32_t *base_out)
+{
+    // Search for the common Xilinx .bit wrapper preamble:
+    // 00 09 0f f0 0f f0 0f f0 0f f0
+    static const uint8_t sig[] = { 0x00, 0x09, 0x0f, 0xf0, 0x0f, 0xf0, 0x0f, 0xf0, 0x0f, 0xf0 };
+    uint8_t buf[256];
+    uint32_t pos = start;
+    uint32_t end = start + limit;
+    uint32_t file_size = storage_size(&cf->file);
+    if (end > file_size) end = file_size;
+
+    while (pos + sizeof(sig) <= end) {
+        uint32_t want = end - pos;
+        if (want > sizeof(buf)) want = sizeof(buf);
+        if (!storage_seek(&cf->file, pos)) return false;
+        size_t got = 0;
+        if (!storage_read(&cf->file, buf, want, &got) || got == 0) return false;
+
+        for (uint32_t i = 0; i + sizeof(sig) <= got; i++) {
+            if (memcmp(buf + i, sig, sizeof(sig)) == 0) {
+                *base_out = pos + i;
+                return true;
+            }
+        }
+
+        if (got < sizeof(sig)) break;
+        pos += (uint32_t)got - (uint32_t)sizeof(sig) + 1u;
+    }
+
     return false;
 }
 
@@ -154,10 +197,18 @@ bool core_open(core_file_t *cf, const char *path)
     if (memcmp(magic, "M65J", 4) == 0) {
         if (!parse_m65j(cf)) { storage_close(&cf->file); return false; }
     } else if (memcmp(magic, "MEGA65BITSTREAM0", 16) == 0) {
-        // Simple MEGA65 .COR assumption from bit2core: 4096-byte container header,
-        // then the original Xilinx .bit file.
+        // MEGA65 .COR files usually have a 4096-byte container header followed
+        // by the original Xilinx .bit file. Be a little more tolerant and scan
+        // for the .bit wrapper if it is not exactly there.
         cf->kind = CORE_KIND_COR;
-        if (!parse_xilinx_bit_at(cf, 4096)) { storage_close(&cf->file); return false; }
+        if (!parse_xilinx_bit_at(cf, 4096)) {
+            uint32_t bit_base = 0;
+            if (!find_xilinx_bit_wrapper(cf, 0, 1024u * 1024u, &bit_base) ||
+                !parse_xilinx_bit_at(cf, bit_base)) {
+                storage_close(&cf->file);
+                return false;
+            }
+        }
     } else {
         cf->kind = CORE_KIND_BIT;
         if (!parse_xilinx_bit_at(cf, 0)) { storage_close(&cf->file); return false; }

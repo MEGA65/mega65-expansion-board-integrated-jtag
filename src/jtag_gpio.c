@@ -16,8 +16,21 @@
 #define XC7_IR_JSTART    0x0cu
 #define XC7_IR_ISC_NOOP  0x14u
 #define XC7_IR_BYPASS    0x3fu
+#define XC7_IR_CFG_OUT   0x04u
+
+// Xilinx 7-series configuration packet helpers.
+#define XC7_CONFIG_DUMMY   0xffffffffu
+#define XC7_CONFIG_SYNC    0xaa995566u
+#define XC7_TYPE1(op, reg, count) (0x20000000u | (((uint32_t)(op) & 3u) << 27) | (((uint32_t)(reg) & 0x3fffu) << 13) | ((uint32_t)(count) & 0x7ffu))
+#define XC7_OP_NOP        0u
+#define XC7_OP_READ       1u
+#define XC7_OP_WRITE      2u
+#define XC7_REG_STAT      7u
+#define XC7_REG_BOOTSTS   22u
 
 static char last_err[128];
+static jtag_status_t last_status;
+static bool last_status_valid;
 
 static const uint32_t tck_mask = (1u << M65_JTAG_TCK_PIN);
 static const uint32_t tms_mask = (1u << M65_JTAG_TMS_PIN);
@@ -197,12 +210,113 @@ static uint32_t shift_dr_read32(void)
     return v;
 }
 
+static uint32_t shift_dr_read32_msb(void)
+{
+    uint32_t v = 0;
+    // Run-Test/Idle -> Select-DR -> Capture-DR -> Shift-DR
+    tick(true, false);
+    tick(false, false);
+    tick(false, false);
+
+    for (unsigned i = 0; i < 32; i++) {
+        bool last = (i == 31);
+        v <<= 1;
+        if (tick(last, false)) v |= 1u; // CFG_OUT words are config-data ordered.
+    }
+
+    // Exit1-DR -> Update-DR -> Run-Test/Idle
+    tick(true, false);
+    tick(false, false);
+    return v;
+}
+
+static void shift_dr_write_word_msb(uint32_t w, bool last_word)
+{
+    for (int b = 31; b >= 0; b--) {
+        bool last = last_word && (b == 0);
+        tick_payload_bit(((w >> b) & 1u) != 0, last);
+    }
+}
+
+static void shift_dr_write_words_msb(const uint32_t *words, size_t count)
+{
+    // Run-Test/Idle -> Select-DR -> Capture-DR -> Shift-DR
+    tick(true, false);
+    tick(false, false);
+    tick(false, false);
+
+    for (size_t i = 0; i < count; i++) {
+        shift_dr_write_word_msb(words[i], i == count - 1);
+    }
+
+    // Exit1-DR -> Update-DR -> Run-Test/Idle
+    tick(true, false);
+    tick(false, false);
+}
+
+static bool read_config_reg(uint32_t reg, uint32_t *value)
+{
+    if (!value) return false;
+
+    // Based on the 7-series JTAG configuration-register read procedure:
+    // feed a small read request through CFG_IN, then shift the register value
+    // out through CFG_OUT.  Single-device chain only.
+    const uint32_t req[] = {
+        XC7_CONFIG_DUMMY,
+        XC7_CONFIG_SYNC,
+        XC7_TYPE1(XC7_OP_NOP, 0, 0),
+        XC7_TYPE1(XC7_OP_READ, reg, 1),
+        XC7_TYPE1(XC7_OP_NOP, 0, 0),
+        XC7_TYPE1(XC7_OP_NOP, 0, 0),
+    };
+
+    shift_ir(XC7_IR_CFG_IN, XC7_IR_LEN);
+    shift_dr_write_words_msb(req, sizeof(req) / sizeof(req[0]));
+    idle_clocks(16);
+
+    shift_ir(XC7_IR_CFG_OUT, XC7_IR_LEN);
+    *value = shift_dr_read32_msb();
+    idle_clocks(16);
+
+    shift_ir(XC7_IR_BYPASS, XC7_IR_LEN);
+    idle_clocks(16);
+    return true;
+}
+
 uint32_t jtag_read_idcode(void)
 {
     last_err[0] = 0;
     tap_reset();
     shift_ir(XC7_IR_IDCODE, XC7_IR_LEN);
     return shift_dr_read32();
+}
+
+bool jtag_read_xilinx_status(jtag_status_t *st)
+{
+    if (!st) return false;
+    memset(st, 0, sizeof(*st));
+    last_err[0] = 0;
+
+    tap_reset();
+    shift_ir(XC7_IR_IDCODE, XC7_IR_LEN);
+    st->idcode = shift_dr_read32();
+
+    st->bootsts_valid = read_config_reg(XC7_REG_BOOTSTS, &st->bootsts);
+    st->stat_valid = read_config_reg(XC7_REG_STAT, &st->stat);
+
+    shift_ir(XC7_IR_BYPASS, XC7_IR_LEN);
+    st->bypass = shift_dr_read32();
+    st->bypass_valid = true;
+
+    tap_reset();
+    return st->bootsts_valid && st->stat_valid;
+}
+
+bool jtag_get_last_status(jtag_status_t *st)
+{
+    if (!st || !last_status_valid) return false;
+    *st = last_status;
+    return true;
 }
 
 static bool stream_cfg_in_from_reader(uint32_t payload_length,
@@ -285,6 +399,7 @@ bool jtag_program_stream(uint32_t payload_length,
                          const jtag_program_options_t *opts)
 {
     last_err[0] = 0;
+    last_status_valid = false;
 
     bool use_hijack = !opts || opts->use_hijack;
     bool release_after = !opts || opts->release_after;
@@ -322,11 +437,30 @@ bool jtag_program_stream(uint32_t payload_length,
         return false;
     }
 
+    // Start-up close-out. 128 clocks was enough for the normal MEGA65 core,
+    // but some cores appear to fall through into configuration fallback/QSPI
+    // boot unless we keep the TAP in Run-Test/Idle for longer after JSTART.
+    // These counts are config.h tunables so we can trim them later.
     shift_ir(XC7_IR_JSTART, XC7_IR_LEN);
-    idle_clocks(128);
+    idle_clocks(M65_JTAG_POST_JSTART_IDLE_CLOCKS);
+
+    // Put the device into an innocuous instruction and provide more idle clocks
+    // before selecting BYPASS/resetting the TAP. This is deliberately conservative
+    // and closer to what a vendor tool does than a minimal byte-shifter.
+    shift_ir(XC7_IR_ISC_NOOP, XC7_IR_LEN);
+    idle_clocks(M65_JTAG_POST_ISC_NOOP_IDLE_CLOCKS);
 
     shift_ir(XC7_IR_BYPASS, XC7_IR_LEN);
+    idle_clocks(M65_JTAG_POST_BYPASS_IDLE_CLOCKS);
+
     tap_reset();
+    idle_clocks(M65_JTAG_POST_TAP_RESET_IDLE_CLOCKS);
+
+    // Capture Xilinx config status before releasing the hijack switch. This is
+    // diagnostic only for now: shifting all bytes is not the same as proving
+    // CRC/DONE/EOS/startup state is good, so expose BOOTSTS/STAT/BYPASS to the
+    // command layer after OK/ERR.
+    last_status_valid = jtag_read_xilinx_status(&last_status);
 
 #if M65_JTAG_DONE_PIN != 255
     if (opts && opts->read_done_pin && gpio_get(M65_JTAG_DONE_PIN) == 0) {

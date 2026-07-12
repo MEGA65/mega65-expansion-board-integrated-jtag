@@ -85,7 +85,7 @@ def read_response_lines(ser, cmd, timeout):
             text = line.decode("utf-8", "replace").rstrip("\r\n")
             print(text)
             last = time.monotonic()
-            if text == "END" or text.startswith("ERR ") or text in {"OK P DONE", "OK S DONE"} or text.startswith("OK N DONE"):
+            if text == "END" or text.startswith("ERR ") or text in {"OK P DONE", "OK S DONE"} or text.startswith("OK N DONE") or text.startswith("OK T DONE"):
                 break
             if cmd[:1].upper() in {"V", "I", "J", "H", "M"} and text.startswith("OK "):
                 break
@@ -129,7 +129,7 @@ def drain_available_lines(ser):
     """Drain already-available text replies.
 
     Returns a terminal OK/ERR line if one was seen, otherwise None.
-    This matters because the final OK S DONE can arrive during a progress drain.
+    This matters because final OK lines can arrive during a progress drain.
     """
     old_timeout = ser.timeout
     ser.timeout = 0
@@ -146,6 +146,7 @@ def drain_available_lines(ser):
                 or text == "END"
                 or text.startswith("OK S DONE")
                 or text.startswith("OK N DONE")
+                or text.startswith("OK T DONE")
                 or text.startswith("OK P DONE")
             ):
                 terminal = text
