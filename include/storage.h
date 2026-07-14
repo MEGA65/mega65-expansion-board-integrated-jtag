@@ -12,6 +12,7 @@ typedef void (*storage_list_cb_t)(const char *name, uint32_t size, bool is_dir, 
 
 bool storage_mount(void);
 void storage_unmount(void);
+bool storage_is_mounted(void);
 const char *storage_last_error(void);
 
 bool storage_open(storage_file_t *f, const char *path);
@@ -30,6 +31,7 @@ bool storage_mkdir(const char *path);
 bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx);
 
 void storage_sd_probe(void);
+bool storage_sd_may_mount(void);
 bool storage_sd_set_transport(const char *name);
 bool storage_sd_transport_locked(void);
 const char *storage_sd_transport_name(void);

@@ -412,15 +412,47 @@ static void at_error(const char *msg)
     uart_cmd_printf("ERROR: %s\r\n", msg ? msg : "ERROR");
 }
 
+typedef enum {
+    SDCARD_STATE_NOT_PRESENT = 0,
+    SDCARD_STATE_PRESENT,
+    SDCARD_STATE_ACTIVE,
+} sdcard_state_t;
+
+static sdcard_state_t sdcard_state(void)
+{
+    if (storage_is_mounted()) {
+        return SDCARD_STATE_ACTIVE;
+    }
+    return storage_sd_may_mount() ? SDCARD_STATE_PRESENT : SDCARD_STATE_NOT_PRESENT;
+}
+
+static const char *sdcard_state_human(sdcard_state_t state)
+{
+    switch (state) {
+    case SDCARD_STATE_ACTIVE: return "ACTIVE";
+    case SDCARD_STATE_PRESENT: return "PRESENT";
+    case SDCARD_STATE_NOT_PRESENT: return "NOT PRESENT";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *sdcard_state_token(sdcard_state_t state)
+{
+    switch (state) {
+    case SDCARD_STATE_ACTIVE: return "active";
+    case SDCARD_STATE_PRESENT: return "present";
+    case SDCARD_STATE_NOT_PRESENT: return "not-present";
+    default: return "unknown";
+    }
+}
+
 static void cmd_ati(void)
 {
     uart_cmd_puts("MEGA65 Expansion Board Integrated JTAG v0.1\r\n");
     uart_cmd_puts("EXPERIMENTAL -- SUBJECT TO INTERFACE/API CHANGES\r\n");
-#if M65_WIFI_SUPPORTED
-    uart_cmd_puts("WIFI: SUPPORTED\r\n");
-#else
-    uart_cmd_puts("WIFI: NOT SUPPORTED\r\n");
-#endif
+    uart_cmd_printf("BUILD: %s\r\n", M65_BUILD_MARKER);
+    uart_cmd_printf("SDCARD: %s\r\n", sdcard_state_human(sdcard_state()));
+    uart_cmd_printf("WIFI: %s\r\n", remote_http_wifi_summary());
     at_ok();
 }
 
@@ -473,6 +505,9 @@ static void cmd_help(void)
         "+HELP: ATZ                 reload saved AT settings\n"
         "+HELP: AT+WRITEGRANT?      show write-authority status\n"
         "+HELP: AT+REMOTE?          show parsed REMOTE_ENABLE.cfg\n"
+        "+HELP: AT+WIFI?            show live WiFi/HTTP status\n"
+        "+HELP: AT+WIFIPROBE        retry CYW43 hardware probe now\n"
+        "+HELP: AT+SDCARD?          show SD card media/mount status\n"
         "+HELP: AT+SDMODE[=auto|hw|soft] show/set SD transport before mount\n"
         "+HELP: AT+JTAGID?          read JTAG IDCODE, using hijack\n"
         "+HELP: AT+JTAGSTATUS?      read Xilinx BOOTSTS/STAT/BYPASS via CFG_OUT\n"
@@ -519,15 +554,18 @@ static void cmd_s_register(char *arg)
 
 static void cmd_version(void)
 {
-    uart_cmd_printf("OK V %s source=%s sd_baud=%lu sd_transport=%s write_pin=GP%u write_timeout_ms=%lu write_usb_only=%lu stream_usb_only=%lu\n",
-                    M65_VERSION_STRING,
-                    uart_cmd_source_name(uart_cmd_last_source()),
-                    (unsigned long)M65_SD_SPI_BAUD,
-                    storage_sd_transport_name(),
+    uart_cmd_printf("+VERSION: firmware=\"%s\"\r\n", M65_VERSION_STRING);
+    uart_cmd_printf("+VERSION: build=%s\r\n", M65_BUILD_MARKER);
+    uart_cmd_printf("+VERSION: source=%s\r\n", uart_cmd_source_name(uart_cmd_last_source()));
+    uart_cmd_printf("+VERSION: sd_baud=%lu\r\n", (unsigned long)M65_SD_SPI_BAUD);
+    uart_cmd_printf("+VERSION: sdcard=%s\r\n", sdcard_state_token(sdcard_state()));
+    uart_cmd_printf("+VERSION: sd_transport=%s\r\n", storage_sd_transport_name());
+    uart_cmd_printf("+VERSION: write_pin=GP%u write_timeout_ms=%lu write_usb_only=%lu stream_usb_only=%lu\r\n",
                     (unsigned)M65_WRITE_ENABLE_PIN,
                     (unsigned long)M65_WRITE_ENABLE_TIMEOUT_MS,
                     (unsigned long)M65_WRITE_COMMANDS_USB_ONLY,
                     (unsigned long)M65_STREAM_COMMANDS_USB_ONLY);
+    at_ok();
 }
 
 static void cmd_sd_transport(char *arg)
@@ -546,6 +584,16 @@ static void cmd_sd_transport(char *arg)
     }
 
     uart_cmd_printf("OK D %s\n", storage_sd_transport_name());
+}
+
+static void cmd_sdcard(void)
+{
+    sdcard_state_t state = sdcard_state();
+    uart_cmd_printf("+SDCARD: state=%s mounted=%lu transport=%s\r\n",
+                    sdcard_state_token(state),
+                    (unsigned long)(storage_is_mounted() ? 1u : 0u),
+                    storage_sd_transport_name());
+    at_ok();
 }
 
 static void cmd_remote(void)
@@ -588,6 +636,22 @@ static void cmd_remote(void)
                         (unsigned long)(remote_cfg.rules[i].allow_files ? 1u : 0u),
                         (unsigned long)(remote_cfg.rules[i].allow_bitstreams ? 1u : 0u));
     }
+    at_ok();
+}
+
+static void cmd_wifi(void)
+{
+    uart_cmd_printf("+WIFI: %s\r\n", remote_http_status());
+    uart_cmd_printf("+WIFIDIAG: %s\r\n", remote_http_wifi_diag());
+    at_ok();
+}
+
+static void cmd_wifi_probe(void)
+{
+    bool scheduled = remote_http_wifi_probe_now();
+    uart_cmd_printf("+WIFIPROBE: scheduled=%lu %s\r\n",
+                    (unsigned long)(scheduled ? 1u : 0u),
+                    remote_http_wifi_diag());
     at_ok();
 }
 
@@ -780,6 +844,10 @@ static void cmd_jtag_id(void)
     jtag_hijack_claim();
     uint32_t id = jtag_read_idcode();
     jtag_hijack_release();
+    if (id == 0x00000000u || id == 0xffffffffu) {
+        uart_cmd_printf("WARN J IDCODE %08lx looks like a JTAG bus error; check hijack, power, TDO and pinout\n",
+                        (unsigned long)id);
+    }
     uart_cmd_printf("OK J %08lx\n", (unsigned long)id);
 }
 
@@ -811,6 +879,18 @@ static bool idcode_match_main(uint32_t seen, uint32_t expected)
 {
     if (expected == 0) return true;
     return (seen & 0x0fffffffu) == (expected & 0x0fffffffu);
+}
+
+static bool idcode_suspicious(uint32_t id)
+{
+    return id == 0x00000000u || id == 0xffffffffu;
+}
+
+static void warn_suspicious_idcode(const char *tag, uint32_t id)
+{
+    uart_cmd_printf("WARN %s IDCODE %08lx looks like a JTAG bus error; check hijack, power, TDO and pinout\n",
+                    tag ? tag : "JTAG",
+                    (unsigned long)id);
 }
 
 typedef struct {
@@ -896,10 +976,13 @@ static void cmd_stream_program(char *arg)
         return;
     }
 
+    jtag_hijack_claim();
+    uint32_t id = jtag_read_idcode();
+    jtag_hijack_release();
+    if (idcode_suspicious(id)) {
+        warn_suspicious_idcode("S", id);
+    }
     if (expected_idcode != 0) {
-        jtag_hijack_claim();
-        uint32_t id = jtag_read_idcode();
-        jtag_hijack_release();
         if (!idcode_match_main(id, expected_idcode)) {
             uart_cmd_printf("ERR S IDCODE mismatch: saw %08lx expected %08lx\n",
                             (unsigned long)id,
@@ -1034,6 +1117,13 @@ static void cmd_program(char *arg)
                     core_kind_name(cf.kind),
                     (unsigned long)cf.payload_length,
                     (unsigned long)cf.expected_idcode);
+
+    jtag_hijack_claim();
+    uint32_t id = jtag_read_idcode();
+    jtag_hijack_release();
+    if (idcode_suspicious(id)) {
+        warn_suspicious_idcode("P", id);
+    }
 
     jtag_program_options_t opts = {
         .check_idcode = true,
@@ -1500,6 +1590,12 @@ static void dispatch_at(char *arg)
         cmd_authority();
     } else if (ci_equal(cmd, "REMOTE")) {
         cmd_remote();
+    } else if (ci_equal(cmd, "WIFI") || ci_equal(cmd, "HTTP")) {
+        cmd_wifi();
+    } else if (ci_equal(cmd, "WIFIPROBE")) {
+        cmd_wifi_probe();
+    } else if (ci_equal(cmd, "SDCARD") || ci_equal(cmd, "SDSTATUS")) {
+        cmd_sdcard();
     } else if (ci_equal(cmd, "SDMODE")) {
         cmd_sd_transport(value ? param : (char *)"");
     } else if (ci_equal(cmd, "JTAGID")) {
@@ -1562,22 +1658,31 @@ int main(void)
     uart_cmd_init();
     jtag_gpio_init();
     storage_sd_probe();
-    at_settings_load();
-    remote_http_init();
+    remote_http_boot_check();
 
     uart_cmd_printf("OK BOOT %s\n", M65_VERSION_STRING);
     uart_cmd_printf("OK SD %s\n", storage_sd_transport_name());
-    if (remote_http_active()) {
-        uart_cmd_printf("OK REMOTE %s\n", remote_http_status());
-    }
     uart_cmd_puts("OK READY\n");
+
+    bool remote_init_done = false;
+    absolute_time_t remote_init_at = make_timeout_time_ms(M65_REMOTE_INIT_DELAY_MS);
 
     char line[256];
     for (;;) {
-        remote_http_poll();
-        remote_http_autofetch_poll(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev);
         if (uart_cmd_read_line(line, sizeof line)) {
             dispatch(line);
+            continue;
+        }
+        if (!remote_init_done &&
+            absolute_time_diff_us(get_absolute_time(), remote_init_at) <= 0) {
+            at_settings_load();
+            remote_http_init();
+            uart_cmd_printf("OK REMOTE %s\n", remote_http_status());
+            remote_init_done = true;
+        }
+        remote_http_poll();
+        if (remote_init_done) {
+            remote_http_autofetch_poll(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev);
         }
         tight_loop_contents();
     }

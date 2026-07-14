@@ -24,6 +24,7 @@
 static FATFS fs;
 static FIL active_file;
 static char last_err[128];
+static bool mounted;
 
 static void set_err(const char *where, FRESULT fr)
 {
@@ -37,6 +38,11 @@ const char *storage_last_error(void)
 
 bool storage_mount(void)
 {
+    if (mounted) return true;
+    if (!storage_sd_may_mount()) {
+        snprintf(last_err, sizeof(last_err), "not-present");
+        return false;
+    }
 #if defined(HAVE_SD_INIT_DRIVER)
     if (!sd_init_driver()) {
         snprintf(last_err, sizeof(last_err), "sd_init_driver failed");
@@ -46,12 +52,19 @@ bool storage_mount(void)
     FRESULT fr = f_mount(&fs, "", 1);
     if (fr != FR_OK) { set_err("f_mount", fr); return false; }
     last_err[0] = 0;
+    mounted = true;
     return true;
 }
 
 void storage_unmount(void)
 {
     f_unmount("");
+    mounted = false;
+}
+
+bool storage_is_mounted(void)
+{
+    return mounted;
 }
 
 bool storage_open(storage_file_t *f, const char *path)

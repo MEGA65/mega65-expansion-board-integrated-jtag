@@ -5,9 +5,13 @@
 #include <stdint.h>
 
 void remote_http_init(void);
+void remote_http_boot_check(void);
 void remote_http_poll(void);
 bool remote_http_active(void);
 const char *remote_http_status(void);
+const char *remote_http_wifi_summary(void);
+const char *remote_http_wifi_diag(void);
+bool remote_http_wifi_probe_now(void);
 bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err, size_t err_len);
 void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override);
 void remote_http_autofetch_reset_schedule(void);

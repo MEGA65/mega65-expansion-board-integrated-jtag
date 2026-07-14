@@ -50,7 +50,8 @@ make deps
 make
 ```
 
-The default build is now FatFs-enabled and will clone:
+The default build is now Pico W, WiFi remote support enabled, and FatFs-enabled.
+It will clone:
 
 - Raspberry Pi `pico-sdk` into `.deps/pico-sdk`
 - `carlk3/no-OS-FatFS-SD-SPI-RPi-Pico` into `third_party/no-OS-FatFS-SD-SPI-RPi-Pico`
@@ -62,7 +63,13 @@ have a `CMakeLists.txt`.
 Output:
 
 ```text
-build/pico_m65jtag.uf2
+build-wifi/mega65-pico-jtag.uf2
+```
+
+For a non-WiFi Pico build:
+
+```bash
+make PICO_BOARD=pico ENABLE_WIFI_REMOTE=0 BUILD_DIR=build build
 ```
 
 For a UART/JTAG-only bring-up build without SD/FatFs:
@@ -134,6 +141,8 @@ AT+DOWNLOADREAD=name       read DOWNLOADS/name as raw bytes
 AT+FETCHBOARD=3|6|remote   select autofetch board manifest
 AT+WRITEGRANT?             show physical write-authority status
 AT+REMOTE?                 show parsed REMOTE_ENABLE.cfg
+AT+WIFI?                   show live WiFi/HTTP status
+AT+SDCARD?                 show SD card media/mount status
 AT+SDMODE[=auto|hw|soft]   show/set SD transport before mount
 AT+JTAGID?                 read JTAG IDCODE, using hijack
 AT+JTAGSTATUS?             read Xilinx BOOTSTS/STAT/BYPASS via CFG_OUT
@@ -278,20 +287,24 @@ bless, store, or JTAG-push a core over HTTP:
 ```sh
 tools/m65j.py check sdcard/cores
 tools/m65j.py bless --board 6 core.bit
-tools/m65j.py push http://mega65-jtag.local core.bit --board 6
-tools/m65j.py store http://mega65-jtag.local core.bit --board 6
+tools/m65j.py -u http://mega65-jtag.local push core.bit --board 6
+tools/m65j.py -u http://mega65-jtag.local store core.bit --board 6
+tools/m65j.py -s /dev/ttyACM0 push local.bit
 ```
 
-For web commands, `tools/m65j.py` reads `.m65j.config` from the current
-directory first, then `~/.m65j.config`. A minimal client config is:
+`tools/m65j.py` reads `.m65j.config` from the current directory first, then
+`~/.m65j.config`. Use `serial=` for the USB TTY and `url=` for the HTTP
+interface:
 
 ```ini
-device=http://mega65-jtag.local
+serial=/dev/ttyACM0
+url=http://mega65-jtag.local
 # or:
 ip=192.168.1.65
 ```
 
-With that in place, the device URL can be omitted:
+With that in place, the target can be omitted. Raw AT-style and one-letter
+commands use the configured serial port; web commands use the configured URL:
 
 ```sh
 tools/m65j.py status
@@ -304,6 +317,12 @@ tools/m65j.py downloads-get fetched.bit -o fetched.bit
 tools/m65j.py mirror stable sdcard/cores --board all --overwrite --bless --yes
 tools/m65j.py populate stable --board all --overwrite --yes
 ```
+
+If neither `serial=` nor `url=`/`ip=` is configured and no `-s`/`-u` option is
+given, `m65j.py` auto-detects a single connected MEGA65 JTAG Pico USB CDC
+device. New firmware identifies itself to the host as product
+`MEGA65 Expansion Board Integrated JTAG`; older builds are recognised by a
+brief `ATI` probe on Raspberry Pi Pico CDC ports.
 
 `mirror` runs on the host and uses the alt-core/filehost downloader. Supply a
 release tag such as `stable`, `unstable`, or `nightly` as the first positional

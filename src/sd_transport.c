@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "hardware/structs/sio.h"
@@ -58,6 +59,8 @@ static sd_active_t active_mode = SD_ACTIVE_NONE;
 static bool transport_locked = false;
 static bool used_auto_fallback = false;
 static uint32_t bitbang_half_period_us = M65_SD_BITBANG_LOW_HALF_PERIOD_US;
+
+#define HW_SPI_DMA_THRESHOLD 32u
 
 static inline uint32_t gpio_mask_u32(uint gpio)
 {
@@ -177,27 +180,37 @@ static bool probe_cmd0(uint cs_gpio, probe_xfer_fn xfer, void *ctx)
 {
     static const uint8_t cmd0[] = {0x40, 0x00, 0x00, 0x00, 0x00, 0x95};
 
-    gpio_put(cs_gpio, 1);
-    for (unsigned i = 0; i < 10; ++i) {
+    for (unsigned attempt = 0; attempt < M65_SD_PROBE_RETRIES; ++attempt) {
+        gpio_put(cs_gpio, 1);
+        for (unsigned i = 0; i < 10; ++i) {
+            (void)xfer(SPI_FILL_CHAR, ctx);
+        }
+
+        gpio_put(cs_gpio, 0);
+        for (unsigned i = 0; i < sizeof cmd0; ++i) {
+            (void)xfer(cmd0[i], ctx);
+        }
+
+        uint8_t response = SPI_FILL_CHAR;
+        for (unsigned i = 0; i < 32; ++i) {
+            response = xfer(SPI_FILL_CHAR, ctx);
+            if ((response & 0x80u) == 0) {
+                break;
+            }
+        }
+
+        gpio_put(cs_gpio, 1);
         (void)xfer(SPI_FILL_CHAR, ctx);
-    }
+        if (response == 0x01u) {
+            return true;
+        }
 
-    gpio_put(cs_gpio, 0);
-    for (unsigned i = 0; i < sizeof cmd0; ++i) {
-        (void)xfer(cmd0[i], ctx);
-    }
-
-    uint8_t response = SPI_FILL_CHAR;
-    for (unsigned i = 0; i < 16; ++i) {
-        response = xfer(SPI_FILL_CHAR, ctx);
-        if ((response & 0x80u) == 0) {
-            break;
+        if (M65_SD_PROBE_RETRY_DELAY_MS) {
+            sleep_ms(M65_SD_PROBE_RETRY_DELAY_MS);
         }
     }
 
-    gpio_put(cs_gpio, 1);
-    (void)xfer(SPI_FILL_CHAR, ctx);
-    return response == 0x01u;
+    return false;
 }
 
 typedef struct {
@@ -293,6 +306,20 @@ void storage_sd_probe(void)
         active_mode = SD_ACTIVE_HW_SPI;
         return;
     }
+}
+
+bool storage_sd_may_mount(void)
+{
+    if (transport_locked) {
+        return true;
+    }
+
+    if (requested_mode != SD_REQUEST_AUTO) {
+        return true;
+    }
+
+    storage_sd_probe();
+    return active_mode != SD_ACTIVE_NONE;
 }
 
 bool storage_sd_set_transport(const char *name)
@@ -415,6 +442,21 @@ bool my_spi_init(spi_t *spi_p)
         gpio_set_function(spi_p->mosi_gpio, GPIO_FUNC_SPI);
         gpio_set_function(spi_p->sck_gpio, GPIO_FUNC_SPI);
         gpio_pull_up(spi_p->miso_gpio);
+
+        spi_p->tx_dma = dma_claim_unused_channel(true);
+        spi_p->rx_dma = dma_claim_unused_channel(true);
+
+        spi_p->tx_dma_cfg = dma_channel_get_default_config(spi_p->tx_dma);
+        channel_config_set_transfer_data_size(&spi_p->tx_dma_cfg, DMA_SIZE_8);
+        channel_config_set_dreq(&spi_p->tx_dma_cfg,
+                                spi_get_index(spi_p->hw_inst) ? DREQ_SPI1_TX : DREQ_SPI0_TX);
+        channel_config_set_write_increment(&spi_p->tx_dma_cfg, false);
+
+        spi_p->rx_dma_cfg = dma_channel_get_default_config(spi_p->rx_dma);
+        channel_config_set_transfer_data_size(&spi_p->rx_dma_cfg, DMA_SIZE_8);
+        channel_config_set_dreq(&spi_p->rx_dma_cfg,
+                                spi_get_index(spi_p->hw_inst) ? DREQ_SPI1_RX : DREQ_SPI0_RX);
+        channel_config_set_read_increment(&spi_p->rx_dma_cfg, false);
     } else {
         gpio_init(spi_p->sck_gpio);
         gpio_init(spi_p->mosi_gpio);
@@ -439,23 +481,75 @@ bool my_spi_init(spi_t *spi_p)
     return true;
 }
 
+static bool hw_spi_dma_transfer(spi_t *spi_p, const uint8_t *tx, uint8_t *rx, size_t length)
+{
+    static const uint8_t dummy_tx = SPI_FILL_CHAR;
+    static uint8_t dummy_rx;
+
+    dma_channel_config tx_cfg = spi_p->tx_dma_cfg;
+    dma_channel_config rx_cfg = spi_p->rx_dma_cfg;
+
+    if (tx) {
+        channel_config_set_read_increment(&tx_cfg, true);
+    } else {
+        tx = &dummy_tx;
+        channel_config_set_read_increment(&tx_cfg, false);
+    }
+
+    if (rx) {
+        channel_config_set_write_increment(&rx_cfg, true);
+    } else {
+        rx = &dummy_rx;
+        channel_config_set_write_increment(&rx_cfg, false);
+    }
+
+    dma_channel_configure(spi_p->tx_dma, &tx_cfg,
+                          &spi_get_hw(spi_p->hw_inst)->dr,
+                          tx,
+                          length,
+                          false);
+    dma_channel_configure(spi_p->rx_dma, &rx_cfg,
+                          rx,
+                          &spi_get_hw(spi_p->hw_inst)->dr,
+                          length,
+                          false);
+
+    dma_start_channel_mask((1u << spi_p->tx_dma) | (1u << spi_p->rx_dma));
+    dma_channel_wait_for_finish_blocking(spi_p->tx_dma);
+    dma_channel_wait_for_finish_blocking(spi_p->rx_dma);
+    return true;
+}
+
 bool spi_transfer(spi_t *spi_p, const uint8_t *tx, uint8_t *rx, size_t length)
 {
     assert(spi_p);
     assert(tx || rx);
 
+    if (length == 0) {
+        return true;
+    }
+
+    if (active_mode == SD_ACTIVE_HW_SPI) {
+        if (length >= HW_SPI_DMA_THRESHOLD) {
+            return hw_spi_dma_transfer(spi_p, tx, rx, length);
+        }
+
+        int count;
+        if (tx && rx) {
+            count = spi_write_read_blocking(spi_p->hw_inst, tx, rx, length);
+        } else if (tx) {
+            count = spi_write_blocking(spi_p->hw_inst, tx, length);
+        } else {
+            count = spi_read_blocking(spi_p->hw_inst, SPI_FILL_CHAR, rx, length);
+        }
+        return count == (int)length;
+    }
+
     for (size_t i = 0; i < length; ++i) {
         const uint8_t out = tx ? tx[i] : SPI_FILL_CHAR;
         uint8_t in = SPI_FILL_CHAR;
 
-        if (active_mode == SD_ACTIVE_HW_SPI) {
-            int count = spi_write_read_blocking(spi_p->hw_inst, &out, &in, 1);
-            if (count != 1) {
-                return false;
-            }
-        } else {
-            in = bitbang_transfer_byte(spi_p, out);
-        }
+        in = bitbang_transfer_byte(spi_p, out);
 
         if (rx) {
             rx[i] = in;

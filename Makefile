@@ -1,4 +1,4 @@
-# Top-level convenience Makefile for pico_m65jtag.
+# Top-level convenience Makefile for MEGA65 Pico JTAG.
 # Normal use:
 #   make deps
 #   make
@@ -9,14 +9,16 @@
 
 SHELL := /bin/bash
 
-PROJECT          ?= pico_m65jtag
-BUILD_DIR        ?= build
+PROJECT          ?= mega65-pico-jtag
+CMAKE_TARGET     ?= pico_m65jtag
+BUILD_DIR        ?= build-wifi
 DEPS_DIR         ?= .deps
-PICO_BOARD       ?= pico
+PICO_BOARD       ?= pico_w
 PICO_SDK_PATH    ?= $(CURDIR)/$(DEPS_DIR)/pico-sdk
 PICO_SDK_REPO    ?= https://github.com/raspberrypi/pico-sdk.git
 PICOTOOL_REPO    ?= https://github.com/raspberrypi/picotool.git
 PICOTOOL_PATH    ?= $(CURDIR)/$(DEPS_DIR)/picotool/build/picotool
+PICOTOOL_FETCH_FROM_GIT_PATH ?= $(if $(wildcard $(CURDIR)/build/_deps/picotool/picotool),$(CURDIR)/build/_deps,)
 
 # Default is now FatFs-on, because P <filename> and L are the whole point.
 # Use `make nofatfs` or `make USE_FATFS=0` for a JTAG/UART-only bring-up build.
@@ -24,11 +26,13 @@ USE_FATFS        ?= 1
 FATFS_REPO       ?= https://github.com/carlk3/no-OS-FatFS-SD-SPI-RPi-Pico.git
 FATFS_PATH       ?= $(CURDIR)/third_party/no-OS-FatFS-SD-SPI-RPi-Pico
 M65_HAVE_SD_INIT_DRIVER ?= 0
-ENABLE_WIFI_REMOTE ?= 0
+ENABLE_WIFI_REMOTE ?= 1
 M65_SD_MODE ?=
 
 UF2 := $(BUILD_DIR)/$(PROJECT).uf2
 ELF := $(BUILD_DIR)/$(PROJECT).elf
+CMAKE_UF2 := $(BUILD_DIR)/$(CMAKE_TARGET).uf2
+CMAKE_ELF := $(BUILD_DIR)/$(CMAKE_TARGET).elf
 
 ifeq ($(USE_FATFS),1)
 CMAKE_FATFS_ARGS := -DM65_USE_FATFS=ON \
@@ -42,6 +46,7 @@ endif
 
 CMAKE_REMOTE_ARGS := -DM65_ENABLE_WIFI_REMOTE=$(if $(filter 1 ON on true TRUE yes YES,$(ENABLE_WIFI_REMOTE)),ON,OFF)
 CMAKE_SD_MODE_ARGS := $(if $(strip $(M65_SD_MODE)),-DM65_SD_MODE=$(M65_SD_MODE),)
+CMAKE_PICOTOOL_ARGS := $(if $(strip $(PICOTOOL_FETCH_FROM_GIT_PATH)),-DPICOTOOL_FETCH_FROM_GIT_PATH=$(PICOTOOL_FETCH_FROM_GIT_PATH),)
 
 .PHONY: all help deps check-tools sdk fatfs configure build nofatfs clean distclean nuke \
         upload flash upload-picotool upload-uf2 picotool print-config terminal
@@ -49,7 +54,7 @@ CMAKE_SD_MODE_ARGS := $(if $(strip $(M65_SD_MODE)),-DM65_SD_MODE=$(M65_SD_MODE),
 all: build
 
 help:
-	@echo "pico_m65jtag Makefile"
+	@echo "MEGA65 Pico JTAG Makefile"
 	@echo
 	@echo "Main targets:"
 	@echo "  make deps              Install Ubuntu/Debian build dependencies with apt"
@@ -67,10 +72,10 @@ help:
 	@echo "Useful variables:"
 	@echo "  USE_FATFS=1            Default. Build with FatFs/SPI-SD backend"
 	@echo "  USE_FATFS=0            Build with storage stub only"
-	@echo "  PICO_BOARD=pico        Pico SDK board name: pico, pico_w, pico2, ..."
+	@echo "  PICO_BOARD=pico_w      Default. Pico SDK board name: pico, pico_w, pico2, ..."
 	@echo "  PICO_SDK_PATH=...      Override SDK path"
-	@echo "  BUILD_DIR=build        Override build directory"
-	@echo "  ENABLE_WIFI_REMOTE=0   Set to 1 with PICO_BOARD=pico_w for HTTP remote support"
+	@echo "  BUILD_DIR=build-wifi   Override build directory"
+	@echo "  ENABLE_WIFI_REMOTE=1   Default. Set 0 for non-WiFi builds"
 	@echo "  M65_SD_MODE=...        Optional: M65_SD_MODE_AUTO, M65_SD_MODE_HW_SPI, M65_SD_MODE_SCHEMATIC_BITBANG"
 	@echo "  PICO_MOUNT=...         Mount point for upload-uf2, if autodetect fails"
 	@echo
@@ -78,6 +83,7 @@ help:
 	@echo "  make deps"
 	@echo "  make"
 	@echo "  make flash"
+	@echo "  make PICO_BOARD=pico ENABLE_WIFI_REMOTE=0 BUILD_DIR=build build"
 	@echo "  make USE_FATFS=0 build"
 
 # Ubuntu/Debian dependency install. This deliberately does not clone the SDK;
@@ -127,10 +133,15 @@ configure: $(CONFIGURE_DEPS)
 		-DPICO_BOARD="$(PICO_BOARD)" \
 		$(CMAKE_FATFS_ARGS) \
 		$(CMAKE_REMOTE_ARGS) \
-		$(CMAKE_SD_MODE_ARGS)
+		$(CMAKE_SD_MODE_ARGS) \
+		$(CMAKE_PICOTOOL_ARGS)
 
 build: configure
 	cmake --build "$(BUILD_DIR)" --parallel
+	@if [ "$(PROJECT)" != "$(CMAKE_TARGET)" ]; then \
+		cp "$(CMAKE_UF2)" "$(UF2)"; \
+		cp "$(CMAKE_ELF)" "$(ELF)"; \
+	fi
 	@echo
 	@echo "Built: $(UF2)"
 
@@ -210,9 +221,11 @@ upload-uf2: build
 
 print-config:
 	@echo "PROJECT=$(PROJECT)"
+	@echo "CMAKE_TARGET=$(CMAKE_TARGET)"
 	@echo "BUILD_DIR=$(BUILD_DIR)"
 	@echo "PICO_BOARD=$(PICO_BOARD)"
 	@echo "PICO_SDK_PATH=$(PICO_SDK_PATH)"
+	@echo "PICOTOOL_FETCH_FROM_GIT_PATH=$(PICOTOOL_FETCH_FROM_GIT_PATH)"
 	@echo "USE_FATFS=$(USE_FATFS)"
 	@echo "FATFS_PATH=$(FATFS_PATH)"
 	@echo "ENABLE_WIFI_REMOTE=$(ENABLE_WIFI_REMOTE)"

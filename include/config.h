@@ -56,9 +56,11 @@
 #define M65_SD_MOSI_PIN         M65_SD_SOFT_MOSI_PIN
 #define M65_SD_MISO_PIN         M65_SD_SOFT_MISO_PIN
 #define M65_SD_CS_PIN           M65_SD_SOFT_CS_PIN
-#define M65_SD_SPI_BAUD      12500000u
+#define M65_SD_SPI_BAUD      30000000u
 #define M65_SD_BITBANG_LOW_HALF_PERIOD_US 2u
 #define M65_SD_BITBANG_FAST_DELAY_LOOPS   0u
+#define M65_SD_PROBE_RETRIES              8u
+#define M65_SD_PROBE_RETRY_DELAY_MS       5u
 
 // Pico-side JTAG pins.
 #define M65_JTAG_TCK_PIN     6u
@@ -78,6 +80,11 @@
 #define M65_WRITE_ENABLE_TIMEOUT_MS      120000u
 #define M65_WRITE_COMMANDS_USB_ONLY      1
 #define M65_STREAM_COMMANDS_USB_ONLY     1
+
+// Give USB CDC a chance to enumerate before SD-backed settings and WiFi
+// connection attempts can block boot progress.
+#define M65_REMOTE_INIT_DELAY_MS         15000u
+#define M65_WIFI_CONNECT_TIMEOUT_MS      5000u
 
 #ifndef M65_LED_PIN
 #ifdef PICO_DEFAULT_LED_PIN
@@ -99,4 +106,9 @@
 #define M65_JTAG_POST_BYPASS_IDLE_CLOCKS     1024u
 #define M65_JTAG_POST_TAP_RESET_IDLE_CLOCKS  1024u
 
-#define M65_VERSION_STRING   "pico-m65jtag v0.1-experimental"
+#ifndef M65_PICO_BOARD_NAME
+#define M65_PICO_BOARD_NAME "unknown"
+#endif
+
+#define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG v0.1"
+#define M65_BUILD_MARKER     "jtag-id-warn-20260714"

@@ -41,7 +41,13 @@ target_include_directories(pico_m65jtag PRIVATE
     "${PICO_SDK_PATH}/lib/mbedtls/include/mbedtls"
     "${PICO_SDK_PATH}/lib/mbedtls/library"
 )
-target_compile_definitions(pico_m65jtag PRIVATE MBEDTLS_CONFIG_FILE="m65_mbedtls_config.h")
+target_compile_definitions(pico_m65jtag PRIVATE
+    MBEDTLS_CONFIG_FILE="m65_mbedtls_config.h"
+    M65_PICO_BOARD_NAME="${PICO_BOARD}"
+    USBD_MANUFACTURER="MEGA65"
+    USBD_PRODUCT="MEGA65 Expansion Board Integrated JTAG"
+    USBD_DESC_STR_MAX=64
+)
 if(M65_SD_MODE)
     target_compile_definitions(pico_m65jtag PRIVATE M65_SD_MODE=${M65_SD_MODE})
 endif()
@@ -52,6 +58,7 @@ target_link_libraries(pico_m65jtag
     hardware_gpio
     hardware_timer
     hardware_spi
+    hardware_watchdog
     pico_mbedtls_crypto
 )
 

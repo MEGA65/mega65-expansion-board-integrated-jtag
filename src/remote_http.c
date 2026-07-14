@@ -20,6 +20,12 @@
 #ifndef M65_WIFI_CONNECT_TIMEOUT_MS
 #define M65_WIFI_CONNECT_TIMEOUT_MS 15000u
 #endif
+#ifndef M65_WIFI_HW_PROBE_WATCHDOG_MS
+#define M65_WIFI_HW_PROBE_WATCHDOG_MS 10000u
+#endif
+#ifndef M65_WIFI_POLL_INTERVAL_US
+#define M65_WIFI_POLL_INTERVAL_US 1000u
+#endif
 #ifndef M65_HTTP_HEADER_MAX
 #define M65_HTTP_HEADER_MAX 1536u
 #endif
@@ -36,9 +42,13 @@
 #if !M65_WIFI_SUPPORTED
 
 void remote_http_init(void) {}
+void remote_http_boot_check(void) {}
 void remote_http_poll(void) {}
 bool remote_http_active(void) { return false; }
 const char *remote_http_status(void) { return "wifi=not-supported"; }
+const char *remote_http_wifi_summary(void) { return "NO HARDWARE"; }
+const char *remote_http_wifi_diag(void) { return "supported=0 board=" M65_PICO_BOARD_NAME; }
+bool remote_http_wifi_probe_now(void) { return false; }
 bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err, size_t err_len)
 {
     (void)url;
@@ -68,6 +78,7 @@ bool remote_http_autofetch_running(void) { return false; }
 
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
+#include "hardware/watchdog.h"
 #include "lwip/dhcp.h"
 #include "lwip/dns.h"
 #include "lwip/ip4_addr.h"
@@ -144,6 +155,13 @@ typedef enum {
     AUTOFETCH_CORE,
 } autofetch_state_t;
 
+typedef enum {
+    WIFI_ASSOC_OFF = 0,
+    WIFI_ASSOC_CONNECTING,
+    WIFI_ASSOC_FAILED,
+    WIFI_ASSOC_HTTP_ACTIVE,
+} wifi_assoc_state_t;
+
 typedef struct {
     struct tcp_pcb *pcb;
     fetch_state_t state;
@@ -176,7 +194,21 @@ static remote_auth_config_t http_cfg;
 static http_conn_t http_conn;
 static struct tcp_pcb *listen_pcb;
 static bool http_is_active;
-static char http_status_buf[128] = "wifi=inactive";
+static bool cyw43_is_ready;
+static bool wifi_hardware_blocked;
+static bool wifi_hardware_known_present;
+static bool wifi_probe_pending;
+static bool remote_init_after_probe_pending;
+static uint32_t wifi_hardware_fault_stage;
+static uint32_t wifi_probe_attempts;
+static int wifi_init_rc = -9999;
+static char wifi_diag_buf[192];
+static wifi_assoc_state_t wifi_assoc_state = WIFI_ASSOC_OFF;
+static absolute_time_t wifi_assoc_deadline;
+static absolute_time_t wifi_assoc_retry_at;
+static absolute_time_t wifi_poll_due;
+static int wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
+static char http_status_buf[128] = "wifi=inactive hardware=not-probed";
 static char page_buf[M65_HTTP_PAGE_MAX];
 static char top_template[M65_HTTP_TEMPLATE_MAX];
 static char row_template[M65_HTTP_TEMPLATE_MAX];
@@ -198,6 +230,46 @@ static char autofetch_channel[24];
 static char autofetch_pending_path[224];
 static char autofetch_pending_sha[65];
 static char autofetch_status_buf[192] = "autofetch=idle";
+
+#define WIFI_HW_PROBE_MAGIC 0x4d365748u
+#define WIFI_HW_STAGE_INIT 1u
+#define WIFI_HW_STAGE_STA  2u
+#define WIFI_HW_STAGE_JOIN 3u
+
+static const char *wifi_hw_stage_name(uint32_t stage)
+{
+    switch (stage) {
+    case WIFI_HW_STAGE_INIT: return "init";
+    case WIFI_HW_STAGE_STA: return "sta";
+    case WIFI_HW_STAGE_JOIN: return "join";
+    default: return "unknown";
+    }
+}
+
+static void wifi_hw_probe_marker_clear(void)
+{
+    if (watchdog_hw->scratch[0] == WIFI_HW_PROBE_MAGIC) {
+        watchdog_hw->scratch[0] = 0;
+        watchdog_hw->scratch[1] = 0;
+    }
+}
+
+static void wifi_hw_status_blocked(void)
+{
+    if (wifi_hardware_fault_stage == WIFI_HW_STAGE_INIT) {
+        snprintf(http_status_buf, sizeof http_status_buf,
+                 "wifi=disabled hardware=cyw43-timeout stage=%s attempts=%lu init_rc=%d",
+                 wifi_hw_stage_name(wifi_hardware_fault_stage),
+                 (unsigned long)wifi_probe_attempts,
+                 wifi_init_rc);
+    } else {
+        snprintf(http_status_buf, sizeof http_status_buf,
+                 "wifi=disabled hardware=cyw43 driver-timeout stage=%s attempts=%lu init_rc=%d",
+                 wifi_hw_stage_name(wifi_hardware_fault_stage),
+                 (unsigned long)wifi_probe_attempts,
+                 wifi_init_rc);
+    }
+}
 
 static const char default_top[] =
     "<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -2119,48 +2191,77 @@ static bool configure_static_ip(void)
     return true;
 }
 
-void remote_http_init(void)
+static bool remote_http_probe_wifi_hardware(void)
 {
-    http_is_active = false;
-    snprintf(http_status_buf, sizeof http_status_buf, "wifi=inactive");
+    if (wifi_hardware_blocked) {
+        wifi_hw_status_blocked();
+        return false;
+    }
+    if (cyw43_is_ready) return true;
 
-    if (!storage_mount()) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled sd=%s", storage_last_error());
-        return;
-    }
+    ++wifi_probe_attempts;
+    wifi_init_rc = -9999;
+    snprintf(http_status_buf, sizeof http_status_buf, "wifi=probing hardware=cyw43");
+    watchdog_hw->scratch[0] = WIFI_HW_PROBE_MAGIC;
+    watchdog_hw->scratch[1] = WIFI_HW_STAGE_INIT;
+    watchdog_enable(M65_WIFI_HW_PROBE_WATCHDOG_MS, false);
 
-    char err[96];
-    if (!remote_auth_load(&http_cfg, err, sizeof err)) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled remote=%s", err);
-        return;
-    }
-    if (!http_cfg.http_enabled) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled http=0");
-        return;
-    }
-    if (!http_cfg.wifi_ssid[0]) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled ssid=missing");
-        return;
-    }
-
-    if (cyw43_arch_init() != 0) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=init-failed");
-        return;
-    }
-    cyw43_arch_enable_sta_mode();
-    if (!http_cfg.dhcp) configure_static_ip();
-
-    int rc = cyw43_arch_wifi_connect_timeout_ms(http_cfg.wifi_ssid,
-                                                http_cfg.wifi_psk[0] ? http_cfg.wifi_psk : NULL,
-                                                CYW43_AUTH_WPA2_AES_PSK,
-                                                M65_WIFI_CONNECT_TIMEOUT_MS);
-    if (rc != 0) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-failed rc=%d", rc);
-        return;
+    wifi_init_rc = cyw43_arch_init();
+    if (wifi_init_rc != 0) {
+        watchdog_disable();
+        wifi_hw_probe_marker_clear();
+        wifi_hardware_blocked = true;
+        wifi_hardware_fault_stage = WIFI_HW_STAGE_INIT;
+        snprintf(http_status_buf, sizeof http_status_buf,
+                 "wifi=disabled hardware=cyw43-init-failed init_rc=%d attempts=%lu",
+                 wifi_init_rc,
+                 (unsigned long)wifi_probe_attempts);
+        return false;
     }
 
+    watchdog_disable();
+    wifi_hw_probe_marker_clear();
+    cyw43_is_ready = true;
+    wifi_hardware_known_present = true;
+    wifi_poll_due = get_absolute_time();
+    snprintf(http_status_buf, sizeof http_status_buf, "wifi=inactive hardware=cyw43");
+    return true;
+}
+
+void remote_http_boot_check(void)
+{
+    if (watchdog_caused_reboot() && watchdog_hw->scratch[0] == WIFI_HW_PROBE_MAGIC) {
+        wifi_hardware_blocked = true;
+        wifi_hardware_fault_stage = watchdog_hw->scratch[1];
+        wifi_probe_attempts = 1;
+        if (wifi_hardware_fault_stage != WIFI_HW_STAGE_INIT) {
+            wifi_hardware_known_present = true;
+        }
+        wifi_hw_status_blocked();
+    }
+    wifi_hw_probe_marker_clear();
+}
+
+static const char *wifi_link_name(int status)
+{
+    switch (status) {
+    case CYW43_LINK_DOWN: return "down";
+    case CYW43_LINK_JOIN: return "join";
+    case CYW43_LINK_NOIP: return "noip";
+    case CYW43_LINK_UP: return "up";
+    case CYW43_LINK_FAIL: return "fail";
+    case CYW43_LINK_NONET: return "nonet";
+    case CYW43_LINK_BADAUTH: return "badauth";
+    default: return "unknown";
+    }
+}
+
+static void remote_http_finish_wifi_join(void)
+{
     if (!listen_http(http_cfg.http_port)) {
         snprintf(http_status_buf, sizeof http_status_buf, "wifi=http-listen-failed");
+        wifi_assoc_state = WIFI_ASSOC_FAILED;
+        http_is_active = false;
         return;
     }
 
@@ -2170,11 +2271,130 @@ void remote_http_init(void)
     remote_auth_format_ipv4(ip, ip_text, sizeof ip_text);
     snprintf(http_status_buf, sizeof http_status_buf, "wifi=up ip=%s port=%u", ip_text, (unsigned)http_cfg.http_port);
     http_is_active = true;
+    wifi_assoc_state = WIFI_ASSOC_HTTP_ACTIVE;
+}
+
+static void remote_http_poll_wifi_join(void)
+{
+    int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+    if (status == CYW43_LINK_UP) {
+        remote_http_finish_wifi_join();
+        return;
+    }
+
+    if (status == CYW43_LINK_NONET) {
+        if (absolute_time_diff_us(get_absolute_time(), wifi_assoc_retry_at) <= 0) {
+            int rc = cyw43_arch_wifi_connect_async(http_cfg.wifi_ssid,
+                                                   http_cfg.wifi_psk[0] ? http_cfg.wifi_psk : NULL,
+                                                   CYW43_AUTH_WPA2_AES_PSK);
+            wifi_assoc_retry_at = make_timeout_time_ms(1000u);
+            if (rc != 0) {
+                snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-retry-failed rc=%d", rc);
+                wifi_assoc_state = WIFI_ASSOC_FAILED;
+                http_is_active = false;
+                return;
+            }
+        }
+        status = CYW43_LINK_JOIN;
+    } else if (status < 0) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-failed status=%s", wifi_link_name(status));
+        wifi_assoc_state = WIFI_ASSOC_FAILED;
+        http_is_active = false;
+        return;
+    }
+
+    if (absolute_time_diff_us(get_absolute_time(), wifi_assoc_deadline) <= 0) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-timeout status=%s", wifi_link_name(status));
+        wifi_assoc_state = WIFI_ASSOC_FAILED;
+        http_is_active = false;
+        return;
+    }
+
+    if (status != wifi_assoc_last_status) {
+        wifi_assoc_last_status = status;
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=connecting status=%s ssid=%s",
+                 wifi_link_name(status), http_cfg.wifi_ssid);
+    }
+}
+
+void remote_http_init(void)
+{
+    http_is_active = false;
+    wifi_assoc_state = WIFI_ASSOC_OFF;
+    wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
+
+    if (!cyw43_is_ready) {
+        if (wifi_hardware_blocked) {
+            wifi_hw_status_blocked();
+            return;
+        }
+        wifi_probe_pending = true;
+        remote_init_after_probe_pending = true;
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=probe-pending hardware=cyw43 remote=init");
+        return;
+    }
+
+    if (!storage_mount()) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 remote=config-unavailable");
+        return;
+    }
+
+    char err[96];
+    if (!remote_auth_load(&http_cfg, err, sizeof err)) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 remote=%s", err);
+        return;
+    }
+    if (!http_cfg.http_enabled) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 http=0");
+        return;
+    }
+    if (!http_cfg.wifi_ssid[0]) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 ssid=missing");
+        return;
+    }
+
+    watchdog_hw->scratch[0] = WIFI_HW_PROBE_MAGIC;
+    watchdog_hw->scratch[1] = WIFI_HW_STAGE_STA;
+    watchdog_enable(M65_WIFI_HW_PROBE_WATCHDOG_MS, false);
+
+    cyw43_arch_enable_sta_mode();
+    if (!http_cfg.dhcp) configure_static_ip();
+
+    watchdog_hw->scratch[1] = WIFI_HW_STAGE_JOIN;
+    int rc = cyw43_arch_wifi_connect_async(http_cfg.wifi_ssid,
+                                           http_cfg.wifi_psk[0] ? http_cfg.wifi_psk : NULL,
+                                           CYW43_AUTH_WPA2_AES_PSK);
+    watchdog_disable();
+    wifi_hw_probe_marker_clear();
+    if (rc != 0) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-start-failed rc=%d", rc);
+        wifi_assoc_state = WIFI_ASSOC_FAILED;
+        return;
+    }
+
+    wifi_assoc_deadline = make_timeout_time_ms(M65_WIFI_CONNECT_TIMEOUT_MS);
+    wifi_assoc_retry_at = make_timeout_time_ms(1000u);
+    wifi_assoc_state = WIFI_ASSOC_CONNECTING;
+    wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
+    snprintf(http_status_buf, sizeof http_status_buf, "wifi=connecting status=start ssid=%s", http_cfg.wifi_ssid);
 }
 
 void remote_http_poll(void)
 {
-    if (http_is_active) cyw43_arch_poll();
+    if (wifi_probe_pending) {
+        wifi_probe_pending = false;
+        bool ok = remote_http_probe_wifi_hardware();
+        if (ok && remote_init_after_probe_pending) {
+            remote_init_after_probe_pending = false;
+            remote_http_init();
+        }
+    }
+    if (!cyw43_is_ready) return;
+    absolute_time_t now = get_absolute_time();
+    if (absolute_time_diff_us(now, wifi_poll_due) > 0) return;
+    wifi_poll_due = delayed_by_us(now, M65_WIFI_POLL_INTERVAL_US);
+    cyw43_arch_poll();
+    if (wifi_assoc_state == WIFI_ASSOC_CONNECTING) remote_http_poll_wifi_join();
 }
 
 bool remote_http_active(void)
@@ -2185,6 +2405,42 @@ bool remote_http_active(void)
 const char *remote_http_status(void)
 {
     return http_status_buf;
+}
+
+const char *remote_http_wifi_summary(void)
+{
+    if (cyw43_is_ready || wifi_hardware_known_present) return "BUILT-IN";
+    if (wifi_hardware_blocked) return "NO HARDWARE";
+    return "PROBING";
+}
+
+const char *remote_http_wifi_diag(void)
+{
+    snprintf(wifi_diag_buf, sizeof wifi_diag_buf,
+             "supported=1 board=%s ready=%lu blocked=%lu known_present=%lu pending=%lu remote_after_probe=%lu attempts=%lu init_rc=%d fault_stage=%s status=\"%s\"",
+             M65_PICO_BOARD_NAME,
+             (unsigned long)(cyw43_is_ready ? 1u : 0u),
+             (unsigned long)(wifi_hardware_blocked ? 1u : 0u),
+             (unsigned long)(wifi_hardware_known_present ? 1u : 0u),
+             (unsigned long)(wifi_probe_pending ? 1u : 0u),
+             (unsigned long)(remote_init_after_probe_pending ? 1u : 0u),
+             (unsigned long)wifi_probe_attempts,
+             wifi_init_rc,
+             wifi_hw_stage_name(wifi_hardware_fault_stage),
+             http_status_buf);
+    return wifi_diag_buf;
+}
+
+bool remote_http_wifi_probe_now(void)
+{
+    if (cyw43_is_ready) {
+        return true;
+    }
+    wifi_hardware_blocked = false;
+    wifi_hardware_fault_stage = 0;
+    wifi_probe_pending = true;
+    snprintf(http_status_buf, sizeof http_status_buf, "wifi=probe-pending hardware=cyw43 manual=1");
+    return true;
 }
 
 #endif

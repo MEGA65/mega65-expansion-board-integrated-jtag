@@ -3,6 +3,7 @@ import argparse
 import base64
 import hashlib
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -29,9 +30,17 @@ KEY_DIR = Path.home() / ".m65jtag" / "keys"
 DEFAULT_KEY_NAME = "default"
 CONFIG_FILES = (Path(".m65j.config"), Path.home() / ".m65j.config")
 SIGNED_SCAN_EXTS = (".bit", ".cor", ".core", ".m65j", ".sha256")
+M65J_USB_MANUFACTURER = "MEGA65"
+M65J_USB_PRODUCT = "MEGA65 Expansion Board Integrated JTAG"
+M65J_ATI_PREFIX = "MEGA65 Expansion Board Integrated JTAG"
+RASPBERRY_PI_USB_VID = 0x2E8A
+PICO_SDK_CDC_PIDS = {0x0009, 0x000A}
 P256_SPKI_PREFIX = bytes.fromhex(
     "3059301306072a8648ce3d020106082a8648ce3d030107034200"
 )
+
+CLI_SERIAL_DEVICE = None
+CLI_WEB_URL = None
 
 
 def load_serial_module():
@@ -41,6 +50,115 @@ def load_serial_module():
         print("Install pyserial for serial-port commands: python3 -m pip install pyserial", file=sys.stderr)
         raise
     return serial
+
+
+def load_list_ports_module():
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        print("Install pyserial for serial-port auto-detection: python3 -m pip install pyserial", file=sys.stderr)
+        raise
+    return list_ports
+
+
+def port_info_text(port):
+    values = (
+        getattr(port, "device", None),
+        getattr(port, "name", None),
+        getattr(port, "description", None),
+        getattr(port, "manufacturer", None),
+        getattr(port, "product", None),
+        getattr(port, "serial_number", None),
+        getattr(port, "hwid", None),
+    )
+    return " ".join(str(v) for v in values if v)
+
+
+def format_port_info(port):
+    vid = getattr(port, "vid", None)
+    pid = getattr(port, "pid", None)
+    vidpid = f"{vid:04x}:{pid:04x}" if vid is not None and pid is not None else "vid:pid=?"
+    parts = [getattr(port, "device", "?"), vidpid]
+    for attr in ("manufacturer", "product", "serial_number"):
+        value = getattr(port, attr, None)
+        if value:
+            parts.append(str(value))
+    return " ".join(parts)
+
+
+def is_m65j_descriptor_port(port):
+    text = port_info_text(port).lower()
+    product = str(getattr(port, "product", "") or "").lower()
+    manufacturer = str(getattr(port, "manufacturer", "") or "").lower()
+    return (
+        M65J_USB_PRODUCT.lower() in text
+        or ("mega65" in text and "jtag" in text)
+        or (manufacturer == M65J_USB_MANUFACTURER.lower() and "jtag" in product)
+    )
+
+
+def is_pico_cdc_port(port):
+    vid = getattr(port, "vid", None)
+    pid = getattr(port, "pid", None)
+    if vid == RASPBERRY_PI_USB_VID and (pid in PICO_SDK_CDC_PIDS or pid is None):
+        return True
+    text = port_info_text(port).lower()
+    return "raspberry pi" in text and ("pico" in text or "board cdc" in text)
+
+
+def probe_m65j_port(serial, device, baud):
+    try:
+        with serial.Serial(device, baud, timeout=0.08, write_timeout=0.25) as ser:
+            time.sleep(0.05)
+            ser.reset_input_buffer()
+            ser.write(b"ATI\n")
+            ser.flush()
+            deadline = time.monotonic() + 0.9
+            seen = []
+            while time.monotonic() < deadline:
+                line = ser.readline()
+                if not line:
+                    continue
+                text = line.decode("utf-8", "replace").strip()
+                if text:
+                    seen.append(text)
+                joined = "\n".join(seen)
+                if M65J_ATI_PREFIX in joined or "pico-m65jtag" in joined:
+                    return True
+                if text == "OK" and seen:
+                    break
+    except (OSError, getattr(serial, "SerialException", OSError)):
+        return False
+    return False
+
+
+def autodetect_serial_port(baud):
+    serial = load_serial_module()
+    list_ports = load_list_ports_module()
+    ports = sorted(list_ports.comports(), key=lambda p: getattr(p, "device", ""))
+    descriptor_matches = [p for p in ports if is_m65j_descriptor_port(p)]
+
+    if len(descriptor_matches) == 1:
+        port = descriptor_matches[0]
+        print(f"INFO: auto-detected MEGA65 JTAG serial device: {format_port_info(port)}", file=sys.stderr)
+        return port.device
+    if len(descriptor_matches) > 1:
+        details = "\n  ".join(format_port_info(p) for p in descriptor_matches)
+        raise SystemExit(f"Multiple MEGA65 JTAG serial devices found; pass -s/--device:\n  {details}")
+
+    candidates = [p for p in ports if is_pico_cdc_port(p)]
+    if not candidates:
+        return None
+
+    probed = [p for p in candidates if probe_m65j_port(serial, p.device, baud)]
+    if len(probed) == 1:
+        port = probed[0]
+        print(f"INFO: auto-detected MEGA65 JTAG serial device by ATI probe: {format_port_info(port)}", file=sys.stderr)
+        return port.device
+    if len(probed) > 1:
+        details = "\n  ".join(format_port_info(p) for p in probed)
+        raise SystemExit(f"Multiple MEGA65 JTAG serial devices answered ATI; pass -s/--device:\n  {details}")
+    return None
 
 
 def run_openssl(args, input_data=None):
@@ -518,9 +636,28 @@ def read_client_config():
     return cfg
 
 
-def configured_device(cfg=None):
+def configured_serial_port(cfg=None):
+    if CLI_SERIAL_DEVICE:
+        return CLI_SERIAL_DEVICE
     cfg = read_client_config() if cfg is None else cfg
-    device = cfg.get("device") or cfg.get("url") or cfg.get("base_url")
+    for key in ("serial", "serial_port", "tty", "usb", "usb_device"):
+        value = cfg.get(key)
+        if value:
+            return value
+    value = cfg.get("device")
+    if value and is_serial_port_arg(value):
+        return value
+    return None
+
+
+def configured_device(cfg=None):
+    if CLI_WEB_URL:
+        return normalize_device(CLI_WEB_URL)
+    cfg = read_client_config() if cfg is None else cfg
+    device = cfg.get("url") or cfg.get("web_url") or cfg.get("http_url") or cfg.get("base_url")
+    legacy_device = cfg.get("device")
+    if not device and legacy_device and not is_serial_port_arg(legacy_device):
+        device = legacy_device
     if not device:
         ip = cfg.get("ip") or cfg.get("host")
         if ip:
@@ -534,8 +671,9 @@ def require_device(explicit=None):
     if device:
         return device
     raise SystemExit(
-        "No web device configured. Add device=http://<pico-ip> or ip=<pico-ip> "
-        "to .m65j.config or ~/.m65j.config, or pass the device URL."
+        "No web URL configured. Add url=http://<pico-ip> or ip=<pico-ip> "
+        "to .m65j.config or ~/.m65j.config, or pass -u/--url. "
+        "For USB serial, pass -s/--device or connect exactly one MEGA65 JTAG Pico CDC device."
     )
 
 
@@ -629,7 +767,7 @@ def signing_main(argv):
     ap.add_argument("--blank-filename", action="store_true", help="leave filename blank so firmware does not check it")
     ap.add_argument("--bless", action="store_true", help="write a signed local file instead of pushing by default")
     ap.add_argument("-o", "--output", type=Path, help="signed local output path")
-    ap.add_argument("--device", help="base board URL, e.g. http://mega65-jtag.local")
+    ap.add_argument("--device", "--url", "-u", dest="device", help="base board URL, e.g. http://mega65-jtag.local")
     ap.add_argument("--put", help="exact HTTP PUT URL; overrides --device URL construction")
     ap.add_argument("--store-only", action="store_true", help="with --device, PUT to /files/<name> instead of /jtag")
     ap.add_argument("--user", help="HTTP Basic auth user")
@@ -786,7 +924,7 @@ def add_mirror_options(ap, populate=False):
     ap.add_argument("--quiet", action="store_true", help="suppress mirror progress chatter")
     ap.add_argument("--detail-workers", type=int, default=8, help="parallel filehost JSON detail fetches; 1 disables")
     if populate:
-        ap.add_argument("--device", help="base board URL, e.g. http://mega65-jtag.local")
+        ap.add_argument("--device", "--url", "-u", dest="device", help="base board URL, e.g. http://mega65-jtag.local")
         ap.add_argument("--staging", type=Path, help="local staging directory; defaults to a temporary directory")
         ap.add_argument("--no-bless", action="store_true", help="upload files without signing/blessing them first")
         ap.add_argument("--user", help="HTTP Basic auth user")
@@ -978,6 +1116,148 @@ def first_arg_is_device(args):
     if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
         return True
     return "." in value and "/" not in value and "\\" not in value
+
+
+def is_serial_port_arg(value):
+    lower = str(value).lower()
+    return (
+        lower.startswith("/dev/tty") or
+        lower.startswith("/dev/cu") or
+        lower.startswith("/dev/serial/") or
+        re.match(r"^com\d+$", lower) is not None
+    )
+
+
+def parse_leading_global_options(argv):
+    opts = {
+        "serial": None,
+        "url": None,
+        "baud": None,
+        "timeout": None,
+    }
+    rest = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            rest.extend(argv[i + 1:])
+            break
+
+        if arg in {"-s", "--device", "--serial", "--tty"}:
+            if i + 1 >= len(argv):
+                raise SystemExit(f"{arg} expects a serial device path")
+            opts["serial"] = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--device=") or arg.startswith("--serial=") or arg.startswith("--tty="):
+            opts["serial"] = arg.split("=", 1)[1]
+            i += 1
+            continue
+
+        if arg in {"-u", "--url", "--web-url"}:
+            if i + 1 >= len(argv):
+                raise SystemExit(f"{arg} expects a board HTTP URL")
+            opts["url"] = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--url=") or arg.startswith("--web-url="):
+            opts["url"] = arg.split("=", 1)[1]
+            i += 1
+            continue
+
+        if arg == "--baud":
+            if i + 1 >= len(argv):
+                raise SystemExit("--baud expects a rate")
+            opts["baud"] = int(argv[i + 1], 0)
+            i += 2
+            continue
+        if arg.startswith("--baud="):
+            opts["baud"] = int(arg.split("=", 1)[1], 0)
+            i += 1
+            continue
+
+        if arg == "--timeout":
+            if i + 1 >= len(argv):
+                raise SystemExit("--timeout expects seconds")
+            opts["timeout"] = float(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--timeout="):
+            opts["timeout"] = float(arg.split("=", 1)[1])
+            i += 1
+            continue
+
+        rest.extend(argv[i:])
+        break
+    return opts, rest
+
+
+def rewrite_command_first_serial(argv):
+    if len(argv) < 2 or not is_serial_port_arg(argv[1]):
+        return argv
+    verb = argv[0].lower()
+    if verb in {
+        "load", "program", "jtagload",
+        "push", "jtag", "jtag-push",
+        "stream", "push-local", "program-local",
+        "store", "write", "upload", "install-file",
+        "sink", "dummy", "rx-test",
+    }:
+        return [argv[1], argv[0], *argv[2:]]
+    return argv
+
+
+def serial_command_candidate(argv):
+    if not argv:
+        return False
+    first = argv[0]
+    upper = first.upper()
+    lower = first.lower()
+    if upper.startswith("AT") or upper == "GO64":
+        return True
+    if upper in {
+        "?", "V", "L", "LIST", "DIR", "LS", "LL", "DETAIL", "COREDETAIL",
+        "CORELS", "I", "T", "P", "LOAD", "PROGRAM", "JTAGLOAD", "S", "N",
+        "W", "F", "R", "A", "D", "J", "X", "H", "M", "STATUS", "VERSION",
+        "VER", "IDENTIFY", "ABOUT", "WIFI", "HTTP", "SDCARD", "SDSTATUS",
+    }:
+        return True
+    return lower in {
+        "stream", "push", "jtag", "jtag-push", "push-local", "program-local",
+        "store", "write", "upload", "install-file", "sink", "dummy", "rx-test",
+    }
+
+
+def serial_preferred_even_with_web_config(argv):
+    if not argv:
+        return False
+    first = argv[0]
+    upper = first.upper()
+    lower = first.lower()
+    if upper.startswith("AT") or upper == "GO64":
+        return True
+    if upper in {
+        "?", "V", "L", "LIST", "DIR", "LS", "LL", "DETAIL", "COREDETAIL",
+        "CORELS", "I", "T", "P", "S", "N", "W", "F", "R", "A", "D",
+        "J", "X", "H", "M", "VERSION", "VER", "IDENTIFY", "ABOUT",
+        "WIFI", "HTTP", "SDCARD", "SDSTATUS",
+    }:
+        return True
+    return lower in {"stream", "sink", "dummy", "rx-test", "push-local", "program-local"}
+
+
+def resolve_implicit_serial_port(argv, baud, explicit_url=False):
+    if explicit_url or not serial_command_candidate(argv):
+        return None
+    serial_port = configured_serial_port()
+    web_device = configured_device()
+    if serial_port:
+        if web_device is None or serial_preferred_even_with_web_config(argv):
+            return serial_port
+        return None
+    if web_device is None:
+        return autodetect_serial_port(baud)
+    return None
 
 
 def pop_optional_device(args):
@@ -1210,7 +1490,8 @@ def read_response_lines(ser, cmd, timeout):
             return name in {
                 "I", "VERSION", "VER", "COREINFO", "CORE", "INFO",
                 "WRITEGRANT", "AUTH", "SDMODE", "JTAGID", "JTAGSTATUS",
-                "XSTATUS", "HIJACK", "MOUNT",
+                "XSTATUS", "HIJACK", "MOUNT", "WIFI", "HTTP",
+                "SDCARD", "SDSTATUS",
             }
         return command[:1].upper() in {"V", "I", "J", "H", "M", "A", "X", "D"}
 
@@ -1221,12 +1502,13 @@ def read_response_lines(ser, cmd, timeout):
             text = line.decode("utf-8", "replace").rstrip("\r\n")
             print(text)
             last = time.monotonic()
-            if text == "END" or text == "OK" or text == "NO CARRIER" or text.startswith("ERR ") or text in {"OK P DONE", "OK S DONE"} or text.startswith("OK N DONE") or text.startswith("OK T DONE") or text.startswith("OK W DONE") or text.startswith("OK F DONE") or text.startswith("OK R DONE"):
-                break
+            if text == "END" or text == "OK" or text == "NO CARRIER" or text.startswith("ERR ") or text.startswith("ERROR:") or text in {"OK P DONE", "OK S DONE"} or text.startswith("OK N DONE") or text.startswith("OK T DONE") or text.startswith("OK W DONE") or text.startswith("OK F DONE") or text.startswith("OK R DONE"):
+                return not (text.startswith("ERR ") or text.startswith("ERROR"))
             if single_line_ok(cmd) and text.startswith("OK "):
-                break
+                return True
         elif time.monotonic() - last > timeout:
-            break
+            print(f"ERR host timeout waiting for response to {cmd}", file=sys.stderr)
+            return False
 
 
 def wait_for_ready(ser, timeout):
@@ -1433,20 +1715,33 @@ def translate_manual_command(parts):
     upper = first.upper()
     rest = " ".join(parts[1:]).strip()
 
-    if upper.startswith("AT") or upper == "GO64":
-        return " ".join(parts).strip()
+    if upper.startswith("AT"):
+        joined = " ".join(parts).strip()
+        return "AT" + joined[2:]
+    if upper == "GO64":
+        return "GO64"
 
     if upper == "?":
         return "AT+HELP"
-    if upper == "V":
+    if upper in {"V", "STATUS", "VERSION", "VER"}:
         return "AT+VERSION?"
-    if upper == "L":
+    if upper in {"WIFI", "HTTP"}:
+        return f"AT+{upper}?"
+    if upper in {"SDCARD", "SDSTATUS"}:
+        return "AT+SDCARD?"
+    if upper in {"IDENTIFY", "ABOUT"}:
+        return "ATI"
+    if upper in {"L", "LIST", "DIR"}:
         return f"AT+CORELIST={rest}" if rest else "AT+CORELIST"
+    if upper in {"LS", "LL", "DETAIL", "COREDETAIL", "CORELS"}:
+        return f"AT+COREDETAIL={rest}" if rest else "AT+COREDETAIL"
     if upper == "I":
         return f"AT+COREINFO={rest}"
     if upper == "T":
         return f"AT+CORETEST={rest}"
     if upper == "P":
+        return f"AT+JTAGLOAD={rest}"
+    if upper in {"LOAD", "PROGRAM", "JTAGLOAD"}:
         return f"AT+JTAGLOAD={rest}"
     if upper == "S":
         return f"AT+JTAGSTREAM={rest}"
@@ -1474,77 +1769,153 @@ def translate_manual_command(parts):
     return " ".join(parts).strip()
 
 
+def send_serial_text_command(ser, cmd, timeout):
+    ser.reset_input_buffer()
+    data = (cmd + "\n").encode("utf-8")
+    try:
+        written = ser.write(data)
+    except Exception as e:
+        print(f"ERR host serial write failed: {e}", file=sys.stderr)
+        return 1
+    if written != len(data):
+        print(f"ERR host serial write short: {written}/{len(data)}", file=sys.stderr)
+        return 1
+    return 0 if read_response_lines(ser, cmd, timeout) else 1
+
+
+def at_filename_arg(name):
+    if '"' in name:
+        raise SystemExit(f'filename cannot contain double quotes for AT command fallback: {name}')
+    if not name or any(c.isspace() for c in name):
+        return f'"{name}"'
+    return name
+
+
+def run_serial_command(port, command, baud, timeout):
+    if not command:
+        raise SystemExit("missing serial command")
+
+    serial = load_serial_module()
+    with serial.Serial(port, baud, timeout=timeout, write_timeout=max(timeout, 2.0)) as ser:
+        # Host-to-Pico streaming command. This does NOT need an SD card on the Pico.
+        if command[0].lower() in {"stream", "push", "jtag", "jtag-push", "push-local", "program-local"}:
+            if len(command) != 2:
+                raise SystemExit(f"{command[0]} expects exactly one .bit/.cor/.m65j filename")
+            verb = command[0].lower()
+            local_candidate = os.path.expanduser(command[1])
+            if os.path.isfile(local_candidate):
+                return stream_local_file(ser, local_candidate, timeout)
+            if verb in {"push", "jtag", "jtag-push"}:
+                print("NOTE local file not found; using Pico SD-card load command", file=sys.stderr)
+                return send_serial_text_command(ser, f"AT+JTAGLOAD={at_filename_arg(command[1])}", timeout)
+            raise SystemExit(f"local file not found: {command[1]}")
+
+        if command[0].lower() in {"sink", "dummy", "rx-test"}:
+            if len(command) != 2:
+                raise SystemExit("sink expects exactly one local .bit/.cor/.m65j filename")
+            return sink_local_file(ser, command[1], timeout)
+
+        if command[0].lower() in {"store", "write", "upload", "install-file"}:
+            if len(command) not in {2, 3}:
+                raise SystemExit(f"{command[0]} expects: {command[0]} localfile [remote-name]")
+            remote = command[2] if len(command) == 3 else None
+            return write_local_file(ser, command[1], remote, timeout)
+
+        if command[0].upper() in {"P", "LOAD", "PROGRAM", "JTAGLOAD"} and len(command) == 2:
+            local_candidate = os.path.expanduser(command[1])
+            if os.path.isfile(local_candidate):
+                print("NOTE local file exists; using streaming mode, not Pico SD-card load command", file=sys.stderr)
+                return stream_local_file(ser, local_candidate, timeout)
+
+        cmd = translate_manual_command(command)
+        return send_serial_text_command(ser, cmd, timeout)
+
+
 def main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
+    global CLI_SERIAL_DEVICE, CLI_WEB_URL
+
+    global_opts, argv = parse_leading_global_options(list(sys.argv[1:] if argv is None else argv))
+    CLI_SERIAL_DEVICE = global_opts["serial"]
+    CLI_WEB_URL = global_opts["url"]
+    baud = global_opts["baud"] if global_opts["baud"] is not None else 2_000_000
+    timeout = global_opts["timeout"] if global_opts["timeout"] is not None else 5.0
+
+    argv = rewrite_command_first_serial(argv)
+
+    serial_port = None
+    if CLI_SERIAL_DEVICE:
+        serial_port = CLI_SERIAL_DEVICE
+    elif argv and is_serial_port_arg(argv[0]):
+        serial_port = argv[0]
+        argv = argv[1:]
+    elif not argv and not CLI_WEB_URL and configured_device() is None:
+        serial_port = configured_serial_port() or autodetect_serial_port(baud)
+        if serial_port:
+            argv = ["ATI"]
+    else:
+        serial_port = resolve_implicit_serial_port(argv, baud, explicit_url=bool(CLI_WEB_URL))
+
+    if serial_port:
+        if not argv:
+            argv = ["ATI"]
+        return run_serial_command(serial_port, argv, baud, timeout)
+
     remote_result = route_remote_command(argv)
     if remote_result is not None:
         return remote_result
 
     ap = argparse.ArgumentParser(
+        usage="%(prog)s [-h] [-s TTY] [-u URL] [--baud BAUD] [--timeout TIMEOUT] [target-or-command] ...",
         description="Single client for pico-m65jtag serial, signing, and HTTP/JTAG delivery",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """\
             Common commands:
+              m65j.py -s /dev/ttyACM0 ATI
+              m65j.py -s /dev/ttyACM0 push local.bit
+              m65j.py -u http://mega65-jtag.local status
+              m65j.py -u http://mega65-jtag.local push core.bit --board 6
+              m65j.py wifi
+              m65j.py sdcard
+              m65j.py status
               m65j.py keys
               m65j.py check sdcard/cores
               m65j.py bless --board 6 core.bit
               m65j.py mirror stable sdcard/cores --board all --overwrite --bless --yes
               m65j.py populate stable --board all --overwrite --yes
               m65j.py list [--board 6]
-              m65j.py push [device-url] core.bit --board 6
-              m65j.py store [device-url] core.bit --board 6
-              m65j.py load [device-url] /cores/core.cor --board 6
-              m65j.py get [device-url] /cores/core.cor -o core.cor
-              m65j.py downloads-get [device-url] fetched.bit -o fetched.bit
+              m65j.py push [url] core.bit --board 6
+              m65j.py store [url] core.bit --board 6
+              m65j.py load [url] /cores/core.cor --board 6
+              m65j.py get [url] /cores/core.cor -o core.cor
+              m65j.py downloads-get [url] fetched.bit -o fetched.bit
               m65j.py put http://host/files/core.bit core.bit --board 6
               m65j.py /dev/ttyACM0 ATI
               m65j.py /dev/ttyACM0 stream local.bit
 
-            Web commands read .m65j.config, then ~/.m65j.config, when no device URL is supplied.
-            Use `device=http://<pico-ip>` or `ip=<pico-ip>` in that config file.
+            Global target options may be placed before the command:
+              -s, --device <tty>     serial TTY, e.g. /dev/ttyACM0
+              -u, --url <url>        board HTTP URL, e.g. http://mega65-jtag.local
+
+            The client reads .m65j.config, then ~/.m65j.config.
+            Use `serial=/dev/ttyACM0` for the USB TTY and `url=http://<pico-ip>`
+            or `ip=<pico-ip>` for the HTTP URL. If neither is configured, a
+            single connected MEGA65 JTAG Pico USB CDC device is auto-detected.
             """
         ),
     )
-    ap.add_argument("port", help="serial port, e.g. /dev/ttyACM0 or COM3")
+    ap.add_argument("port", metavar="target-or-command",
+                    help="legacy serial port form, e.g. /dev/ttyACM0 ATI")
     ap.add_argument("command", nargs=argparse.REMAINDER,
                     help="serial command to send, e.g. ATI, AT+JTAGID?, AT+JTAGLOAD=/core.bit, or stream local.bit")
+    ap.add_argument("-s", "--device", "--serial", dest="serial_device", help="serial TTY, e.g. /dev/ttyACM0")
+    ap.add_argument("-u", "--url", dest="web_url", help="board HTTP URL, e.g. http://mega65-jtag.local")
     ap.add_argument("--baud", type=int, default=2_000_000)
-    ap.add_argument("--timeout", type=float, default=1.0)
+    ap.add_argument("--timeout", type=float, default=5.0)
     args = ap.parse_args(argv)
     if not args.command:
         ap.error("missing command")
-
-    serial = load_serial_module()
-    with serial.Serial(args.port, args.baud, timeout=args.timeout, write_timeout=None) as ser:
-        # Host-to-Pico streaming command. This does NOT need an SD card on the Pico.
-        if args.command[0].lower() in {"stream", "push-local", "program-local"}:
-            if len(args.command) != 2:
-                ap.error("stream expects exactly one local .bit/.cor/.m65j filename")
-            sys.exit(stream_local_file(ser, args.command[1], args.timeout))
-
-        if args.command[0].lower() in {"sink", "dummy", "rx-test"}:
-            if len(args.command) != 2:
-                ap.error("sink expects exactly one local .bit/.cor/.m65j filename")
-            sys.exit(sink_local_file(ser, args.command[1], args.timeout))
-
-        if args.command[0].lower() in {"write", "upload", "install-file"}:
-            if len(args.command) not in {2, 3}:
-                ap.error("write expects: write localfile [remote-name]")
-            remote = args.command[2] if len(args.command) == 3 else None
-            sys.exit(write_local_file(ser, args.command[1], remote, args.timeout))
-
-        if args.command[0].upper() == "P" and len(args.command) == 2:
-            local_candidate = os.path.expanduser(args.command[1])
-            if os.path.isfile(local_candidate):
-                print("NOTE local file exists; using streaming mode, not Pico SD-card P command", file=sys.stderr)
-                sys.exit(stream_local_file(ser, local_candidate, args.timeout))
-
-        cmd = translate_manual_command(args.command)
-        ser.reset_input_buffer()
-        ser.write((cmd + "\n").encode("utf-8"))
-        ser.flush()
-        read_response_lines(ser, cmd, args.timeout)
+    return run_serial_command(args.serial_device or args.port, args.command, args.baud, args.timeout)
 
 
 if __name__ == "__main__":
