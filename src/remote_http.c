@@ -2410,7 +2410,7 @@ const char *remote_http_status(void)
 const char *remote_http_wifi_summary(void)
 {
     if (cyw43_is_ready || wifi_hardware_known_present) return "BUILT-IN";
-    if (wifi_hardware_blocked) return "NO HARDWARE";
+    if (wifi_hardware_blocked) return "PROBE FAILED";
     return "PROBING";
 }
 

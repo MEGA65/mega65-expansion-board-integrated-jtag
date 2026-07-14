@@ -19,6 +19,8 @@ PICO_SDK_REPO    ?= https://github.com/raspberrypi/pico-sdk.git
 PICOTOOL_REPO    ?= https://github.com/raspberrypi/picotool.git
 PICOTOOL_PATH    ?= $(CURDIR)/$(DEPS_DIR)/picotool/build/picotool
 PICOTOOL_FETCH_FROM_GIT_PATH ?= $(if $(wildcard $(CURDIR)/build/_deps/picotool/picotool),$(CURDIR)/build/_deps,)
+WIFI_PROBE_BUILD_DIR ?= build-wifi-probe
+WIFI_PROBE_UF2 ?= $(WIFI_PROBE_BUILD_DIR)/mega65-wifi-probe.uf2
 
 # Default is now FatFs-on, because P <filename> and L are the whole point.
 # Use `make nofatfs` or `make USE_FATFS=0` for a JTAG/UART-only bring-up build.
@@ -49,7 +51,8 @@ CMAKE_SD_MODE_ARGS := $(if $(strip $(M65_SD_MODE)),-DM65_SD_MODE=$(M65_SD_MODE),
 CMAKE_PICOTOOL_ARGS := $(if $(strip $(PICOTOOL_FETCH_FROM_GIT_PATH)),-DPICOTOOL_FETCH_FROM_GIT_PATH=$(PICOTOOL_FETCH_FROM_GIT_PATH),)
 
 .PHONY: all help deps check-tools sdk fatfs configure build nofatfs clean distclean nuke \
-        upload flash upload-picotool upload-uf2 picotool print-config terminal
+        upload flash upload-picotool upload-uf2 picotool print-config terminal \
+        wifi-probe wifi-probe-lwip wifi-probe-bg wifi-probe-manual wifi-probe-manual-bg upload-wifi-probe
 
 all: build
 
@@ -65,6 +68,11 @@ help:
 	@echo "  make picotool          Build local picotool under .deps/picotool/build/"
 	@echo "  make upload-picotool   Flash using system/local picotool"
 	@echo "  make nofatfs           Build UART/JTAG-only firmware without SD/FatFs"
+	@echo "  make wifi-probe        Build standalone Pico W bare CYW43 probe, no SD/FatFs/JTAG/lwIP"
+	@echo "  make wifi-probe-lwip   Build same probe against pico_cyw43_arch_lwip_poll"
+	@echo "  make wifi-probe-bg     Build same probe against pico_cyw43_arch_lwip_threadsafe_background"
+	@echo "  make wifi-probe-manual Build staged manual CYW43/lwIP poll probe"
+	@echo "  make wifi-probe-manual-bg Build staged manual CYW43/lwIP background probe"
 	@echo "  make clean             Clean CMake build products"
 	@echo "  make distclean         Remove build directory"
 	@echo "  make nuke              Remove build directory and downloaded .deps"
@@ -148,11 +156,93 @@ build: configure
 nofatfs:
 	$(MAKE) USE_FATFS=0 BUILD_DIR=build-nofatfs build
 
+wifi-probe: sdk
+	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)" \
+		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
+		-DPICO_BOARD=pico_w \
+		-DWIFI_PROBE_MODE=none \
+		$(CMAKE_PICOTOOL_ARGS)
+	cmake --build "$(WIFI_PROBE_BUILD_DIR)" --parallel
+	cp "$(WIFI_PROBE_BUILD_DIR)/m65_wifi_probe.uf2" "$(WIFI_PROBE_UF2)"
+	@echo
+	@echo "Built: $(WIFI_PROBE_UF2)"
+
+wifi-probe-lwip: sdk
+	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-lwip" \
+		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
+		-DPICO_BOARD=pico_w \
+		-DWIFI_PROBE_MODE=lwip_poll \
+		$(CMAKE_PICOTOOL_ARGS)
+	cmake --build "$(WIFI_PROBE_BUILD_DIR)-lwip" --parallel
+	cp "$(WIFI_PROBE_BUILD_DIR)-lwip/m65_wifi_probe.uf2" "$(WIFI_PROBE_BUILD_DIR)-lwip/mega65-wifi-probe-lwip.uf2"
+	@echo
+	@echo "Built: $(WIFI_PROBE_BUILD_DIR)-lwip/mega65-wifi-probe-lwip.uf2"
+
+wifi-probe-bg: sdk
+	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-bg" \
+		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
+		-DPICO_BOARD=pico_w \
+		-DWIFI_PROBE_MODE=lwip_background \
+		$(CMAKE_PICOTOOL_ARGS)
+	cmake --build "$(WIFI_PROBE_BUILD_DIR)-bg" --parallel
+	cp "$(WIFI_PROBE_BUILD_DIR)-bg/m65_wifi_probe.uf2" "$(WIFI_PROBE_BUILD_DIR)-bg/mega65-wifi-probe-bg.uf2"
+	@echo
+	@echo "Built: $(WIFI_PROBE_BUILD_DIR)-bg/mega65-wifi-probe-bg.uf2"
+
+wifi-probe-manual: sdk
+	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-manual" \
+		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
+		-DPICO_BOARD=pico_w \
+		-DWIFI_PROBE_MODE=manual_poll \
+		$(CMAKE_PICOTOOL_ARGS)
+	cmake --build "$(WIFI_PROBE_BUILD_DIR)-manual" --parallel
+	cp "$(WIFI_PROBE_BUILD_DIR)-manual/m65_wifi_probe.uf2" "$(WIFI_PROBE_BUILD_DIR)-manual/mega65-wifi-probe-manual.uf2"
+	@echo
+	@echo "Built: $(WIFI_PROBE_BUILD_DIR)-manual/mega65-wifi-probe-manual.uf2"
+
+wifi-probe-manual-bg: sdk
+	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-manual-bg" \
+		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
+		-DPICO_BOARD=pico_w \
+		-DWIFI_PROBE_MODE=manual_background \
+		$(CMAKE_PICOTOOL_ARGS)
+	cmake --build "$(WIFI_PROBE_BUILD_DIR)-manual-bg" --parallel
+	cp "$(WIFI_PROBE_BUILD_DIR)-manual-bg/m65_wifi_probe.uf2" "$(WIFI_PROBE_BUILD_DIR)-manual-bg/mega65-wifi-probe-manual-bg.uf2"
+	@echo
+	@echo "Built: $(WIFI_PROBE_BUILD_DIR)-manual-bg/mega65-wifi-probe-manual-bg.uf2"
+
+upload-wifi-probe: wifi-probe
+	@set -e; \
+	if [ ! -f "$(WIFI_PROBE_UF2)" ]; then echo "No UF2 at $(WIFI_PROBE_UF2)"; exit 1; fi; \
+	mount="$$PICO_MOUNT"; \
+	if [ -z "$$mount" ]; then \
+		for d in \
+			/media/$$USER/RPI-RP2 \
+			/run/media/$$USER/RPI-RP2 \
+			/mnt/RPI-RP2 \
+			/Volumes/RPI-RP2 \
+			/media/$$USER/RP2350 \
+			/run/media/$$USER/RP2350 \
+			/mnt/RP2350 \
+			/Volumes/RP2350; do \
+			if [ -d "$$d" ]; then mount="$$d"; break; fi; \
+		done; \
+	fi; \
+	if [ -z "$$mount" ]; then \
+		echo "Could not find RPI-RP2/RP2350 mount."; \
+		echo "Hold BOOTSEL while plugging the Pico into USB, or set PICO_MOUNT=/path/to/RPI-RP2."; \
+		exit 1; \
+	fi; \
+	echo "Copying $(WIFI_PROBE_UF2) to $$mount/"; \
+	cp "$(WIFI_PROBE_UF2)" "$$mount/"; \
+	sync; \
+	echo "Flash requested. The Pico should reboot after the UF2 copy completes."
+
 clean:
 	@if [ -d "$(BUILD_DIR)" ]; then cmake --build "$(BUILD_DIR)" --target clean; fi
 
 distclean:
-	rm -rf "$(BUILD_DIR)" build-nofatfs
+	rm -rf "$(BUILD_DIR)" build-nofatfs "$(WIFI_PROBE_BUILD_DIR)" "$(WIFI_PROBE_BUILD_DIR)-lwip" "$(WIFI_PROBE_BUILD_DIR)-bg" "$(WIFI_PROBE_BUILD_DIR)-manual" "$(WIFI_PROBE_BUILD_DIR)-manual-bg"
 
 nuke: distclean
 	rm -rf "$(DEPS_DIR)"
