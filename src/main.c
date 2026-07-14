@@ -290,24 +290,28 @@ static void basic_error(const char *err)
 static void cmd_help(void)
 {
     uart_cmd_puts(
-        "OK HELP\n"
-        "V                         version\n"
-        "L [path]                  list .BIT/.COR/.M65J files and dirs\n"
-        "I <file>                  inspect core file\n"
-        "T <file>                  read core payload from SD/FAT and discard; speed test\n"
-        "P <file>                  hijack JTAG and program core from SD/FAT\n"
-        "S <length> <idcode>        stream raw Xilinx payload over this serial link; USB-only by default\n"
-        "N <length>                 receive/discard bytes; serial throughput test\n"
-        "W <file> <length>          write core file to SD; USB + physical WE required by default\n"
-        "F <url> <name>             fetch http:// URL into DOWNLOADS/<name>\n"
-        "R <name>                   read DOWNLOADS/<name> as raw bytes\n"
-        "A                         show write-authority status\n"
-        "D [auto|hw|soft]          show/set SD transport before mount\n"
-        "J                         read JTAG IDCODE, using hijack\n"
-        "X                         read Xilinx BOOTSTS/STAT/BYPASS via CFG_OUT\n"
-        "H 1|0                     manually assert/release JTAG hijack\n"
-        "M                         mount/remount SD card\n"
-        "?                         help\n"
+        "+HELP: AT                  modem attention check\n"
+        "+HELP: ATI                 identify firmware and WiFi capability\n"
+        "+HELP: ATD*                novelty dial command\n"
+        "+HELP: AT+GO64             enter BASIC command mode\n"
+        "+HELP: GO64                enter BASIC command mode\n"
+        "+HELP: AT+VERSION?         firmware version and transport status\n"
+        "+HELP: AT+CORELIST[=path]  list .BIT/.COR/.M65J files and dirs\n"
+        "+HELP: AT+COREINFO=file    inspect core file\n"
+        "+HELP: AT+CORETEST=file    read core payload from SD and discard\n"
+        "+HELP: AT+JTAGLOAD=file    hijack JTAG and program core from SD\n"
+        "+HELP: AT+JTAGSTREAM=len id stream raw Xilinx payload over serial\n"
+        "+HELP: AT+TESTSINK=len     receive/discard bytes; serial throughput test\n"
+        "+HELP: AT+FILEWRITE=file len write core file to SD; needs write grant\n"
+        "+HELP: AT+FETCH=url name   fetch http:// URL into DOWNLOADS/name\n"
+        "+HELP: AT+DOWNLOADREAD=name read DOWNLOADS/name as raw bytes\n"
+        "+HELP: AT+WRITEGRANT?      show write-authority status\n"
+        "+HELP: AT+REMOTE?          show parsed REMOTE_ENABLE.cfg\n"
+        "+HELP: AT+SDMODE[=auto|hw|soft] show/set SD transport before mount\n"
+        "+HELP: AT+JTAGID?          read JTAG IDCODE, using hijack\n"
+        "+HELP: AT+JTAGSTATUS?      read Xilinx BOOTSTS/STAT/BYPASS via CFG_OUT\n"
+        "+HELP: AT+HIJACK=1|0       manually assert/release JTAG hijack\n"
+        "+HELP: AT+MOUNT            mount/remount SD card\n"
         "END\n");
 }
 
@@ -1048,6 +1052,7 @@ static void cmd_read_download(char *arg)
     uart_cmd_puts("\nOK R DONE\n");
 }
 
+#if M65_ENABLE_LEGACY_UART_COMMANDS
 static bool dispatch_legacy(char cmd, char *arg)
 {
     switch (cmd) {
@@ -1073,6 +1078,7 @@ static bool dispatch_legacy(char cmd, char *arg)
     }
     return true;
 }
+#endif
 
 static void dispatch_at(char *arg)
 {
@@ -1115,27 +1121,27 @@ static void dispatch_at(char *arg)
         cmd_help();
     } else if (ci_equal(cmd, "I") || ci_equal(cmd, "IDENT")) {
         cmd_ati();
-    } else if (ci_equal(cmd, "VER")) {
+    } else if (ci_equal(cmd, "VERSION") || ci_equal(cmd, "VER")) {
         cmd_version();
-    } else if (ci_equal(cmd, "LIST")) {
+    } else if (ci_equal(cmd, "CORELIST") || ci_equal(cmd, "LIST")) {
         cmd_list(param);
-    } else if (ci_equal(cmd, "CORE") || ci_equal(cmd, "INFO")) {
+    } else if (ci_equal(cmd, "COREINFO") || ci_equal(cmd, "CORE") || ci_equal(cmd, "INFO")) {
         cmd_info(param);
-    } else if (ci_equal(cmd, "TESTREAD")) {
+    } else if (ci_equal(cmd, "CORETEST") || ci_equal(cmd, "TESTREAD")) {
         cmd_test_read(param);
-    } else if (ci_equal(cmd, "PROGRAM") || ci_equal(cmd, "LOAD")) {
+    } else if (ci_equal(cmd, "JTAGLOAD") || ci_equal(cmd, "PROGRAM") || ci_equal(cmd, "LOAD")) {
         cmd_program(param);
-    } else if (ci_equal(cmd, "STREAM")) {
+    } else if (ci_equal(cmd, "JTAGSTREAM") || ci_equal(cmd, "STREAM")) {
         cmd_stream_program(param);
-    } else if (ci_equal(cmd, "SINK")) {
+    } else if (ci_equal(cmd, "TESTSINK") || ci_equal(cmd, "SINK")) {
         cmd_sink_stream(param);
-    } else if (ci_equal(cmd, "WRITE")) {
+    } else if (ci_equal(cmd, "FILEWRITE") || ci_equal(cmd, "WRITE")) {
         cmd_write_file(param);
-    } else if (ci_equal(cmd, "FETCH") || ci_equal(cmd, "DOWNLOAD")) {
+    } else if (ci_equal(cmd, "FETCH") || ci_equal(cmd, "HTTPFETCH") || ci_equal(cmd, "DOWNLOAD")) {
         cmd_fetch(param);
-    } else if (ci_equal(cmd, "READ")) {
+    } else if (ci_equal(cmd, "DOWNLOADREAD") || ci_equal(cmd, "READ")) {
         cmd_read_download(param);
-    } else if (ci_equal(cmd, "AUTH")) {
+    } else if (ci_equal(cmd, "WRITEGRANT") || ci_equal(cmd, "AUTH")) {
         cmd_authority();
     } else if (ci_equal(cmd, "REMOTE")) {
         cmd_remote();
@@ -1143,7 +1149,7 @@ static void dispatch_at(char *arg)
         cmd_sd_transport(value ? param : (char *)"");
     } else if (ci_equal(cmd, "JTAGID")) {
         cmd_jtag_id();
-    } else if (ci_equal(cmd, "XSTATUS")) {
+    } else if (ci_equal(cmd, "JTAGSTATUS") || ci_equal(cmd, "XSTATUS")) {
         cmd_xilinx_status();
     } else if (ci_equal(cmd, "HIJACK")) {
         cmd_hijack(param);
@@ -1176,11 +1182,15 @@ static void dispatch(char *line)
         return;
     }
 
+#if M65_ENABLE_LEGACY_UART_COMMANDS
     char cmd = (char)toupper((unsigned char)s[0]);
     char *arg = trim_line(s + 1);
     if (!dispatch_legacy(cmd, arg)) {
         at_error("UNKNOWN COMMAND");
     }
+#else
+    at_error("SYNTAX");
+#endif
 }
 
 int main(void)
