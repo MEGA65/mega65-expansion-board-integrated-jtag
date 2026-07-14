@@ -1,0 +1,1652 @@
+#include "remote_http.h"
+#include "config.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "core_file.h"
+#include "core_filter.h"
+#include "jtag_gpio.h"
+#include "remote_auth.h"
+#include "signed_file.h"
+#include "storage.h"
+#include "uart_cmd.h"
+#include "write_gate.h"
+
+#ifndef M65_WIFI_CONNECT_TIMEOUT_MS
+#define M65_WIFI_CONNECT_TIMEOUT_MS 15000u
+#endif
+#ifndef M65_HTTP_HEADER_MAX
+#define M65_HTTP_HEADER_MAX 1536u
+#endif
+#ifndef M65_HTTP_PAGE_MAX
+#define M65_HTTP_PAGE_MAX 8192u
+#endif
+#ifndef M65_HTTP_IO_CHUNK
+#define M65_HTTP_IO_CHUNK 1024u
+#endif
+#ifndef M65_HTTP_TEMPLATE_MAX
+#define M65_HTTP_TEMPLATE_MAX 1536u
+#endif
+
+#if !M65_WIFI_SUPPORTED
+
+void remote_http_init(void) {}
+void remote_http_poll(void) {}
+bool remote_http_active(void) { return false; }
+const char *remote_http_status(void) { return "wifi=not-supported"; }
+bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err, size_t err_len)
+{
+    (void)url;
+    (void)name;
+    if (err && err_len) snprintf(err, err_len, "wifi not supported");
+    return false;
+}
+
+#else
+
+#include "pico/cyw43_arch.h"
+#include "pico/stdlib.h"
+#include "lwip/dhcp.h"
+#include "lwip/dns.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/netif.h"
+#include "lwip/pbuf.h"
+#include "lwip/tcp.h"
+
+typedef enum {
+    HTTP_RECV_HEADERS = 0,
+    HTTP_RECV_BODY,
+    HTTP_SEND_FILE,
+    HTTP_CLOSED,
+} http_state_t;
+
+typedef enum {
+    HTTP_PUT_NONE = 0,
+    HTTP_PUT_FILE,
+    HTTP_PUT_JTAG,
+} http_put_op_t;
+
+typedef struct {
+    struct tcp_pcb *pcb;
+    http_state_t state;
+    http_put_op_t put_op;
+    bool in_use;
+    bool aborted;
+    bool jtag_active;
+    bool jtag_spool;
+    uint8_t jtag_board_rev;
+    uint32_t remote_ip;
+    char header[M65_HTTP_HEADER_MAX];
+    size_t header_len;
+    char method[8];
+    char target[256];
+    char path[256];
+    char tmp_path[272];
+    char content_type[64];
+    bool attachment;
+    uint32_t content_length;
+    uint32_t body_done;
+    uint32_t expected_idcode;
+    uint32_t file_offset;
+    uint32_t file_size;
+    jtag_stream_writer_t jtag;
+    signed_file_rx_t signed_rx;
+} http_conn_t;
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+    const char *tmpl;
+} page_builder_t;
+
+typedef struct {
+    page_builder_t *pb;
+    const char *row_template;
+    uint8_t board_rev;
+    bool truncated;
+} index_list_ctx_t;
+
+typedef enum {
+    FETCH_CONNECTING = 0,
+    FETCH_RECV_HEADERS,
+    FETCH_RECV_BODY,
+    FETCH_DONE,
+    FETCH_FAILED,
+} fetch_state_t;
+
+typedef struct {
+    struct tcp_pcb *pcb;
+    fetch_state_t state;
+    char host[128];
+    char path[256];
+    char name[192];
+    char final_path[256];
+    char tmp_path[272];
+    char header[M65_HTTP_HEADER_MAX];
+    size_t header_len;
+    uint16_t port;
+    uint32_t content_length;
+    uint32_t body_done;
+    signed_file_rx_t signed_rx;
+    char err[128];
+} fetch_ctx_t;
+
+static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len);
+static int find_header_end(const char *buf, size_t len, size_t *end_len);
+
+static remote_auth_config_t http_cfg;
+static http_conn_t http_conn;
+static struct tcp_pcb *listen_pcb;
+static bool http_is_active;
+static char http_status_buf[128] = "wifi=inactive";
+static char page_buf[M65_HTTP_PAGE_MAX];
+static char top_template[M65_HTTP_TEMPLATE_MAX];
+static char row_template[M65_HTTP_TEMPLATE_MAX];
+static char bottom_template[M65_HTTP_TEMPLATE_MAX];
+
+static const char default_top[] =
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>MEGA65 JTAG</title>"
+    "<style>"
+    "body{font-family:system-ui,sans-serif;margin:2rem;background:#f6f6f6;color:#111}"
+    "table{border-collapse:collapse;width:100%;background:#fff}"
+    "th,td{border-bottom:1px solid #ddd;padding:.55rem;text-align:left}"
+    ".status{margin:.8rem 0;padding:.7rem;background:#fff;border-left:4px solid #2563eb}"
+    "a{color:#0645ad}"
+    "</style></head><body>"
+    "<h1>MEGA65 Expansion Board Integrated JTAG</h1>"
+    "<div class=\"status\">Write grant: {WRITE_GRANT_STATUS} "
+    "({WRITE_GRANT_SECONDS}s remaining, policy {WRITE_GRANT_REQUIRED})</div>"
+    "<p>Showing: {BOARD_LABEL} <a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a></p>"
+    "<table><thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Actions</th></tr></thead><tbody>\n";
+static const char default_row[] =
+    "<tr><td><a href=\"{FILE_URL}\">{FILENAME}</a></td>"
+    "<td>{TYPE}</td><td>{SIZE}</td>"
+    "<td><a href=\"{FILE_URL}\">download</a> <a href=\"{JTAG_URL}\">jtag</a></td></tr>\n";
+static const char default_bottom[] =
+    "</tbody></table></body></html>\n";
+
+static bool has_core_ext(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot) return false;
+    char e1 = (char)tolower((unsigned char)dot[1]);
+    char e2 = (char)tolower((unsigned char)dot[2]);
+    char e3 = (char)tolower((unsigned char)dot[3]);
+    char e4 = (char)tolower((unsigned char)dot[4]);
+    char e5 = (char)tolower((unsigned char)dot[5]);
+    return (e1 == 'b' && e2 == 'i' && e3 == 't' && e4 == 0) ||
+           (e1 == 'c' && e2 == 'o' && e3 == 'r' && e4 == 0) ||
+           (e1 == 'm' && e2 == '6' && e3 == '5' && e4 == 'j' && e5 == 0);
+}
+
+static bool safe_file_path(const char *path)
+{
+    if (!path || !path[0]) return false;
+    size_t n = strlen(path);
+    if (n > 220) return false;
+    if (strstr(path, "..")) return false;
+    if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
+    return has_core_ext(path);
+}
+
+static bool safe_www_path(const char *path)
+{
+    if (!path || !path[0]) return false;
+    size_t n = strlen(path);
+    if (n > 220) return false;
+    if (strstr(path, "..")) return false;
+    if (path[0] == '/') return false;
+    if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
+    return true;
+}
+
+static bool safe_download_name(const char *path)
+{
+    if (!path || !path[0]) return false;
+    size_t n = strlen(path);
+    if (n > 180) return false;
+    if (path[0] == '/') return false;
+    if (strstr(path, "..")) return false;
+    if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
+    return true;
+}
+
+static bool make_download_path(const char *name, char *out, size_t out_len)
+{
+    if (!safe_download_name(name)) return false;
+    return snprintf(out, out_len, "DOWNLOADS/%s", name) < (int)out_len;
+}
+
+static bool ext_equal_ci(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static const char *content_type_for_path(const char *path)
+{
+    const char *dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    if (ext_equal_ci(dot, ".html") || ext_equal_ci(dot, ".htm")) return "text/html; charset=utf-8";
+    if (ext_equal_ci(dot, ".css")) return "text/css; charset=utf-8";
+    if (ext_equal_ci(dot, ".js")) return "application/javascript";
+    if (ext_equal_ci(dot, ".png")) return "image/png";
+    if (ext_equal_ci(dot, ".jpg") || ext_equal_ci(dot, ".jpeg")) return "image/jpeg";
+    if (ext_equal_ci(dot, ".gif")) return "image/gif";
+    if (ext_equal_ci(dot, ".svg")) return "image/svg+xml";
+    if (ext_equal_ci(dot, ".ico")) return "image/x-icon";
+    return "application/octet-stream";
+}
+
+static uint32_t lwip_ip_to_host_u32(const ip_addr_t *ip)
+{
+    const ip4_addr_t *ip4 = ip_2_ip4(ip);
+    return lwip_ntohl(ip4_addr_get_u32(ip4));
+}
+
+static void cfg_ip_to_lwip(uint32_t ip, ip4_addr_t *out)
+{
+    out->addr = PP_HTONL(ip);
+}
+
+static void page_append(page_builder_t *pb, const char *s)
+{
+    if (!pb || !s || pb->len >= pb->cap) return;
+    size_t n = strlen(s);
+    if (n > pb->cap - pb->len - 1u) n = pb->cap - pb->len - 1u;
+    memcpy(pb->buf + pb->len, s, n);
+    pb->len += n;
+    pb->buf[pb->len] = 0;
+}
+
+static void page_append_n(page_builder_t *pb, const char *s, size_t n)
+{
+    if (!pb || !s || pb->len >= pb->cap) return;
+    if (n > pb->cap - pb->len - 1u) n = pb->cap - pb->len - 1u;
+    memcpy(pb->buf + pb->len, s, n);
+    pb->len += n;
+    pb->buf[pb->len] = 0;
+}
+
+static void html_escape(const char *in, char *out, size_t out_len)
+{
+    size_t pos = 0;
+    if (!out_len) return;
+    for (; in && *in && pos + 1 < out_len; in++) {
+        const char *rep = NULL;
+        switch (*in) {
+        case '&': rep = "&amp;"; break;
+        case '<': rep = "&lt;"; break;
+        case '>': rep = "&gt;"; break;
+        case '"': rep = "&quot;"; break;
+        default: break;
+        }
+        if (rep) {
+            size_t n = strlen(rep);
+            if (pos + n >= out_len) break;
+            memcpy(out + pos, rep, n);
+            pos += n;
+        } else {
+            out[pos++] = *in;
+        }
+    }
+    out[pos] = 0;
+}
+
+static void url_encode(const char *in, char *out, size_t out_len)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t pos = 0;
+    if (!out_len) return;
+    for (; in && *in && pos + 1 < out_len; in++) {
+        unsigned char c = (unsigned char)*in;
+        bool keep = isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/';
+        if (keep) {
+            out[pos++] = (char)c;
+        } else {
+            if (pos + 3 >= out_len) break;
+            out[pos++] = '%';
+            out[pos++] = hex[c >> 4];
+            out[pos++] = hex[c & 0x0f];
+        }
+    }
+    out[pos] = 0;
+}
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+static bool url_decode(const char *in, char *out, size_t out_len)
+{
+    size_t pos = 0;
+    if (!out_len) return false;
+    while (in && *in && pos + 1 < out_len) {
+        if (*in == '%') {
+            int h1 = hex_value(in[1]);
+            int h2 = hex_value(in[2]);
+            if (h1 < 0 || h2 < 0) return false;
+            out[pos++] = (char)((h1 << 4) | h2);
+            in += 3;
+        } else if (*in == '+') {
+            out[pos++] = ' ';
+            in++;
+        } else {
+            out[pos++] = *in++;
+        }
+    }
+    out[pos] = 0;
+    return in && *in == 0;
+}
+
+static bool ci_equal_n(const char *a, const char *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    }
+    return true;
+}
+
+static bool ci_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static bool starts_with(const char *s, const char *prefix)
+{
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static const char *header_value(const char *headers, const char *key)
+{
+    size_t key_len = strlen(key);
+    const char *p = headers;
+    while (p && *p) {
+        const char *line_end = strstr(p, "\r\n");
+        if (!line_end) line_end = strchr(p, '\n');
+        if (!line_end) break;
+        if ((size_t)(line_end - p) == 0) break;
+        if ((size_t)(line_end - p) > key_len && ci_equal_n(p, key, key_len) && p[key_len] == ':') {
+            p += key_len + 1;
+            while (*p == ' ' || *p == '\t') p++;
+            return p;
+        }
+        p = (*line_end == '\r' && line_end[1] == '\n') ? line_end + 2 : line_end + 1;
+    }
+    return NULL;
+}
+
+static size_t header_value_len(const char *value)
+{
+    size_t n = 0;
+    while (value && value[n] && value[n] != '\r' && value[n] != '\n') n++;
+    return n;
+}
+
+static int b64_value(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + c - 'a';
+    if (c >= '0' && c <= '9') return 52 + c - '0';
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    if (c == '=') return -2;
+    return -1;
+}
+
+static bool base64_decode(const char *in, size_t in_len, char *out, size_t out_len)
+{
+    size_t pos = 0;
+    int val = 0;
+    int bits = -8;
+    for (size_t i = 0; i < in_len; i++) {
+        if (isspace((unsigned char)in[i])) continue;
+        int v = b64_value(in[i]);
+        if (v == -2) break;
+        if (v < 0) return false;
+        val = (val << 6) | v;
+        bits += 6;
+        if (bits >= 0) {
+            if (pos + 1 >= out_len) return false;
+            out[pos++] = (char)((val >> bits) & 0xff);
+            bits -= 8;
+        }
+    }
+    if (pos >= out_len) return false;
+    out[pos] = 0;
+    return true;
+}
+
+static bool basic_auth_ok(const http_conn_t *c)
+{
+    if (!http_cfg.http_user[0] && !http_cfg.http_password[0]) return true;
+    const char *auth = header_value(c->header, "Authorization");
+    if (!auth) return false;
+    size_t auth_len = header_value_len(auth);
+    if (auth_len < 7 || !ci_equal_n(auth, "Basic ", 6)) return false;
+
+    char decoded[112];
+    if (!base64_decode(auth + 6, auth_len - 6, decoded, sizeof decoded)) return false;
+
+    char expected[112];
+    snprintf(expected, sizeof expected, "%s:%s", http_cfg.http_user, http_cfg.http_password);
+    return strcmp(decoded, expected) == 0;
+}
+
+static bool load_template(const char *path, char *buf, size_t buflen, const char *fallback)
+{
+    if (!buflen) return false;
+    storage_file_t f = {0};
+    if (storage_open(&f, path)) {
+        uint32_t size = storage_size(&f);
+        if (size < buflen) {
+            size_t got = 0;
+            if (storage_read(&f, buf, size, &got) && got == size) {
+                buf[size] = 0;
+                storage_close(&f);
+                return true;
+            }
+        }
+        storage_close(&f);
+    }
+    snprintf(buf, buflen, "%s", fallback);
+    return false;
+}
+
+static void substitution_value(const char *name,
+                               const char *file_name,
+                               uint32_t size,
+                               bool is_dir,
+                               uint8_t board_rev,
+                               char *out,
+                               size_t out_len)
+{
+    char escaped[256];
+    char encoded[256];
+    char tmp[300];
+    if (ci_equal(name, "WRITE_GRANT_STATUS")) {
+        snprintf(out, out_len, "%s", write_gate_active() ? "active" : "inactive");
+    } else if (ci_equal(name, "WRITE_GRANT_SECONDS")) {
+        snprintf(out, out_len, "%lu", (unsigned long)(write_gate_remaining_ms() / 1000u));
+    } else if (ci_equal(name, "WRITE_GRANT_MS")) {
+        snprintf(out, out_len, "%lu", (unsigned long)write_gate_remaining_ms());
+    } else if (ci_equal(name, "WRITE_GRANT_REQUIRED")) {
+        snprintf(out, out_len, "%s", http_cfg.require_write_grant ? "required" : "not required");
+    } else if (ci_equal(name, "BOARD_REV")) {
+        snprintf(out, out_len, "%lu", (unsigned long)board_rev);
+    } else if (ci_equal(name, "BOARD_LABEL")) {
+        snprintf(out, out_len, "%s", core_board_label(board_rev));
+    } else if (ci_equal(name, "R3_URL")) {
+        snprintf(out, out_len, "/index.html?board=3");
+    } else if (ci_equal(name, "R6_URL")) {
+        snprintf(out, out_len, "/index.html?board=6");
+    } else if (ci_equal(name, "FILENAME")) {
+        html_escape(file_name ? file_name : "", out, out_len);
+    } else if (ci_equal(name, "TYPE")) {
+        snprintf(out, out_len, "%s", is_dir ? "DIR" : "CORE");
+    } else if (ci_equal(name, "SIZE")) {
+        if (is_dir) snprintf(out, out_len, "-");
+        else snprintf(out, out_len, "%lu", (unsigned long)size);
+    } else if (ci_equal(name, "FILE_URL")) {
+        if (is_dir) {
+            snprintf(out, out_len, "#");
+        } else {
+            url_encode(file_name ? file_name : "", encoded, sizeof encoded);
+            snprintf(out, out_len, "/files/%s", encoded);
+        }
+    } else if (ci_equal(name, "JTAG_URL")) {
+        if (is_dir) {
+            snprintf(out, out_len, "#");
+        } else {
+            url_encode(file_name ? file_name : "", encoded, sizeof encoded);
+            if (board_rev == 3 || board_rev == 6) {
+                snprintf(out, out_len, "/jtag?file=%s&board=%lu", encoded, (unsigned long)board_rev);
+            } else {
+                snprintf(out, out_len, "/jtag?file=%s", encoded);
+            }
+        }
+    } else if (ci_equal(name, "PATH")) {
+        snprintf(out, out_len, "%s", file_name ? file_name : "");
+    } else if (ci_equal(name, "PATH_ESCAPED")) {
+        html_escape(file_name ? file_name : "", escaped, sizeof escaped);
+        snprintf(out, out_len, "%s", escaped);
+    } else {
+        snprintf(tmp, sizeof tmp, "{%s}", name);
+        snprintf(out, out_len, "%s", tmp);
+    }
+}
+
+static void append_substituted(page_builder_t *pb,
+                               const char *tmpl,
+                               const char *file_name,
+                               uint32_t size,
+                               bool is_dir,
+                               uint8_t board_rev)
+{
+    const char *p = tmpl;
+    while (p && *p) {
+        const char *open = strchr(p, '{');
+        if (!open) {
+            page_append(pb, p);
+            break;
+        }
+        page_append_n(pb, p, (size_t)(open - p));
+        const char *close = strchr(open + 1, '}');
+        if (!close) {
+            page_append(pb, open);
+            break;
+        }
+        char name[48];
+        size_t n = (size_t)(close - open - 1);
+        if (n >= sizeof name) n = sizeof name - 1u;
+        memcpy(name, open + 1, n);
+        name[n] = 0;
+        char value[320];
+        substitution_value(name, file_name, size, is_dir, board_rev, value, sizeof value);
+        page_append(pb, value);
+        p = close + 1;
+    }
+}
+
+static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+{
+    index_list_ctx_t *il = (index_list_ctx_t *)ctx;
+    if (il->pb->len + 512u >= il->pb->cap) {
+        il->truncated = true;
+        return;
+    }
+    if (!is_dir && (il->board_rev == 3 || il->board_rev == 6)) {
+        core_file_t cf;
+        if (!core_open(&cf, name)) return;
+        bool match = core_matches_board(&cf, name, il->board_rev);
+        core_close(&cf);
+        if (!match) return;
+    }
+    append_substituted(il->pb, il->row_template, name, size, is_dir, il->board_rev);
+}
+
+static err_t http_close(http_conn_t *c)
+{
+    if (!c || !c->pcb) return ERR_OK;
+    if ((c->put_op == HTTP_PUT_FILE || c->jtag_spool) && c->state == HTTP_RECV_BODY) {
+        signed_file_receive_abort(&c->signed_rx);
+    }
+    if (c->jtag_active) {
+        jtag_program_writer_abort(&c->jtag);
+        c->jtag_active = false;
+    }
+    struct tcp_pcb *pcb = c->pcb;
+    c->state = HTTP_CLOSED;
+    tcp_arg(pcb, NULL);
+    tcp_recv(pcb, NULL);
+    tcp_sent(pcb, NULL);
+    tcp_err(pcb, NULL);
+    tcp_poll(pcb, NULL, 0);
+    c->pcb = NULL;
+    c->in_use = false;
+    err_t err = tcp_close(pcb);
+    if (err != ERR_OK) {
+        tcp_abort(pcb);
+        c->aborted = true;
+        return ERR_ABRT;
+    }
+    return ERR_OK;
+}
+
+static bool tcp_write_copy(http_conn_t *c, const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    while (len) {
+        u16_t snd = tcp_sndbuf(c->pcb);
+        if (snd == 0) return false;
+        u16_t chunk = len > snd ? snd : (u16_t)len;
+        err_t err = tcp_write(c->pcb, p, chunk, TCP_WRITE_FLAG_COPY);
+        if (err != ERR_OK) return false;
+        p += chunk;
+        len -= chunk;
+    }
+    tcp_output(c->pcb);
+    return true;
+}
+
+static err_t send_response(http_conn_t *c,
+                           int code,
+                           const char *reason,
+                           const char *content_type,
+                           const char *body)
+{
+    if (!body) body = "";
+    char header[256];
+    size_t body_len = strlen(body);
+    snprintf(header, sizeof header,
+             "HTTP/1.0 %d %s\r\n"
+             "Connection: close\r\n"
+             "Content-Type: %s\r\n"
+             "Content-Length: %lu\r\n"
+             "Cache-Control: no-store\r\n"
+             "\r\n",
+             code, reason, content_type ? content_type : "text/plain",
+             (unsigned long)body_len);
+    tcp_write_copy(c, header, strlen(header));
+    tcp_write_copy(c, body, body_len);
+    return http_close(c);
+}
+
+static err_t send_error(http_conn_t *c, int code, const char *reason, const char *msg)
+{
+    char body[256];
+    snprintf(body, sizeof body, "%d %s\n%s\n", code, reason, msg ? msg : reason);
+    return send_response(c, code, reason, "text/plain", body);
+}
+
+static bool check_perm(http_conn_t *c, remote_auth_perm_t perm)
+{
+    return remote_auth_allowed(&http_cfg, c->remote_ip, perm);
+}
+
+static bool check_write_grant(void)
+{
+    return !http_cfg.require_write_grant || write_gate_active();
+}
+
+static uint8_t board_from_target(const char *target)
+{
+    char value[8];
+    if (!parse_query_value(target, "board", value, sizeof value)) return 0;
+    if (strcmp(value, "3") == 0 || ci_equal(value, "r3")) return 3;
+    if (strcmp(value, "6") == 0 || ci_equal(value, "r6")) return 6;
+    return 0;
+}
+
+static err_t send_index(http_conn_t *c, uint8_t board_rev)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
+        return send_error(c, 403, "Forbidden", "remote IP is not authorised");
+    }
+
+    load_template("WWW/index_top.html", top_template, sizeof top_template, default_top);
+    load_template("WWW/index_row.html", row_template, sizeof row_template, default_row);
+    load_template("WWW/index_bottom.html", bottom_template, sizeof bottom_template, default_bottom);
+
+    page_builder_t pb = { .buf = page_buf, .cap = sizeof page_buf };
+    page_buf[0] = 0;
+    append_substituted(&pb, top_template, NULL, 0, false, board_rev);
+
+    index_list_ctx_t il = {
+        .pb = &pb,
+        .row_template = row_template,
+        .board_rev = board_rev,
+    };
+    if (!storage_list_cores("/", index_cb, &il)) {
+        page_append(&pb, "<tr><td colspan=\"4\">SD list failed</td></tr>\n");
+    }
+    if (il.truncated) {
+        page_append(&pb, "<tr><td colspan=\"4\">List truncated</td></tr>\n");
+    }
+    append_substituted(&pb, bottom_template, NULL, 0, false, board_rev);
+    return send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
+}
+
+static err_t send_file_chunk(http_conn_t *c)
+{
+    if (!c || !c->pcb || c->state != HTTP_SEND_FILE) return ERR_OK;
+    if (c->file_offset >= c->file_size) return http_close(c);
+
+    u16_t snd = tcp_sndbuf(c->pcb);
+    if (snd == 0) return ERR_OK;
+    size_t want = c->file_size - c->file_offset;
+    if (want > M65_HTTP_IO_CHUNK) want = M65_HTTP_IO_CHUNK;
+    if (want > snd) want = snd;
+
+    static uint8_t io[M65_HTTP_IO_CHUNK];
+    storage_file_t f = {0};
+    if (!storage_open(&f, c->path)) return send_error(c, 500, "Internal Server Error", storage_last_error());
+    if (!storage_seek(&f, c->file_offset)) {
+        storage_close(&f);
+        return send_error(c, 500, "Internal Server Error", storage_last_error());
+    }
+    size_t got = 0;
+    bool ok = storage_read(&f, io, want, &got);
+    storage_close(&f);
+    if (!ok || got == 0) return send_error(c, 500, "Internal Server Error", storage_last_error());
+
+    err_t err = tcp_write(c->pcb, io, (u16_t)got, TCP_WRITE_FLAG_COPY);
+    if (err != ERR_OK) return ERR_OK;
+    c->file_offset += (uint32_t)got;
+    tcp_output(c->pcb);
+    if (c->file_offset >= c->file_size) return http_close(c);
+    return ERR_OK;
+}
+
+static err_t start_download(http_conn_t *c,
+                            const char *path,
+                            const char *content_type,
+                            bool attachment)
+{
+    storage_file_t f = {0};
+    if (!storage_open(&f, path)) return send_error(c, 404, "Not Found", storage_last_error());
+    uint32_t size = storage_size(&f);
+    storage_close(&f);
+
+    snprintf(c->path, sizeof c->path, "%s", path);
+    snprintf(c->content_type, sizeof c->content_type, "%s", content_type ? content_type : "application/octet-stream");
+    c->attachment = attachment;
+    c->file_size = size;
+    c->file_offset = 0;
+    c->state = HTTP_SEND_FILE;
+
+    char header[320];
+    snprintf(header, sizeof header,
+             "HTTP/1.0 200 OK\r\n"
+             "Connection: close\r\n"
+             "Content-Type: %s\r\n"
+             "Content-Length: %lu\r\n"
+             "%s%s%s"
+             "\r\n",
+             c->content_type,
+             (unsigned long)size,
+             c->attachment ? "Content-Disposition: attachment; filename=\"" : "",
+             c->attachment ? (strrchr(path, '/') ? strrchr(path, '/') + 1 : path) : "",
+             c->attachment ? "\"\r\n" : "");
+    if (!tcp_write_copy(c, header, strlen(header))) return http_close(c);
+    return send_file_chunk(c);
+}
+
+static err_t start_file_download(http_conn_t *c, const char *path)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES)) return send_error(c, 403, "Forbidden", "file downloads are not authorised");
+    if (!safe_file_path(path)) return send_error(c, 400, "Bad Request", "unsafe or unsupported file path");
+    return start_download(c, path, "application/octet-stream", true);
+}
+
+static err_t start_www_download(http_conn_t *c, const char *path)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
+        return send_error(c, 403, "Forbidden", "remote IP is not authorised");
+    }
+    if (!safe_www_path(path)) return send_error(c, 400, "Bad Request", "unsafe WWW path");
+    char full[256];
+    if (snprintf(full, sizeof full, "WWW/%s", path) >= (int)sizeof full) {
+        return send_error(c, 400, "Bad Request", "path too long");
+    }
+    return start_download(c, full, content_type_for_path(full), false);
+}
+
+static err_t start_downloads_download(http_conn_t *c, const char *path)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES)) return send_error(c, 403, "Forbidden", "download reads are not authorised");
+    char full[256];
+    if (!make_download_path(path, full, sizeof full)) {
+        return send_error(c, 400, "Bad Request", "unsafe DOWNLOADS path");
+    }
+    return start_download(c, full, content_type_for_path(full), true);
+}
+
+static err_t program_file(http_conn_t *c, const char *path, uint8_t board_rev)
+{
+    if (!check_perm(c, REMOTE_AUTH_BITSTREAMS)) return send_error(c, 403, "Forbidden", "JTAG programming is not authorised");
+    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
+    if (!safe_file_path(path)) return send_error(c, 400, "Bad Request", "unsafe or unsupported file path");
+
+    core_file_t cf;
+    if (!core_open(&cf, path)) return send_error(c, 404, "Not Found", core_last_error());
+    if (!core_matches_board(&cf, path, board_rev)) {
+        core_close(&cf);
+        return send_error(c, 404, "Not Found", "core does not match requested board revision");
+    }
+
+    jtag_program_options_t opts = {
+        .check_idcode = true,
+        .use_hijack = true,
+        .release_after = true,
+    };
+    bool ok = jtag_program_core(&cf, &opts);
+    core_close(&cf);
+    if (!ok) return send_error(c, 500, "Internal Server Error", jtag_last_error());
+    return send_response(c, 200, "OK", "text/plain", "OK JTAG DONE\n");
+}
+
+static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len)
+{
+    const char *q = strchr(target, '?');
+    if (!q) return false;
+    q++;
+    size_t key_len = strlen(key);
+    while (*q) {
+        const char *next = strchr(q, '&');
+        size_t part_len = next ? (size_t)(next - q) : strlen(q);
+        if (part_len > key_len && strncmp(q, key, key_len) == 0 && q[key_len] == '=') {
+            char encoded[256];
+            size_t n = part_len - key_len - 1u;
+            if (n >= sizeof encoded) n = sizeof encoded - 1u;
+            memcpy(encoded, q + key_len + 1u, n);
+            encoded[n] = 0;
+            return url_decode(encoded, out, out_len);
+        }
+        if (!next) break;
+        q = next + 1;
+    }
+    return false;
+}
+
+static err_t begin_put_file(http_conn_t *c, const char *path)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES)) return send_error(c, 403, "Forbidden", "file uploads are not authorised");
+    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
+    if (!safe_file_path(path)) return send_error(c, 400, "Bad Request", "unsafe or unsupported file path");
+    if (c->content_length == 0) return send_error(c, 411, "Length Required", "Content-Length must be non-zero");
+
+    snprintf(c->path, sizeof c->path, "%s", path);
+    if (snprintf(c->tmp_path, sizeof c->tmp_path, "%s.tmp", path) >= (int)sizeof c->tmp_path) {
+        return send_error(c, 400, "Bad Request", "path too long");
+    }
+    storage_delete(c->tmp_path);
+    if (!signed_file_receive_begin(&c->signed_rx,
+                                   &http_cfg,
+                                   c->path,
+                                   c->tmp_path,
+                                   c->content_length,
+                                   signed_file_type_from_path(path))) {
+        storage_delete(c->tmp_path);
+        return send_error(c, 400, "Bad Request", signed_file_last_error());
+    }
+    c->put_op = HTTP_PUT_FILE;
+    c->state = HTTP_RECV_BODY;
+    return ERR_OK;
+}
+
+static err_t begin_put_jtag(http_conn_t *c)
+{
+    if (!check_perm(c, REMOTE_AUTH_BITSTREAMS)) return send_error(c, 403, "Forbidden", "JTAG programming is not authorised");
+    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
+    if (c->content_length == 0) return send_error(c, 411, "Length Required", "Content-Length must be non-zero");
+
+    c->jtag_board_rev = board_from_target(c->target);
+
+    char spool_name[192];
+    bool have_spool_name = parse_query_value(c->target, "name", spool_name, sizeof spool_name);
+    if (http_cfg.require_signatures || have_spool_name) {
+        if (!have_spool_name) snprintf(spool_name, sizeof spool_name, "JTAG-PUT.bit");
+        if (!make_download_path(spool_name, c->path, sizeof c->path)) {
+            return send_error(c, 400, "Bad Request", "unsafe DOWNLOADS filename");
+        }
+        if (snprintf(c->tmp_path, sizeof c->tmp_path, "%s.tmp", c->path) >= (int)sizeof c->tmp_path) {
+            return send_error(c, 400, "Bad Request", "path too long");
+        }
+        if (!storage_mkdir("DOWNLOADS")) {
+            return send_error(c, 500, "Internal Server Error", storage_last_error());
+        }
+        storage_delete(c->tmp_path);
+        m65_signed_file_type_t type = have_spool_name ? signed_file_type_from_path(c->path) : M65_SIGNED_FILE_ANY;
+        if (!signed_file_receive_begin(&c->signed_rx,
+                                       &http_cfg,
+                                       c->path,
+                                       c->tmp_path,
+                                       c->content_length,
+                                       type)) {
+            storage_delete(c->tmp_path);
+            return send_error(c, 400, "Bad Request", signed_file_last_error());
+        }
+        c->jtag_spool = true;
+        c->put_op = HTTP_PUT_JTAG;
+        c->state = HTTP_RECV_BODY;
+        return ERR_OK;
+    }
+
+    char idcode[32];
+    if (parse_query_value(c->target, "idcode", idcode, sizeof idcode)) {
+        c->expected_idcode = (uint32_t)strtoul(idcode, NULL, 16);
+    }
+    jtag_program_options_t opts = {
+        .check_idcode = c->expected_idcode != 0,
+        .use_hijack = true,
+        .release_after = true,
+    };
+    if (!jtag_program_writer_begin(&c->jtag, c->content_length, c->expected_idcode, &opts)) {
+        return send_error(c, 500, "Internal Server Error", jtag_last_error());
+    }
+    c->jtag_active = true;
+    c->put_op = HTTP_PUT_JTAG;
+    c->state = HTTP_RECV_BODY;
+    return ERR_OK;
+}
+
+static err_t write_file_body(http_conn_t *c, const uint8_t *data, size_t len)
+{
+    if (!len) return ERR_OK;
+    if (c->body_done + len > c->content_length) return send_error(c, 400, "Bad Request", "body exceeds Content-Length");
+    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant expired");
+
+    if (!signed_file_receive_write(&c->signed_rx, data, len)) {
+        signed_file_receive_abort(&c->signed_rx);
+        return send_error(c, 400, "Bad Request", signed_file_last_error());
+    }
+
+    c->body_done += (uint32_t)len;
+    return ERR_OK;
+}
+
+static err_t write_jtag_body(http_conn_t *c, const uint8_t *data, size_t len)
+{
+    if (!len) return ERR_OK;
+    if (c->body_done + len > c->content_length) return send_error(c, 400, "Bad Request", "body exceeds Content-Length");
+    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant expired");
+    if (c->jtag_spool) {
+        if (!signed_file_receive_write(&c->signed_rx, data, len)) {
+            signed_file_receive_abort(&c->signed_rx);
+            return send_error(c, 400, "Bad Request", signed_file_last_error());
+        }
+        c->body_done += (uint32_t)len;
+        return ERR_OK;
+    }
+    if (!jtag_program_writer_write(&c->jtag, data, len)) {
+        jtag_program_writer_abort(&c->jtag);
+        c->jtag_active = false;
+        return send_error(c, 500, "Internal Server Error", jtag_last_error());
+    }
+    c->body_done += (uint32_t)len;
+    return ERR_OK;
+}
+
+static err_t finish_put(http_conn_t *c)
+{
+    if (c->put_op == HTTP_PUT_FILE) {
+        if (!signed_file_receive_finish(&c->signed_rx)) {
+            signed_file_receive_abort(&c->signed_rx);
+            return send_error(c, 400, "Bad Request", signed_file_last_error());
+        }
+        storage_delete(c->path);
+        if (!storage_rename(c->tmp_path, c->path)) {
+            storage_delete(c->tmp_path);
+            return send_error(c, 500, "Internal Server Error", storage_last_error());
+        }
+        c->put_op = HTTP_PUT_NONE;
+        return send_response(c, 201, "Created", "text/plain", "OK FILE STORED\n");
+    }
+    if (c->put_op == HTTP_PUT_JTAG) {
+        if (c->jtag_spool) {
+            if (!signed_file_receive_finish(&c->signed_rx)) {
+                signed_file_receive_abort(&c->signed_rx);
+                return send_error(c, 400, "Bad Request", signed_file_last_error());
+            }
+            storage_delete(c->path);
+            if (!storage_rename(c->tmp_path, c->path)) {
+                storage_delete(c->tmp_path);
+                return send_error(c, 500, "Internal Server Error", storage_last_error());
+            }
+
+            core_file_t cf;
+            if (!core_open(&cf, c->path)) {
+                c->put_op = HTTP_PUT_NONE;
+                c->jtag_spool = false;
+                return send_error(c, 400, "Bad Request", core_last_error());
+            }
+            if (!core_matches_board(&cf, c->path, c->jtag_board_rev)) {
+                core_close(&cf);
+                c->put_op = HTTP_PUT_NONE;
+                c->jtag_spool = false;
+                return send_error(c, 404, "Not Found", "core does not match requested board revision");
+            }
+
+            jtag_program_options_t opts = {
+                .check_idcode = true,
+                .use_hijack = true,
+                .release_after = true,
+            };
+            bool ok = jtag_program_core(&cf, &opts);
+            core_close(&cf);
+            c->put_op = HTTP_PUT_NONE;
+            c->jtag_spool = false;
+            if (!ok) return send_error(c, 500, "Internal Server Error", jtag_last_error());
+            return send_response(c, 200, "OK", "text/plain", "OK JTAG DONE\n");
+        }
+        if (!jtag_program_writer_finish(&c->jtag)) {
+            c->jtag_active = false;
+            return send_error(c, 500, "Internal Server Error", jtag_last_error());
+        }
+        c->jtag_active = false;
+        c->put_op = HTTP_PUT_NONE;
+        return send_response(c, 200, "OK", "text/plain", "OK JTAG DONE\n");
+    }
+    return send_error(c, 400, "Bad Request", "no active PUT operation");
+}
+
+static int find_header_end(const char *buf, size_t len, size_t *end_len)
+{
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            *end_len = 4;
+            return (int)i;
+        }
+    }
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (buf[i] == '\n' && buf[i + 1] == '\n') {
+            *end_len = 2;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static err_t parse_headers(http_conn_t *c)
+{
+    char version[16];
+    if (sscanf(c->header, "%7s %255s %15s", c->method, c->target, version) != 3) {
+        return send_error(c, 400, "Bad Request", "cannot parse request line");
+    }
+    if (!basic_auth_ok(c)) {
+        const char body[] = "401 Unauthorized\n";
+        const char header[] =
+            "HTTP/1.0 401 Unauthorized\r\n"
+            "Connection: close\r\n"
+            "WWW-Authenticate: Basic realm=\"MEGA65 JTAG\"\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 17\r\n\r\n";
+        tcp_write_copy(c, header, strlen(header));
+        tcp_write_copy(c, body, strlen(body));
+        return http_close(c);
+    }
+
+    c->content_length = 0;
+    const char *cl = header_value(c->header, "Content-Length");
+    if (cl) c->content_length = (uint32_t)strtoul(cl, NULL, 10);
+
+    char target_path[256];
+    snprintf(target_path, sizeof target_path, "%s", c->target);
+    char *query = strchr(target_path, '?');
+    if (query) *query = 0;
+
+    if (ci_equal(c->method, "GET")) {
+        if (ci_equal(target_path, "/") || ci_equal(target_path, "/index.html")) {
+            return send_index(c, board_from_target(c->target));
+        }
+        if (starts_with(target_path, "/files/")) {
+            char decoded[256];
+            if (!url_decode(target_path + 7, decoded, sizeof decoded)) {
+                return send_error(c, 400, "Bad Request", "bad URL encoding");
+            }
+            return start_file_download(c, decoded);
+        }
+        if (starts_with(target_path, "/WWW/")) {
+            char decoded[256];
+            if (!url_decode(target_path + 5, decoded, sizeof decoded)) {
+                return send_error(c, 400, "Bad Request", "bad URL encoding");
+            }
+            return start_www_download(c, decoded);
+        }
+        if (starts_with(target_path, "/downloads/")) {
+            char decoded[256];
+            if (!url_decode(target_path + 11, decoded, sizeof decoded)) {
+                return send_error(c, 400, "Bad Request", "bad URL encoding");
+            }
+            return start_downloads_download(c, decoded);
+        }
+        if (ci_equal(target_path, "/jtag")) {
+            char file[256];
+            if (!parse_query_value(c->target, "file", file, sizeof file)) {
+                return send_error(c, 400, "Bad Request", "missing file query parameter");
+            }
+            return program_file(c, file, board_from_target(c->target));
+        }
+        return send_error(c, 404, "Not Found", "unknown GET endpoint");
+    }
+
+    if (ci_equal(c->method, "PUT")) {
+        if (starts_with(target_path, "/files/")) {
+            char decoded[256];
+            if (!url_decode(target_path + 7, decoded, sizeof decoded)) {
+                return send_error(c, 400, "Bad Request", "bad URL encoding");
+            }
+            return begin_put_file(c, decoded);
+        }
+        if (ci_equal(target_path, "/jtag")) {
+            return begin_put_jtag(c);
+        }
+        return send_error(c, 404, "Not Found", "unknown PUT endpoint");
+    }
+
+    return send_error(c, 405, "Method Not Allowed", "only GET and PUT are supported");
+}
+
+static err_t process_body(http_conn_t *c, const uint8_t *data, size_t len)
+{
+    while (len && c->state == HTTP_RECV_BODY) {
+        size_t want = c->content_length - c->body_done;
+        if (want > len) want = len;
+        err_t err = ERR_OK;
+        if (c->put_op == HTTP_PUT_FILE) err = write_file_body(c, data, want);
+        else if (c->put_op == HTTP_PUT_JTAG) err = write_jtag_body(c, data, want);
+        else err = send_error(c, 400, "Bad Request", "unexpected body");
+        if (err != ERR_OK || c->state == HTTP_CLOSED) return err;
+        data += want;
+        len -= want;
+        if (c->body_done == c->content_length) return finish_put(c);
+    }
+    return ERR_OK;
+}
+
+static err_t process_bytes(http_conn_t *c, const uint8_t *data, size_t len)
+{
+    if (c->state == HTTP_RECV_BODY) return process_body(c, data, len);
+    if (c->state != HTTP_RECV_HEADERS) return ERR_OK;
+
+    size_t copy = len;
+    if (copy > sizeof(c->header) - c->header_len - 1u) {
+        return send_error(c, 431, "Request Header Fields Too Large", "HTTP headers too large");
+    }
+    memcpy(c->header + c->header_len, data, copy);
+    c->header_len += copy;
+    c->header[c->header_len] = 0;
+
+    size_t end_len = 0;
+    int hdr_end = find_header_end(c->header, c->header_len, &end_len);
+    if (hdr_end < 0) return ERR_OK;
+
+    size_t body_offset = (size_t)hdr_end + end_len;
+    size_t body_len = c->header_len - body_offset;
+    uint8_t initial_body[M65_HTTP_HEADER_MAX];
+    if (body_len) memcpy(initial_body, c->header + body_offset, body_len);
+    c->header[hdr_end] = 0;
+
+    err_t err = parse_headers(c);
+    if (err != ERR_OK || c->state == HTTP_CLOSED) return err;
+    if (body_len && c->state == HTTP_RECV_BODY) return process_body(c, initial_body, body_len);
+    return ERR_OK;
+}
+
+static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
+{
+    (void)pcb;
+    http_conn_t *c = (http_conn_t *)arg;
+    if (!c) return ERR_OK;
+    if (!p) return http_close(c);
+    if (err != ERR_OK) {
+        pbuf_free(p);
+        return err;
+    }
+
+    for (struct pbuf *q = p; q; q = q->next) {
+        err_t perr = process_bytes(c, (const uint8_t *)q->payload, q->len);
+        if (perr == ERR_ABRT || c->aborted) {
+            pbuf_free(p);
+            return ERR_ABRT;
+        }
+        if (c->state == HTTP_CLOSED) break;
+    }
+    tcp_recved(pcb, p->tot_len);
+    pbuf_free(p);
+    return c->aborted ? ERR_ABRT : ERR_OK;
+}
+
+static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
+{
+    (void)pcb;
+    (void)len;
+    http_conn_t *c = (http_conn_t *)arg;
+    if (c && c->state == HTTP_SEND_FILE) return send_file_chunk(c);
+    return ERR_OK;
+}
+
+static err_t http_poll_cb(void *arg, struct tcp_pcb *pcb)
+{
+    (void)pcb;
+    http_conn_t *c = (http_conn_t *)arg;
+    if (c && c->state == HTTP_SEND_FILE) return send_file_chunk(c);
+    return ERR_OK;
+}
+
+static void http_err(void *arg, err_t err)
+{
+    (void)err;
+    http_conn_t *c = (http_conn_t *)arg;
+    if (!c) return;
+    if (c->jtag_active) jtag_program_writer_abort(&c->jtag);
+    if (c->put_op == HTTP_PUT_FILE || c->jtag_spool) signed_file_receive_abort(&c->signed_rx);
+    memset(c, 0, sizeof *c);
+}
+
+static void fetch_set_error(fetch_ctx_t *fc, const char *msg)
+{
+    if (!fc) return;
+    snprintf(fc->err, sizeof fc->err, "%s", msg ? msg : "fetch failed");
+    fc->state = FETCH_FAILED;
+}
+
+static void fetch_close(fetch_ctx_t *fc, bool aborting)
+{
+    if (!fc || !fc->pcb) return;
+    struct tcp_pcb *pcb = fc->pcb;
+    fc->pcb = NULL;
+    tcp_arg(pcb, NULL);
+    tcp_recv(pcb, NULL);
+    tcp_sent(pcb, NULL);
+    tcp_err(pcb, NULL);
+    tcp_poll(pcb, NULL, 0);
+    if (aborting) {
+        tcp_abort(pcb);
+    } else if (tcp_close(pcb) != ERR_OK) {
+        tcp_abort(pcb);
+    }
+}
+
+static bool parse_http_url(const char *url, char *host, size_t host_len, uint16_t *port, char *path, size_t path_len)
+{
+    if (!url || strncmp(url, "http://", 7) != 0) return false;
+    const char *p = url + 7;
+    const char *slash = strchr(p, '/');
+    const char *host_end = slash ? slash : p + strlen(p);
+    if (host_end == p) return false;
+
+    const char *colon = NULL;
+    for (const char *q = p; q < host_end; ++q) {
+        if (*q == ':') colon = q;
+    }
+    size_t hn = (size_t)((colon ? colon : host_end) - p);
+    if (hn == 0 || hn >= host_len) return false;
+    memcpy(host, p, hn);
+    host[hn] = 0;
+
+    *port = 80;
+    if (colon) {
+        char *end = NULL;
+        unsigned long v = strtoul(colon + 1, &end, 10);
+        if (end != host_end || v == 0 || v > 65535u) return false;
+        *port = (uint16_t)v;
+    }
+
+    if (!slash) {
+        snprintf(path, path_len, "/");
+    } else {
+        if (strlen(slash) >= path_len) return false;
+        snprintf(path, path_len, "%s", slash);
+    }
+    return true;
+}
+
+static err_t fetch_connected(void *arg, struct tcp_pcb *pcb, err_t err)
+{
+    fetch_ctx_t *fc = (fetch_ctx_t *)arg;
+    if (!fc) return ERR_OK;
+    if (err != ERR_OK) {
+        fetch_set_error(fc, "TCP connect failed");
+        fetch_close(fc, false);
+        return ERR_OK;
+    }
+
+    char req[512];
+    int n = snprintf(req, sizeof req,
+                     "GET %s HTTP/1.0\r\n"
+                     "Host: %s\r\n"
+                     "User-Agent: MEGA65-JTAG/1.0\r\n"
+                     "Connection: close\r\n"
+                     "\r\n",
+                     fc->path, fc->host);
+    if (n <= 0 || n >= (int)sizeof req ||
+        tcp_write(pcb, req, (u16_t)n, TCP_WRITE_FLAG_COPY) != ERR_OK) {
+        fetch_set_error(fc, "cannot send HTTP request");
+        fetch_close(fc, true);
+        return ERR_ABRT;
+    }
+    tcp_output(pcb);
+    fc->state = FETCH_RECV_HEADERS;
+    return ERR_OK;
+}
+
+static bool fetch_process_body(fetch_ctx_t *fc, const uint8_t *data, size_t len)
+{
+    if (fc->body_done + len > fc->content_length) {
+        fetch_set_error(fc, "HTTP body exceeds Content-Length");
+        return false;
+    }
+    if (http_cfg.require_write_grant && !write_gate_active()) {
+        fetch_set_error(fc, "write grant expired");
+        return false;
+    }
+    if (!signed_file_receive_write(&fc->signed_rx, data, len)) {
+        fetch_set_error(fc, signed_file_last_error());
+        return false;
+    }
+    fc->body_done += (uint32_t)len;
+    if (fc->body_done == fc->content_length) {
+        if (!signed_file_receive_finish(&fc->signed_rx)) {
+            fetch_set_error(fc, signed_file_last_error());
+            return false;
+        }
+        storage_delete(fc->final_path);
+        if (!storage_rename(fc->tmp_path, fc->final_path)) {
+            snprintf(fc->err, sizeof fc->err, "rename failed: %s", storage_last_error());
+            fc->state = FETCH_FAILED;
+            return false;
+        }
+        fc->state = FETCH_DONE;
+    }
+    return true;
+}
+
+static bool fetch_parse_headers(fetch_ctx_t *fc, const uint8_t *body, size_t body_len)
+{
+    int status = 0;
+    if (sscanf(fc->header, "HTTP/%*s %d", &status) != 1 || status < 200 || status >= 300) {
+        fetch_set_error(fc, "HTTP status was not 2xx");
+        return false;
+    }
+    const char *cl = header_value(fc->header, "Content-Length");
+    if (!cl) {
+        fetch_set_error(fc, "HTTP response missing Content-Length");
+        return false;
+    }
+    fc->content_length = (uint32_t)strtoul(cl, NULL, 10);
+    if (fc->content_length == 0) {
+        fetch_set_error(fc, "HTTP response has zero Content-Length");
+        return false;
+    }
+
+    storage_delete(fc->tmp_path);
+    if (!signed_file_receive_begin(&fc->signed_rx,
+                                   &http_cfg,
+                                   fc->final_path,
+                                   fc->tmp_path,
+                                   fc->content_length,
+                                   signed_file_type_from_path(fc->final_path))) {
+        fetch_set_error(fc, signed_file_last_error());
+        return false;
+    }
+
+    fc->state = FETCH_RECV_BODY;
+    if (body_len) return fetch_process_body(fc, body, body_len);
+    return true;
+}
+
+static bool fetch_process_bytes(fetch_ctx_t *fc, const uint8_t *data, size_t len)
+{
+    if (fc->state == FETCH_RECV_BODY) return fetch_process_body(fc, data, len);
+    if (fc->state != FETCH_RECV_HEADERS) return true;
+
+    if (len > sizeof(fc->header) - fc->header_len - 1u) {
+        fetch_set_error(fc, "HTTP response headers too large");
+        return false;
+    }
+    memcpy(fc->header + fc->header_len, data, len);
+    fc->header_len += len;
+    fc->header[fc->header_len] = 0;
+
+    size_t end_len = 0;
+    int hdr_end = find_header_end(fc->header, fc->header_len, &end_len);
+    if (hdr_end < 0) return true;
+
+    size_t body_offset = (size_t)hdr_end + end_len;
+    size_t body_len = fc->header_len - body_offset;
+    uint8_t initial_body[M65_HTTP_HEADER_MAX];
+    if (body_len) memcpy(initial_body, fc->header + body_offset, body_len);
+    fc->header[hdr_end] = 0;
+    return fetch_parse_headers(fc, initial_body, body_len);
+}
+
+static err_t fetch_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
+{
+    (void)pcb;
+    fetch_ctx_t *fc = (fetch_ctx_t *)arg;
+    if (!fc) return ERR_OK;
+    if (!p) {
+        if (fc->state != FETCH_DONE) fetch_set_error(fc, "connection closed before download completed");
+        fetch_close(fc, false);
+        return ERR_OK;
+    }
+    if (err != ERR_OK) {
+        pbuf_free(p);
+        fetch_set_error(fc, "TCP receive failed");
+        return err;
+    }
+
+    for (struct pbuf *q = p; q; q = q->next) {
+        if (!fetch_process_bytes(fc, (const uint8_t *)q->payload, q->len)) {
+            pbuf_free(p);
+            signed_file_receive_abort(&fc->signed_rx);
+            fetch_close(fc, true);
+            return ERR_ABRT;
+        }
+        if (fc->state == FETCH_DONE) break;
+    }
+    tcp_recved(pcb, p->tot_len);
+    pbuf_free(p);
+    if (fc->state == FETCH_DONE) fetch_close(fc, false);
+    return ERR_OK;
+}
+
+static void fetch_err(void *arg, err_t err)
+{
+    (void)err;
+    fetch_ctx_t *fc = (fetch_ctx_t *)arg;
+    if (!fc) return;
+    if (fc->state != FETCH_DONE) fetch_set_error(fc, "TCP connection aborted");
+}
+
+static void fetch_dns_cb(const char *name, const ip_addr_t *ipaddr, void *arg)
+{
+    (void)name;
+    fetch_ctx_t *fc = (fetch_ctx_t *)arg;
+    if (!fc) return;
+    if (!ipaddr) {
+        fetch_set_error(fc, "DNS lookup failed");
+        return;
+    }
+    fc->pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (!fc->pcb) {
+        fetch_set_error(fc, "cannot allocate TCP PCB");
+        return;
+    }
+    tcp_arg(fc->pcb, fc);
+    tcp_recv(fc->pcb, fetch_recv);
+    tcp_err(fc->pcb, fetch_err);
+    err_t err = tcp_connect(fc->pcb, ipaddr, fc->port, fetch_connected);
+    if (err != ERR_OK) {
+        fetch_set_error(fc, "TCP connect start failed");
+        fetch_close(fc, true);
+    } else {
+        fc->state = FETCH_CONNECTING;
+    }
+}
+
+bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err, size_t err_len)
+{
+    if (err && err_len) err[0] = 0;
+    if (!http_is_active) {
+        if (err && err_len) snprintf(err, err_len, "wifi HTTP is not active");
+        return false;
+    }
+    if (http_cfg.require_write_grant && !write_gate_active()) {
+        if (err && err_len) snprintf(err, err_len, "write grant is not active");
+        return false;
+    }
+
+    fetch_ctx_t fc;
+    memset(&fc, 0, sizeof fc);
+    fc.state = FETCH_CONNECTING;
+    if (!safe_download_name(name) || !make_download_path(name, fc.final_path, sizeof fc.final_path)) {
+        if (err && err_len) snprintf(err, err_len, "unsafe DOWNLOADS filename");
+        return false;
+    }
+    if (snprintf(fc.tmp_path, sizeof fc.tmp_path, "%s.tmp", fc.final_path) >= (int)sizeof fc.tmp_path) {
+        if (err && err_len) snprintf(err, err_len, "DOWNLOADS filename too long");
+        return false;
+    }
+    if (!parse_http_url(url, fc.host, sizeof fc.host, &fc.port, fc.path, sizeof fc.path)) {
+        if (err && err_len) snprintf(err, err_len, "expected http://host[:port]/path URL");
+        return false;
+    }
+    snprintf(fc.name, sizeof fc.name, "%s", name);
+
+    if (!storage_mkdir("DOWNLOADS")) {
+        if (err && err_len) snprintf(err, err_len, "cannot create DOWNLOADS: %s", storage_last_error());
+        return false;
+    }
+
+    ip_addr_t addr;
+    err_t dns_err = dns_gethostbyname(fc.host, &addr, fetch_dns_cb, &fc);
+    if (dns_err == ERR_OK) {
+        fetch_dns_cb(fc.host, &addr, &fc);
+    } else if (dns_err != ERR_INPROGRESS) {
+        if (err && err_len) snprintf(err, err_len, "DNS lookup failed");
+        return false;
+    }
+
+    absolute_time_t deadline = make_timeout_time_ms(60000);
+    while (fc.state != FETCH_DONE && fc.state != FETCH_FAILED) {
+        cyw43_arch_poll();
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            fetch_set_error(&fc, "fetch timed out");
+            signed_file_receive_abort(&fc.signed_rx);
+            fetch_close(&fc, true);
+            break;
+        }
+        sleep_ms(1);
+    }
+
+    bool ok = fc.state == FETCH_DONE;
+    if (!ok) {
+        signed_file_receive_abort(&fc.signed_rx);
+        storage_delete(fc.tmp_path);
+        if (err && err_len) snprintf(err, err_len, "%s", fc.err[0] ? fc.err : "fetch failed");
+    }
+    return ok;
+}
+
+static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
+{
+    (void)arg;
+    if (err != ERR_OK || !newpcb) return ERR_VAL;
+    if (http_conn.in_use) {
+        tcp_abort(newpcb);
+        return ERR_ABRT;
+    }
+
+    memset(&http_conn, 0, sizeof http_conn);
+    http_conn.pcb = newpcb;
+    http_conn.in_use = true;
+    http_conn.state = HTTP_RECV_HEADERS;
+    http_conn.remote_ip = lwip_ip_to_host_u32(&newpcb->remote_ip);
+
+    tcp_arg(newpcb, &http_conn);
+    tcp_recv(newpcb, http_recv);
+    tcp_sent(newpcb, http_sent);
+    tcp_err(newpcb, http_err);
+    tcp_poll(newpcb, http_poll_cb, 2);
+    return ERR_OK;
+}
+
+static bool listen_http(uint16_t port)
+{
+    listen_pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (!listen_pcb) return false;
+    err_t err = tcp_bind(listen_pcb, IP_ANY_TYPE, port);
+    if (err != ERR_OK) {
+        tcp_close(listen_pcb);
+        listen_pcb = NULL;
+        return false;
+    }
+    listen_pcb = tcp_listen_with_backlog(listen_pcb, 1);
+    if (!listen_pcb) return false;
+    tcp_accept(listen_pcb, http_accept);
+    return true;
+}
+
+static bool configure_static_ip(void)
+{
+    struct netif *n = &cyw43_state.netif[CYW43_ITF_STA];
+    ip4_addr_t ip, mask, gw;
+    cfg_ip_to_lwip(http_cfg.static_ip, &ip);
+    cfg_ip_to_lwip(http_cfg.netmask, &mask);
+    cfg_ip_to_lwip(http_cfg.gateway, &gw);
+    dhcp_stop(n);
+    netif_set_addr(n, &ip, &mask, &gw);
+    return true;
+}
+
+void remote_http_init(void)
+{
+    http_is_active = false;
+    snprintf(http_status_buf, sizeof http_status_buf, "wifi=inactive");
+
+    if (!storage_mount()) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled sd=%s", storage_last_error());
+        return;
+    }
+
+    char err[96];
+    if (!remote_auth_load(&http_cfg, err, sizeof err)) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled remote=%s", err);
+        return;
+    }
+    if (!http_cfg.http_enabled) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled http=0");
+        return;
+    }
+    if (!http_cfg.wifi_ssid[0]) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled ssid=missing");
+        return;
+    }
+
+    if (cyw43_arch_init() != 0) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=init-failed");
+        return;
+    }
+    cyw43_arch_enable_sta_mode();
+    if (!http_cfg.dhcp) configure_static_ip();
+
+    int rc = cyw43_arch_wifi_connect_timeout_ms(http_cfg.wifi_ssid,
+                                                http_cfg.wifi_psk[0] ? http_cfg.wifi_psk : NULL,
+                                                CYW43_AUTH_WPA2_AES_PSK,
+                                                M65_WIFI_CONNECT_TIMEOUT_MS);
+    if (rc != 0) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-failed rc=%d", rc);
+        return;
+    }
+
+    if (!listen_http(http_cfg.http_port)) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=http-listen-failed");
+        return;
+    }
+
+    struct netif *n = &cyw43_state.netif[CYW43_ITF_STA];
+    uint32_t ip = lwip_ntohl(ip4_addr_get_u32(netif_ip4_addr(n)));
+    char ip_text[24];
+    remote_auth_format_ipv4(ip, ip_text, sizeof ip_text);
+    snprintf(http_status_buf, sizeof http_status_buf, "wifi=up ip=%s port=%u", ip_text, (unsigned)http_cfg.http_port);
+    http_is_active = true;
+}
+
+void remote_http_poll(void)
+{
+    if (http_is_active) cyw43_arch_poll();
+}
+
+bool remote_http_active(void)
+{
+    return http_is_active;
+}
+
+const char *remote_http_status(void)
+{
+    return http_status_buf;
+}
+
+#endif

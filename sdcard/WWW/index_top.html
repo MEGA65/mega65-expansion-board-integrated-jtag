@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MEGA65 JTAG</title>
+  <link rel="stylesheet" href="/WWW/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <img src="/WWW/mega65_320x64.png" alt="MEGA65" width="320" height="64">
+      <h1>Expansion Board Integrated JTAG</h1>
+    </header>
+    <section class="grant grant-{WRITE_GRANT_STATUS}">
+      <strong>Write grant:</strong> {WRITE_GRANT_STATUS}
+      <span>{WRITE_GRANT_SECONDS}s remaining</span>
+      <span>Policy: {WRITE_GRANT_REQUIRED}</span>
+    </section>
+    <nav class="boards">
+      <span>Showing: {BOARD_LABEL}</span>
+      <a href="{R3_URL}">R3 cores</a>
+      <a href="{R6_URL}">R6 cores</a>
+    </nav>
+    <table>
+      <thead>
+        <tr>
+          <th>Core</th>
+          <th>Type</th>
+          <th>Bytes</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
