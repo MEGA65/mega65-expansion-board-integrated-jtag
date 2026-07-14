@@ -21,6 +21,8 @@ typedef struct {
     uint32_t payload_length;
     uint32_t expected_idcode;
     uint8_t model_id;
+    char title[32];
+    char version[32];
     char model[32];
 } core_file_t;
 

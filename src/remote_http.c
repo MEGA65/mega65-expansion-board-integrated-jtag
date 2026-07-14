@@ -15,6 +15,8 @@
 #include "uart_cmd.h"
 #include "write_gate.h"
 
+#include "mbedtls/sha256.h"
+
 #ifndef M65_WIFI_CONNECT_TIMEOUT_MS
 #define M65_WIFI_CONNECT_TIMEOUT_MS 15000u
 #endif
@@ -44,6 +46,23 @@ bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err
     if (err && err_len) snprintf(err, err_len, "wifi not supported");
     return false;
 }
+void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
+{
+    (void)enabled_override;
+    (void)interval_hours_override;
+    (void)board_rev_override;
+}
+void remote_http_autofetch_reset_schedule(void) {}
+void remote_http_autofetch_cancel(const char *reason) { (void)reason; }
+const char *remote_http_autofetch_status(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
+{
+    (void)enabled_override;
+    (void)interval_hours_override;
+    (void)board_rev_override;
+    return "autofetch=unsupported";
+}
+uint32_t remote_http_autofetch_last_success_seconds(void) { return 0xffffffffu; }
+bool remote_http_autofetch_running(void) { return false; }
 
 #else
 
@@ -118,15 +137,29 @@ typedef enum {
     FETCH_FAILED,
 } fetch_state_t;
 
+typedef enum {
+    AUTOFETCH_IDLE = 0,
+    AUTOFETCH_MANIFEST,
+    AUTOFETCH_SCAN,
+    AUTOFETCH_CORE,
+} autofetch_state_t;
+
 typedef struct {
     struct tcp_pcb *pcb;
     fetch_state_t state;
+    const remote_auth_config_t *cfg;
+    absolute_time_t deadline;
+    bool raw_to_buffer;
+    bool check_write_grant;
     char host[128];
     char path[256];
     char name[192];
     char final_path[256];
     char tmp_path[272];
     char header[M65_HTTP_HEADER_MAX];
+    char *raw_buf;
+    size_t raw_cap;
+    size_t raw_len;
     size_t header_len;
     uint16_t port;
     uint32_t content_length;
@@ -137,6 +170,7 @@ typedef struct {
 
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len);
 static int find_header_end(const char *buf, size_t len, size_t *end_len);
+static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms);
 
 static remote_auth_config_t http_cfg;
 static http_conn_t http_conn;
@@ -147,6 +181,23 @@ static char page_buf[M65_HTTP_PAGE_MAX];
 static char top_template[M65_HTTP_TEMPLATE_MAX];
 static char row_template[M65_HTTP_TEMPLATE_MAX];
 static char bottom_template[M65_HTTP_TEMPLATE_MAX];
+static absolute_time_t next_autofetch_due;
+static bool autofetch_schedule_valid;
+static bool autofetch_running;
+static bool autofetch_last_success_valid;
+static absolute_time_t autofetch_last_success;
+static autofetch_state_t autofetch_state = AUTOFETCH_IDLE;
+static fetch_ctx_t autofetch_fc;
+static remote_auth_config_t autofetch_sig_cfg;
+static uint32_t autofetch_manifest_offset;
+static uint32_t autofetch_updated_count;
+static uint32_t autofetch_checked_count;
+static char autofetch_manifest_path[48];
+static char autofetch_base_url[192];
+static char autofetch_channel[24];
+static char autofetch_pending_path[224];
+static char autofetch_pending_sha[65];
+static char autofetch_status_buf[192] = "autofetch=idle";
 
 static const char default_top[] =
     "<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -185,6 +236,17 @@ static bool has_core_ext(const char *name)
            (e1 == 'm' && e2 == '6' && e3 == '5' && e4 == 'j' && e5 == 0);
 }
 
+static bool has_manifest_ext(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot) return false;
+    return dot[1] &&
+           tolower((unsigned char)dot[1]) == 's' &&
+           tolower((unsigned char)dot[2]) == 'h' &&
+           tolower((unsigned char)dot[3]) == 'a' &&
+           dot[4] == '2' && dot[5] == '5' && dot[6] == '6' && dot[7] == 0;
+}
+
 static bool safe_file_path(const char *path)
 {
     if (!path || !path[0]) return false;
@@ -192,7 +254,7 @@ static bool safe_file_path(const char *path)
     if (n > 220) return false;
     if (strstr(path, "..")) return false;
     if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
-    return has_core_ext(path);
+    return has_core_ext(path) || has_manifest_ext(path);
 }
 
 static bool safe_www_path(const char *path)
@@ -241,6 +303,7 @@ static const char *content_type_for_path(const char *path)
     if (ext_equal_ci(dot, ".css")) return "text/css; charset=utf-8";
     if (ext_equal_ci(dot, ".js")) return "application/javascript";
     if (ext_equal_ci(dot, ".png")) return "image/png";
+    if (ext_equal_ci(dot, ".sha256") || ext_equal_ci(dot, ".txt")) return "text/plain; charset=utf-8";
     if (ext_equal_ci(dot, ".jpg") || ext_equal_ci(dot, ".jpeg")) return "image/jpeg";
     if (ext_equal_ci(dot, ".gif")) return "image/gif";
     if (ext_equal_ci(dot, ".svg")) return "image/svg+xml";
@@ -351,6 +414,100 @@ static bool url_decode(const char *in, char *out, size_t out_len)
     }
     out[pos] = 0;
     return in && *in == 0;
+}
+
+static bool safe_channel_name(const char *s, char *out, size_t out_len)
+{
+    size_t pos = 0;
+    if (!s || !s[0] || !out_len) return false;
+    for (; *s && pos + 1 < out_len; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (isalnum(c)) {
+            out[pos++] = (char)tolower(c);
+        } else if (c == '-' || c == '_' || c == '.') {
+            out[pos++] = '-';
+        } else {
+            return false;
+        }
+    }
+    while (pos > 0 && out[pos - 1] == '-') pos--;
+    out[pos] = 0;
+    return pos > 0 && *s == 0;
+}
+
+static bool join_url_path(const char *base, const char *rel, char *out, size_t out_len)
+{
+    if (!base || !base[0] || !rel || !rel[0]) return false;
+    char encoded[256];
+    url_encode(rel, encoded, sizeof encoded);
+    size_t n = strlen(base);
+    const char *slash = (n && base[n - 1] == '/') ? "" : "/";
+    return snprintf(out, out_len, "%s%s%s", base, slash, encoded) < (int)out_len;
+}
+
+static bool hex_to_bytes32(const char *hex, uint8_t out[32])
+{
+    if (!hex) return false;
+    for (unsigned i = 0; i < 32; i++) {
+        int hi = hex_value(hex[i * 2]);
+        int lo = hex_value(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return hex[64] == 0;
+}
+
+static void bytes32_to_hex(const uint8_t in[32], char out[65])
+{
+    static const char hex[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 32; i++) {
+        out[i * 2] = hex[in[i] >> 4];
+        out[i * 2 + 1] = hex[in[i] & 0x0f];
+    }
+    out[64] = 0;
+}
+
+static bool file_sha256_hex(const char *path, char out[65])
+{
+    storage_file_t f = {0};
+    if (!storage_open(&f, path)) return false;
+
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    if (mbedtls_sha256_starts(&sha, 0) != 0) {
+        mbedtls_sha256_free(&sha);
+        storage_close(&f);
+        return false;
+    }
+
+    uint8_t buf[M65_HTTP_IO_CHUNK];
+    uint32_t done = 0;
+    uint32_t size = storage_size(&f);
+    bool ok = true;
+    while (done < size) {
+        size_t want = size - done;
+        if (want > sizeof buf) want = sizeof buf;
+        size_t got = 0;
+        if (!storage_read(&f, buf, want, &got) || got == 0) {
+            ok = false;
+            break;
+        }
+        if (mbedtls_sha256_update(&sha, buf, got) != 0) {
+            ok = false;
+            break;
+        }
+        done += (uint32_t)got;
+    }
+    storage_close(&f);
+
+    uint8_t digest[32];
+    if (ok && mbedtls_sha256_finish(&sha, digest) == 0) {
+        bytes32_to_hex(digest, out);
+    } else {
+        ok = false;
+    }
+    mbedtls_sha256_free(&sha);
+    return ok;
 }
 
 static bool ci_equal_n(const char *a, const char *b, size_t n)
@@ -1317,7 +1474,8 @@ static bool fetch_process_body(fetch_ctx_t *fc, const uint8_t *data, size_t len)
         fetch_set_error(fc, "HTTP body exceeds Content-Length");
         return false;
     }
-    if (http_cfg.require_write_grant && !write_gate_active()) {
+    const remote_auth_config_t *cfg = fc->cfg ? fc->cfg : &http_cfg;
+    if (fc->check_write_grant && cfg->require_write_grant && !write_gate_active()) {
         fetch_set_error(fc, "write grant expired");
         return false;
     }
@@ -1360,9 +1518,10 @@ static bool fetch_parse_headers(fetch_ctx_t *fc, const uint8_t *body, size_t bod
         return false;
     }
 
+    const remote_auth_config_t *cfg = fc->cfg ? fc->cfg : &http_cfg;
     storage_delete(fc->tmp_path);
     if (!signed_file_receive_begin(&fc->signed_rx,
-                                   &http_cfg,
+                                   cfg,
                                    fc->final_path,
                                    fc->tmp_path,
                                    fc->content_length,
@@ -1466,6 +1625,69 @@ static void fetch_dns_cb(const char *name, const ip_addr_t *ipaddr, void *arg)
     }
 }
 
+static bool fetch_start(fetch_ctx_t *fc,
+                        const char *url,
+                        const char *final_path,
+                        const remote_auth_config_t *cfg,
+                        bool check_write_grant,
+                        uint32_t timeout_ms,
+                        char *err,
+                        size_t err_len)
+{
+    if (err && err_len) err[0] = 0;
+    if (!http_is_active) {
+        if (err && err_len) snprintf(err, err_len, "wifi HTTP is not active");
+        return false;
+    }
+    if (check_write_grant && cfg && cfg->require_write_grant && !write_gate_active()) {
+        if (err && err_len) snprintf(err, err_len, "write grant is not active");
+        return false;
+    }
+    if (!url || !final_path || !final_path[0]) {
+        if (err && err_len) snprintf(err, err_len, "invalid fetch parameters");
+        return false;
+    }
+
+    memset(fc, 0, sizeof *fc);
+    fc->state = FETCH_CONNECTING;
+    fc->cfg = cfg ? cfg : &http_cfg;
+    fc->check_write_grant = check_write_grant;
+    fc->deadline = make_timeout_time_ms(timeout_ms ? timeout_ms : 60000u);
+    snprintf(fc->final_path, sizeof fc->final_path, "%s", final_path);
+    if (snprintf(fc->tmp_path, sizeof fc->tmp_path, "%s.tmp", fc->final_path) >= (int)sizeof fc->tmp_path) {
+        if (err && err_len) snprintf(err, err_len, "destination filename too long");
+        return false;
+    }
+    if (!parse_http_url(url, fc->host, sizeof fc->host, &fc->port, fc->path, sizeof fc->path)) {
+        if (err && err_len) snprintf(err, err_len, "expected http://host[:port]/path URL");
+        return false;
+    }
+
+    ip_addr_t addr;
+    err_t dns_err = dns_gethostbyname(fc->host, &addr, fetch_dns_cb, fc);
+    if (dns_err == ERR_OK) {
+        fetch_dns_cb(fc->host, &addr, fc);
+    } else if (dns_err != ERR_INPROGRESS) {
+        if (err && err_len) snprintf(err, err_len, "DNS lookup failed");
+        return false;
+    }
+    return true;
+}
+
+static bool fetch_poll(fetch_ctx_t *fc)
+{
+    if (!fc) return false;
+    if (fc->state == FETCH_DONE || fc->state == FETCH_FAILED) return true;
+    if (absolute_time_diff_us(get_absolute_time(), fc->deadline) <= 0) {
+        fetch_set_error(fc, "fetch timed out");
+        signed_file_receive_abort(&fc->signed_rx);
+        fetch_close(fc, true);
+        storage_delete(fc->tmp_path);
+        return true;
+    }
+    return false;
+}
+
 bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err, size_t err_len)
 {
     if (err && err_len) err[0] = 0;
@@ -1479,45 +1701,20 @@ bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err
     }
 
     fetch_ctx_t fc;
-    memset(&fc, 0, sizeof fc);
-    fc.state = FETCH_CONNECTING;
     if (!safe_download_name(name) || !make_download_path(name, fc.final_path, sizeof fc.final_path)) {
         if (err && err_len) snprintf(err, err_len, "unsafe DOWNLOADS filename");
         return false;
     }
-    if (snprintf(fc.tmp_path, sizeof fc.tmp_path, "%s.tmp", fc.final_path) >= (int)sizeof fc.tmp_path) {
-        if (err && err_len) snprintf(err, err_len, "DOWNLOADS filename too long");
-        return false;
-    }
-    if (!parse_http_url(url, fc.host, sizeof fc.host, &fc.port, fc.path, sizeof fc.path)) {
-        if (err && err_len) snprintf(err, err_len, "expected http://host[:port]/path URL");
-        return false;
-    }
-    snprintf(fc.name, sizeof fc.name, "%s", name);
-
     if (!storage_mkdir("DOWNLOADS")) {
         if (err && err_len) snprintf(err, err_len, "cannot create DOWNLOADS: %s", storage_last_error());
         return false;
     }
-
-    ip_addr_t addr;
-    err_t dns_err = dns_gethostbyname(fc.host, &addr, fetch_dns_cb, &fc);
-    if (dns_err == ERR_OK) {
-        fetch_dns_cb(fc.host, &addr, &fc);
-    } else if (dns_err != ERR_INPROGRESS) {
-        if (err && err_len) snprintf(err, err_len, "DNS lookup failed");
-        return false;
-    }
-
-    absolute_time_t deadline = make_timeout_time_ms(60000);
+    char final_path[256];
+    snprintf(final_path, sizeof final_path, "%s", fc.final_path);
+    if (!fetch_start(&fc, url, final_path, &http_cfg, true, 60000u, err, err_len)) return false;
     while (fc.state != FETCH_DONE && fc.state != FETCH_FAILED) {
         cyw43_arch_poll();
-        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-            fetch_set_error(&fc, "fetch timed out");
-            signed_file_receive_abort(&fc.signed_rx);
-            fetch_close(&fc, true);
-            break;
-        }
+        fetch_poll(&fc);
         sleep_ms(1);
     }
 
@@ -1530,10 +1727,351 @@ bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err
     return ok;
 }
 
+static uint32_t clamp_interval_hours(uint32_t hours)
+{
+    if (hours < 3u) return 3u;
+    return hours;
+}
+
+static uint32_t interval_ms_for_hours(uint32_t hours)
+{
+    uint64_t ms = (uint64_t)clamp_interval_hours(hours) * 3600000ull;
+    if (ms > 0x7ffffffful) ms = 0x7ffffffful;
+    return (uint32_t)ms;
+}
+
+static bool effective_autofetch_enabled(int enabled_override)
+{
+    if (enabled_override == 0) return false;
+    if (enabled_override == 1) return true;
+    return http_cfg.autofetch_enabled;
+}
+
+static uint32_t effective_fetch_interval(uint32_t interval_hours_override)
+{
+    return clamp_interval_hours(interval_hours_override ? interval_hours_override : http_cfg.fetch_interval_hours);
+}
+
+static uint8_t effective_fetch_board(uint8_t board_rev_override)
+{
+    if (board_rev_override == 3 || board_rev_override == 6) return board_rev_override;
+    if (http_cfg.fetch_board_rev == 3 || http_cfg.fetch_board_rev == 6) return http_cfg.fetch_board_rev;
+    return 0;
+}
+
+static void autofetch_schedule_after(uint32_t delay_ms)
+{
+    next_autofetch_due = make_timeout_time_ms(delay_ms);
+    autofetch_schedule_valid = true;
+}
+
+void remote_http_autofetch_reset_schedule(void)
+{
+    autofetch_schedule_after(30000u);
+}
+
+static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms)
+{
+    bool had_status = autofetch_status_buf[0] != 0 &&
+                      (strstr(autofetch_status_buf, "autofetch=failed") == autofetch_status_buf);
+    if (autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE) {
+        if (autofetch_fc.state != FETCH_DONE) signed_file_receive_abort(&autofetch_fc.signed_rx);
+        fetch_close(&autofetch_fc, true);
+        storage_delete(autofetch_fc.tmp_path);
+    }
+    if ((autofetch_running || autofetch_state != AUTOFETCH_IDLE) && !had_status) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                 "autofetch=cancelled reason=\"%s\" checked=%lu updated=%lu",
+                 reason ? reason : "activity",
+                 (unsigned long)autofetch_checked_count,
+                 (unsigned long)autofetch_updated_count);
+    }
+    autofetch_running = false;
+    autofetch_state = AUTOFETCH_IDLE;
+    autofetch_schedule_after(retry_delay_ms ? retry_delay_ms : 900000u);
+}
+
+void remote_http_autofetch_cancel(const char *reason)
+{
+    autofetch_cancel(reason ? reason : "operator activity", 900000u);
+}
+
+static bool read_manifest_line(uint32_t *offset, char *line, size_t line_len, bool *eof)
+{
+    if (eof) *eof = false;
+    if (!offset || !line || line_len == 0) return false;
+    line[0] = 0;
+
+    storage_file_t f = {0};
+    if (!storage_open(&f, autofetch_manifest_path)) return false;
+    uint32_t size = storage_size(&f);
+    if (*offset >= size) {
+        storage_close(&f);
+        if (eof) *eof = true;
+        return true;
+    }
+    if (!storage_seek(&f, *offset)) {
+        storage_close(&f);
+        return false;
+    }
+
+    size_t pos = 0;
+    while (*offset < size) {
+        char ch = 0;
+        size_t got = 0;
+        if (!storage_read(&f, &ch, 1, &got) || got != 1) {
+            storage_close(&f);
+            return false;
+        }
+        (*offset)++;
+        if (ch == '\n') break;
+        if (ch != '\r' && pos + 1 < line_len) line[pos++] = ch;
+    }
+    line[pos] = 0;
+    storage_close(&f);
+    return true;
+}
+
+static bool parse_manifest_entry(char *line, char sha[65], char rel[224], bool *skip, char *err, size_t err_len)
+{
+    *skip = true;
+    char *s = line;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (!*s || *s == '#') return true;
+
+    char *hash = s;
+    while (*s && !isspace((unsigned char)*s)) s++;
+    if (*s) *s++ = 0;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (strlen(hash) != 64 || !*s) {
+        if (err && err_len) snprintf(err, err_len, "bad manifest line");
+        return false;
+    }
+    uint8_t digest[32];
+    if (!hex_to_bytes32(hash, digest)) {
+        if (err && err_len) snprintf(err, err_len, "bad manifest SHA-256");
+        return false;
+    }
+    if (!safe_file_path(s) || !has_core_ext(s) || s[0] == '/') {
+        if (err && err_len) snprintf(err, err_len, "unsafe manifest filename");
+        return false;
+    }
+    snprintf(sha, 65, "%s", hash);
+    snprintf(rel, 224, "%s", s);
+    *skip = false;
+    return true;
+}
+
+static bool autofetch_start_manifest(uint8_t board_rev)
+{
+    char channel[sizeof autofetch_channel];
+    if (!safe_channel_name(http_cfg.fetch_channel[0] ? http_cfg.fetch_channel : "stable", channel, sizeof channel)) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=blocked reason=bad-channel");
+        return false;
+    }
+    if (!http_cfg.fetch_base_url[0]) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=blocked reason=no-fetch-base-url");
+        return false;
+    }
+    if (http_cfg.trusted_key_count == 0) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=blocked reason=no-trusted-keys");
+        return false;
+    }
+    if (board_rev != 3 && board_rev != 6) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=blocked reason=no-fetch-board");
+        return false;
+    }
+
+    snprintf(autofetch_base_url, sizeof autofetch_base_url, "%s", http_cfg.fetch_base_url);
+    snprintf(autofetch_channel, sizeof autofetch_channel, "%s", channel);
+    snprintf(autofetch_manifest_path, sizeof autofetch_manifest_path, "%s-r%u.sha256",
+             autofetch_channel, (unsigned)board_rev);
+
+    char url[320];
+    if (!join_url_path(autofetch_base_url, autofetch_manifest_path, url, sizeof url)) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=blocked reason=manifest-url-too-long");
+        return false;
+    }
+
+    autofetch_sig_cfg = http_cfg;
+    autofetch_sig_cfg.require_signatures = true;
+    char err[96];
+    if (!fetch_start(&autofetch_fc, url, autofetch_manifest_path, &autofetch_sig_cfg, false, 120000u, err, sizeof err)) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=failed stage=manifest reason=\"%s\"", err);
+        return false;
+    }
+    autofetch_manifest_offset = 0;
+    autofetch_checked_count = 0;
+    autofetch_updated_count = 0;
+    autofetch_running = true;
+    autofetch_state = AUTOFETCH_MANIFEST;
+    snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+             "autofetch=running stage=manifest channel=%s board=R%u",
+             autofetch_channel, (unsigned)board_rev);
+    return true;
+}
+
+static bool autofetch_start_core(const char *rel, const char *sha)
+{
+    char url[384];
+    if (!join_url_path(autofetch_base_url, rel, url, sizeof url)) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=failed reason=core-url-too-long file=%s", rel);
+        return false;
+    }
+    char err[96];
+    if (!fetch_start(&autofetch_fc, url, rel, &autofetch_sig_cfg, false, 600000u, err, sizeof err)) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=failed file=%s reason=\"%s\"", rel, err);
+        return false;
+    }
+    snprintf(autofetch_pending_path, sizeof autofetch_pending_path, "%s", rel);
+    snprintf(autofetch_pending_sha, sizeof autofetch_pending_sha, "%s", sha);
+    autofetch_state = AUTOFETCH_CORE;
+    snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+             "autofetch=running stage=core file=%s checked=%lu updated=%lu",
+             rel,
+             (unsigned long)autofetch_checked_count,
+             (unsigned long)autofetch_updated_count);
+    return true;
+}
+
+static bool autofetch_scan_manifest(void)
+{
+    char line[320];
+    for (;;) {
+        bool eof = false;
+        if (!read_manifest_line(&autofetch_manifest_offset, line, sizeof line, &eof)) {
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                     "autofetch=failed stage=manifest-scan reason=\"%s\"", storage_last_error());
+            return false;
+        }
+        if (eof) {
+            autofetch_last_success = get_absolute_time();
+            autofetch_last_success_valid = true;
+            autofetch_running = false;
+            autofetch_state = AUTOFETCH_IDLE;
+            autofetch_schedule_after(interval_ms_for_hours(http_cfg.fetch_interval_hours));
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                     "autofetch=idle last=success channel=%s checked=%lu updated=%lu",
+                     autofetch_channel,
+                     (unsigned long)autofetch_checked_count,
+                     (unsigned long)autofetch_updated_count);
+            return true;
+        }
+
+        char sha[65];
+        char rel[224];
+        bool skip = true;
+        char err[80];
+        if (!parse_manifest_entry(line, sha, rel, &skip, err, sizeof err)) {
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                     "autofetch=failed stage=manifest-scan reason=\"%s\"", err);
+            return false;
+        }
+        if (skip) continue;
+
+        autofetch_checked_count++;
+        char have[65];
+        if (file_sha256_hex(rel, have) && strcmp(have, sha) == 0) continue;
+        if (!autofetch_start_core(rel, sha)) return false;
+        return true;
+    }
+}
+
+void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
+{
+    if (!http_is_active) return;
+
+    uint32_t interval_hours = effective_fetch_interval(interval_hours_override);
+    uint8_t board_rev = effective_fetch_board(board_rev_override);
+    if (!effective_autofetch_enabled(enabled_override)) {
+        if (autofetch_running) autofetch_cancel("disabled", 0);
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=disabled interval_hours=%lu board=R%u",
+                 (unsigned long)interval_hours, (unsigned)board_rev);
+        return;
+    }
+
+    if (!autofetch_schedule_valid) autofetch_schedule_after(30000u);
+
+    if (autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE) {
+        fetch_poll(&autofetch_fc);
+        if (autofetch_fc.state == FETCH_FAILED) {
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                     "autofetch=failed stage=%s reason=\"%s\"",
+                     autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core",
+                     autofetch_fc.err[0] ? autofetch_fc.err : "fetch failed");
+            autofetch_cancel("fetch failed", 900000u);
+            return;
+        }
+        if (autofetch_fc.state != FETCH_DONE) return;
+
+        if (autofetch_state == AUTOFETCH_MANIFEST) {
+            autofetch_state = AUTOFETCH_SCAN;
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=running stage=scan channel=%s", autofetch_channel);
+        } else {
+            char have[65];
+            if (!file_sha256_hex(autofetch_pending_path, have) || strcmp(have, autofetch_pending_sha) != 0) {
+                storage_delete(autofetch_pending_path);
+                snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                         "autofetch=failed stage=verify file=%s", autofetch_pending_path);
+                autofetch_cancel("hash mismatch", 900000u);
+                return;
+            }
+            autofetch_updated_count++;
+            autofetch_state = AUTOFETCH_SCAN;
+        }
+    }
+
+    if (autofetch_state == AUTOFETCH_SCAN) {
+        if (!autofetch_scan_manifest()) {
+            autofetch_cancel("manifest scan failed", 900000u);
+        }
+        return;
+    }
+
+    if (autofetch_state == AUTOFETCH_IDLE &&
+        absolute_time_diff_us(get_absolute_time(), next_autofetch_due) <= 0) {
+        http_cfg.fetch_interval_hours = interval_hours;
+        if (!autofetch_start_manifest(board_rev)) {
+            autofetch_schedule_after(900000u);
+        }
+    }
+}
+
+const char *remote_http_autofetch_status(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
+{
+    uint32_t interval_hours = effective_fetch_interval(interval_hours_override);
+    uint8_t board_rev = effective_fetch_board(board_rev_override);
+    const char *state = autofetch_status_buf[0] ? autofetch_status_buf : "autofetch=idle";
+    uint32_t last_seconds = remote_http_autofetch_last_success_seconds();
+    static char buf[320];
+    snprintf(buf, sizeof buf,
+             "%s enabled=%lu interval_hours=%lu board=R%u last_success_seconds=%lu running=%lu",
+             state,
+             (unsigned long)(effective_autofetch_enabled(enabled_override) ? 1u : 0u),
+             (unsigned long)interval_hours,
+             (unsigned)board_rev,
+             (unsigned long)last_seconds,
+             (unsigned long)(autofetch_running ? 1u : 0u));
+    return buf;
+}
+
+uint32_t remote_http_autofetch_last_success_seconds(void)
+{
+    if (!autofetch_last_success_valid) return 0xffffffffu;
+    int64_t us = absolute_time_diff_us(autofetch_last_success, get_absolute_time());
+    return us > 0 ? (uint32_t)(us / 1000000ll) : 0u;
+}
+
+bool remote_http_autofetch_running(void)
+{
+    return autofetch_running;
+}
+
 static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
     (void)arg;
     if (err != ERR_OK || !newpcb) return ERR_VAL;
+    autofetch_cancel("web request", 900000u);
     if (http_conn.in_use) {
         tcp_abort(newpcb);
         return ERR_ABRT;

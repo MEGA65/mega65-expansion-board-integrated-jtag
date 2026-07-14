@@ -56,6 +56,8 @@ static bool parse_cor_header(core_file_t *cf)
         set_err("cannot read COR header");
         return false;
     }
+    copy_fixed_string(cf->title, sizeof cf->title, hdr + 0x10, 32);
+    copy_fixed_string(cf->version, sizeof cf->version, hdr + 0x30, 32);
     copy_fixed_string(cf->model, sizeof cf->model, hdr + 0x50, 32);
     cf->model_id = hdr[0x70];
     return true;

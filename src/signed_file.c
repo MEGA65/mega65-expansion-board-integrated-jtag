@@ -393,7 +393,13 @@ bool signed_file_receive_finish(signed_file_rx_t *rx)
 void signed_file_receive_abort(signed_file_rx_t *rx)
 {
     if (!rx) return;
-    if (rx->candidate_signature) mbedtls_sha256_free(&rx->sha);
-    if (rx->tmp_path[0]) storage_delete(rx->tmp_path);
+    if (rx->candidate_signature) {
+        mbedtls_sha256_free(&rx->sha);
+        rx->candidate_signature = false;
+    }
+    if (rx->tmp_path[0]) {
+        storage_delete(rx->tmp_path);
+        rx->tmp_path[0] = 0;
+    }
     rx->rejected = true;
 }

@@ -35,13 +35,18 @@ typedef struct {
     bool present;
     bool dhcp;
     bool http_enabled;
+    bool autofetch_enabled;
     bool require_write_grant;
     bool require_signatures;
     uint16_t http_port;
+    uint32_t fetch_interval_hours;
+    uint8_t fetch_board_rev;
     char wifi_ssid[33];
     char wifi_psk[65];
     char http_user[33];
     char http_password[65];
+    char fetch_base_url[192];
+    char fetch_channel[24];
     uint32_t static_ip;
     uint32_t netmask;
     uint32_t gateway;

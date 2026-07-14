@@ -51,9 +51,9 @@ bool core_matches_board(const core_file_t *cf, const char *path, uint8_t board_r
 const char *core_board_label(uint8_t board_rev)
 {
     switch (board_rev) {
+    case 2: return "R2";
     case 3: return "R3";
     case 6: return "R6";
     default: return "ANY";
     }
 }
-

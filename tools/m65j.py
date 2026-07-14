@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import urllib.parse
 import urllib.request
@@ -27,6 +28,10 @@ DEFAULT_KEY = Path.home() / ".m65jtag-core-signing.pem"
 KEY_DIR = Path.home() / ".m65jtag" / "keys"
 DEFAULT_KEY_NAME = "default"
 CONFIG_FILES = (Path(".m65j.config"), Path.home() / ".m65j.config")
+SIGNED_SCAN_EXTS = (".bit", ".cor", ".core", ".m65j", ".sha256")
+P256_SPKI_PREFIX = bytes.fromhex(
+    "3059301306072a8648ce3d020106082a8648ce3d030107034200"
+)
 
 
 def load_serial_module():
@@ -188,7 +193,7 @@ def file_type_for(path):
     ext = path.suffix.lower()
     if ext == ".bit":
         return 1
-    if ext == ".cor":
+    if ext in {".cor", ".core"}:
         return 2
     if ext == ".m65j":
         return 3
@@ -209,6 +214,241 @@ def blessed_filename(data):
     if not raw:
         return ""
     return raw.decode("utf-8", "replace")
+
+
+def der_len(n):
+    if n < 0x80:
+        return bytes([n])
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(raw)]) + raw
+
+
+def der_int(raw):
+    value = bytes(raw).lstrip(b"\x00") or b"\x00"
+    if value[0] & 0x80:
+        value = b"\x00" + value
+    return b"\x02" + der_len(len(value)) + value
+
+
+def ecdsa_der_from_raw(raw_sig):
+    if len(raw_sig) != 64:
+        raise ValueError("raw ECDSA signature must be 64 bytes")
+    body = der_int(raw_sig[:32]) + der_int(raw_sig[32:])
+    return b"\x30" + der_len(len(body)) + body
+
+
+def parse_trusted_key_value(value):
+    value = value.strip()
+    lower = value.lower()
+    if lower.startswith("p256:"):
+        value = value[5:]
+    elif lower.startswith("ecdsa-p256:"):
+        value = value[11:]
+    compact = "".join(c for c in value if c not in ":- \t\r\n")
+    try:
+        raw = bytes.fromhex(compact)
+    except ValueError:
+        return None
+    if len(raw) != 65 or raw[0] != 0x04:
+        return None
+    return raw
+
+
+def trusted_keys_from_remote_config(path):
+    keys = []
+    text = Path(path).read_text(encoding="utf-8")
+    for line_no, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip().lower() not in {"trusted_key", "public_key", "signature_key"}:
+            continue
+        pub = parse_trusted_key_value(value)
+        if pub is None:
+            print(f"WARNING {path}:{line_no}: ignored malformed trusted key", file=sys.stderr)
+            continue
+        keys.append((f"{Path(path).name}:{line_no}", pub))
+    return keys
+
+
+def local_trusted_keys():
+    keys = []
+    for name, path in iter_known_keys():
+        try:
+            keys.append((name, raw_public_key_from_private_key(path)))
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING skipped local key {path}: {exc}", file=sys.stderr)
+    return keys
+
+
+def verify_p256_raw_signature(pubkey, metadata, raw_sig):
+    pub_der = P256_SPKI_PREFIX + pubkey
+    sig_der = ecdsa_der_from_raw(raw_sig)
+    temps = []
+    try:
+        for data in (pub_der, sig_der, metadata):
+            tf = tempfile.NamedTemporaryFile(delete=False)
+            tf.write(data)
+            tf.close()
+            temps.append(tf.name)
+        p = subprocess.run(
+            [
+                "openssl",
+                "dgst",
+                "-sha256",
+                "-keyform",
+                "DER",
+                "-verify",
+                temps[0],
+                "-signature",
+                temps[1],
+                temps[2],
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return p.returncode == 0
+    except FileNotFoundError:
+        raise SystemExit("openssl not found in PATH")
+    finally:
+        for name in temps:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+
+
+def trailer_filename(trailer):
+    raw = trailer[FILENAME_OFF:FILENAME_OFF + FILENAME_LEN]
+    if raw and raw[0] and b"\x00" not in raw:
+        raise ValueError("signature filename is not terminated")
+    raw = raw.split(b"\x00", 1)[0]
+    return raw.decode("utf-8", "replace") if raw else ""
+
+
+def check_signed_bytes(data, path, trusted_keys, check_filename=True, check_type=True):
+    if len(data) < TRAILER_LEN or data[-TRAILER_LEN:-TRAILER_LEN + len(MAGIC)] != MAGIC:
+        return "uncursed", "no signature trailer"
+
+    payload = data[:-TRAILER_LEN]
+    trailer = data[-TRAILER_LEN:]
+    version, header_len = struct.unpack_from("<HH", trailer, 32)
+    payload_len = struct.unpack_from("<I", trailer, 40)[0]
+    file_type = trailer[44]
+    board = trailer[45]
+    hash_alg = trailer[46]
+    sig_alg = trailer[47]
+    key_id = trailer[48:64]
+    payload_hash = trailer[64:96]
+    raw_sig = trailer[SIG_OFF:SIG_OFF + 64]
+
+    if version != 1 or header_len != TRAILER_LEN:
+        return "cursed", f"unsupported signature block version/header ({version}/{header_len})"
+    if payload_len != len(payload):
+        return "cursed", f"signature payload length mismatch ({payload_len} != {len(payload)})"
+    if hash_alg != 1 or sig_alg != 1:
+        return "cursed", f"unsupported signature algorithms ({hash_alg}/{sig_alg})"
+    if hashlib.sha256(payload).digest() != payload_hash:
+        return "cursed", "payload SHA-256 mismatch"
+    if check_type:
+        expected_type = file_type_for(path)
+        if file_type != 0 and expected_type != 0 and file_type != expected_type:
+            return "cursed", f"file type mismatch (signed={file_type}, path={expected_type})"
+    try:
+        signed_name = trailer_filename(trailer)
+    except ValueError as exc:
+        return "cursed", str(exc)
+    if check_filename and signed_name and signed_name != path.name:
+        return "cursed", f"filename mismatch (signed={signed_name!r}, path={path.name!r})"
+
+    if not trusted_keys:
+        return "cursed", "no trusted keys available to verify signature"
+
+    metadata = trailer[:SIG_OFF]
+    matched_key_id = 0
+    for name, pubkey in trusted_keys:
+        if any(key_id):
+            have_key_id = hashlib.sha256(pubkey).digest()[:16]
+            if have_key_id != key_id:
+                continue
+            matched_key_id += 1
+        if verify_p256_raw_signature(pubkey, metadata, raw_sig):
+            details = f"key={name} board={board} type={file_type}"
+            if signed_name:
+                details += f" name={signed_name}"
+            return "blessed", details
+
+    if any(key_id) and matched_key_id == 0:
+        return "cursed", f"no trusted key matches key_id={key_id.hex()}"
+    return "cursed", "signature verification failed"
+
+
+def collect_check_paths(inputs, all_files=False):
+    paths = []
+    for value in inputs:
+        path = Path(value)
+        if path.is_dir():
+            for child in sorted(path.rglob("*")):
+                if child.is_file() and (all_files or child.suffix.lower() in SIGNED_SCAN_EXTS):
+                    paths.append(child)
+        else:
+            paths.append(path)
+    return paths
+
+
+def check_main(argv):
+    ap = argparse.ArgumentParser(
+        prog="m65j.py check",
+        description="Report signed-file blessedness for local files.",
+    )
+    ap.add_argument("paths", nargs="+", help="files or directories to inspect")
+    ap.add_argument("--trusted-key", action="append", default=[], help="raw trusted key, e.g. p256:04...")
+    ap.add_argument("--remote-config", action="append", type=Path, default=[],
+                    help="REMOTE_ENABLE.cfg to read trusted_key lines from")
+    ap.add_argument("--no-local-keys", action="store_true", help="do not use local ~/.m65jtag signing keys")
+    ap.add_argument("--no-filename-check", action="store_true", help="do not mark renamed signed files as cursed")
+    ap.add_argument("--no-type-check", action="store_true", help="do not compare signed type with filename extension")
+    ap.add_argument("--all", action="store_true", help="when checking directories, include every file")
+    args = ap.parse_args(argv)
+
+    trusted = []
+    if not args.no_local_keys:
+        trusted.extend(local_trusted_keys())
+    for value in args.trusted_key:
+        pub = parse_trusted_key_value(value)
+        if pub is None:
+            raise SystemExit(f"bad --trusted-key value: {value}")
+        trusted.append(("cli", pub))
+    for path in args.remote_config:
+        trusted.extend(trusted_keys_from_remote_config(path))
+
+    paths = collect_check_paths(args.paths, args.all)
+    if not paths:
+        raise SystemExit("no files matched")
+
+    rc = 0
+    for path in paths:
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            print(f"[cursed]   {path} - cannot read: {exc}")
+            rc = 1
+            continue
+        status, detail = check_signed_bytes(
+            data,
+            path,
+            trusted,
+            check_filename=not args.no_filename_check,
+            check_type=not args.no_type_check,
+        )
+        pad = " " * max(1, 9 - len(status))
+        suffix = f" - {detail}" if status == "cursed" else (f" - {detail}" if status == "blessed" else "")
+        print(f"[{status}]{pad}{path}{suffix}")
+        if status == "cursed":
+            rc = 1
+    return rc
 
 
 def build_trailer(payload, key_path, board, file_type, key_id, signed_filename):
@@ -448,6 +688,283 @@ def signing_main(argv):
     return 0
 
 
+def latest_main(argv):
+    import download_altcores
+
+    return download_altcores.main(argv)
+
+
+def normalize_board_for_mirror(board):
+    b = str(board).lower()
+    if b in {"3", "r3"}:
+        return "r3"
+    if b in {"6", "r6"}:
+        return "r6"
+    if b in {"all", "both"}:
+        return "all"
+    raise SystemExit("board must be r3, r6, 3, 6, or all")
+
+
+def mirror_boards(board):
+    b = normalize_board_for_mirror(board)
+    return ["r3", "r6"] if b == "all" else [b]
+
+
+def board_id_for_mirror(board):
+    b = normalize_board_for_mirror(board)
+    if b == "r3":
+        return "3"
+    if b == "r6":
+        return "6"
+    return "0"
+
+
+def safe_channel_name(name):
+    out = "".join(c.lower() if c.isalnum() else "-" for c in str(name))
+    out = "-".join(part for part in out.split("-") if part)
+    return out or "stable"
+
+
+def looks_like_http_url(value):
+    lower = str(value).lower()
+    return lower.startswith("http://") or lower.startswith("https://")
+
+
+def resolve_mirror_positionals(ap, items):
+    known_release_tags = {
+        "stable",
+        "unstable",
+        "nightly",
+        "latest",
+        "release",
+        "testing",
+        "dev",
+        "devel",
+    }
+    if not items:
+        ap.error("mirror expects: [release-type] <output-dir> [source-url...]")
+
+    if len(items) == 1:
+        if looks_like_http_url(items[0]):
+            ap.error("missing output directory before source URL; try: mirror stable mirror https://...")
+        return "stable", Path(items[0]), []
+
+    if looks_like_http_url(items[1]):
+        if items[0].lower() in known_release_tags:
+            ap.error("missing output directory before source URL; try: mirror stable mirror https://...")
+        return "stable", Path(items[0]), items[1:]
+
+    if looks_like_http_url(items[0]):
+        ap.error("source URL must come after the output directory; try: mirror stable mirror https://...")
+
+    release_type = items[0]
+    output = Path(items[1])
+    source_urls = items[2:]
+    if looks_like_http_url(str(output)):
+        ap.error("output directory looks like a URL; try: mirror stable mirror https://...")
+    return release_type, output, source_urls
+
+
+def add_mirror_options(ap, populate=False):
+    ap.add_argument("--board", choices=("r3", "r6", "3", "6", "all"), required=True, help="MEGA65 board revision, or all")
+    ap.add_argument("--source-url", dest="option_source_url", action="append", default=[],
+                    help="alternate catalogue URL to scrape; files.mega65.org aliases the default alt-core pages; repeatable")
+    ap.add_argument("--cache", default=".cache/altcores", help="directory for downloaded zip archives")
+    ap.add_argument("--cookie", help="raw Cookie header for files.mega65.org if login is required")
+    ap.add_argument("--cookie-file", help="file containing a raw Cookie header")
+    ap.add_argument("--keep-zips", action="store_true", help="keep downloaded zip archives in --cache")
+    ap.add_argument("--overwrite", action="store_true", help="replace changed canonical core files")
+    ap.add_argument("--limit", type=int, default=0, help="limit discovered refs processed")
+    ap.add_argument("--manifest", default="", help="write JSON result manifest")
+    ap.add_argument("--key", help="explicit P-256 EC private key PEM for blessing")
+    ap.add_argument("--key-name", default=DEFAULT_KEY_NAME, help="named key under ~/.m65jtag/keys")
+    ap.add_argument("--yes", action="store_true", help="create the selected signing key without prompting")
+    ap.add_argument("--blank-filename", action="store_true", help="do not bind signatures to filenames")
+    ap.add_argument("--hash-file", default=None, help="hash-list filename; default is <release-type>-rX.sha256")
+    ap.add_argument("--no-hash-file", action="store_true", help="do not write a release hash list")
+    ap.add_argument("--preserve-filenames", action="store_true", help="use archive member filenames instead of canonical names")
+    ap.add_argument("--quiet", action="store_true", help="suppress mirror progress chatter")
+    ap.add_argument("--detail-workers", type=int, default=8, help="parallel filehost JSON detail fetches; 1 disables")
+    if populate:
+        ap.add_argument("--device", help="base board URL, e.g. http://mega65-jtag.local")
+        ap.add_argument("--staging", type=Path, help="local staging directory; defaults to a temporary directory")
+        ap.add_argument("--no-bless", action="store_true", help="upload files without signing/blessing them first")
+        ap.add_argument("--user", help="HTTP Basic auth user")
+        ap.add_argument("--password", help="HTTP Basic auth password")
+    else:
+        ap.add_argument("--bless", action="store_true", help="append signed trailers to offered core files")
+        ap.add_argument("--dry-run", action="store_true", help="only list discovered filehost IDs")
+
+
+def downloader_args_from(ns, output, release_type, source_urls, bless):
+    args = [
+        "--board", normalize_board_for_mirror(ns.board),
+        "--output", str(output),
+        "--cache", ns.cache,
+        "--channel", release_type,
+    ]
+    for attr in ("cookie", "cookie_file", "manifest", "key", "key_name", "hash_file", "detail_workers"):
+        value = getattr(ns, attr, None)
+        if value is not None and value != "":
+            args.extend([f"--{attr.replace('_', '-')}", str(value)])
+    for url in [*getattr(ns, "option_source_url", []), *source_urls]:
+        args.extend(["--source-url", url])
+    if ns.keep_zips:
+        args.append("--keep-zips")
+    if ns.overwrite:
+        args.append("--overwrite")
+    if ns.limit:
+        args.extend(["--limit", str(ns.limit)])
+    if bless:
+        args.append("--bless")
+    if getattr(ns, "yes", False):
+        args.append("--yes")
+    if getattr(ns, "blank_filename", False):
+        args.append("--blank-filename")
+    if getattr(ns, "no_hash_file", False):
+        args.append("--no-hash-file")
+    if getattr(ns, "preserve_filenames", False):
+        args.append("--preserve-filenames")
+    if getattr(ns, "dry_run", False):
+        args.append("--dry-run")
+    if getattr(ns, "quiet", False):
+        args.append("--quiet")
+    return args
+
+
+def mirror_main(argv):
+    import download_altcores
+
+    ap = argparse.ArgumentParser(
+        prog="m65j.py mirror",
+        description="Build a local canonical MEGA65 core mirror for a release channel.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Positional order:
+              m65j.py mirror [options] <release-type> <output-dir> [source-url...]
+              m65j.py mirror [options] <output-dir> [source-url...]
+
+            If <release-type> is omitted, it defaults to stable. Source URLs
+            always come after the output directory.
+
+            Examples:
+              m65j.py mirror --board all mirror https://files.mega65.org
+              m65j.py mirror --board r6 stable mirror https://files.mega65.org
+              m65j.py mirror --board r6 stable sdcard/cores --overwrite --bless --yes
+            """
+        ),
+    )
+    ap.add_argument("items", nargs="*", metavar="ARGS",
+                    help="positionals; see positional order below")
+    add_mirror_options(ap, populate=False)
+    ns = ap.parse_args(argv)
+    release_type, output, source_urls = resolve_mirror_positionals(ap, ns.items)
+    args = downloader_args_from(ns, output, release_type, source_urls, ns.bless)
+    return download_altcores.main(args)
+
+
+def read_hash_manifest(path):
+    rows = []
+    data = Path(path).read_bytes()
+    if len(data) >= TRAILER_LEN and data[-TRAILER_LEN:-TRAILER_LEN + len(MAGIC)] == MAGIC:
+        data = data[:-TRAILER_LEN]
+    for line_no, raw in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2 or len(parts[0]) != 64:
+            raise SystemExit(f"bad hash manifest line {line_no}: {raw}")
+        sha, rel = parts[0].lower(), parts[1].strip()
+        if any(c not in "0123456789abcdef" for c in sha):
+            raise SystemExit(f"bad SHA-256 on manifest line {line_no}")
+        if not rel or rel.startswith("/") or ".." in rel or "\\" in rel or ":" in rel:
+            raise SystemExit(f"unsafe manifest filename on line {line_no}: {rel}")
+        rows.append((sha, rel))
+    return rows
+
+
+def populate_main(argv):
+    import download_altcores
+
+    ap = argparse.ArgumentParser(
+        prog="m65j.py populate",
+        description="Mirror a release channel and upload the resulting files to the board SD card over HTTP.",
+    )
+    ap.add_argument("release_type", help="release channel tag, e.g. stable, unstable, nightly")
+    ap.add_argument("source_urls", nargs="*", help="alternate catalogue URL(s) to scrape instead of the defaults")
+    add_mirror_options(ap, populate=True)
+    ns = ap.parse_args(argv)
+
+    device = require_device(ns.device)
+    user, password = config_auth(ns.user, ns.password)
+    staging_ctx = None
+    if ns.staging:
+        out_dir = ns.staging
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        staging_ctx = tempfile.TemporaryDirectory(prefix="m65j-populate-")
+        out_dir = Path(staging_ctx.name)
+
+    try:
+        bless = not ns.no_bless
+        args = downloader_args_from(ns, out_dir, ns.release_type, ns.source_urls, bless)
+        rc = download_altcores.main(args)
+        if rc != 0:
+            return rc
+
+        hash_names = []
+        if not ns.no_hash_file:
+            if ns.hash_file and normalize_board_for_mirror(ns.board) == "all":
+                raise SystemExit("populate --board all uses <release>-r3.sha256 and <release>-r6.sha256; omit --hash-file")
+            for board in mirror_boards(ns.board):
+                hash_names.append(ns.hash_file or f"{safe_channel_name(ns.release_type)}-{board}.sha256")
+        if not hash_names:
+            raise SystemExit("populate requires a hash file; omit --no-hash-file")
+
+        uploaded: set[str] = set()
+        hash_paths: list[tuple[str, Path]] = []
+        for board, hash_name in zip(mirror_boards(ns.board), hash_names):
+            hash_path = Path(hash_name)
+            if not hash_path.is_absolute():
+                hash_path = out_dir / hash_path
+            hash_paths.append((board, hash_path))
+            rows = read_hash_manifest(hash_path)
+            for _sha, rel in rows:
+                local = out_dir / rel
+                if not local.exists():
+                    raise SystemExit(f"manifest entry is missing locally: {local}")
+                if rel in uploaded:
+                    continue
+                uploaded.add(rel)
+                put_url = device_put_url(device, rel, 0, True)
+                print(f"PUT {put_url}", file=sys.stderr)
+                put_file(put_url, local.read_bytes(), user, password)
+
+        # Upload the release hash list last, signed if populate is doing normal
+        # blessed uploads. The firmware stores only the payload after verifying.
+        for board, hash_path in hash_paths:
+            if bless:
+                rc = signing_main([
+                    "--device", device,
+                    "--store-only",
+                    "--board", board_id_for_mirror(board),
+                    "--name", hash_path.name,
+                    str(hash_path),
+                ])
+                if rc != 0:
+                    return rc
+            else:
+                put_url = device_put_url(device, hash_path.name, 0, True)
+                print(f"PUT {put_url}", file=sys.stderr)
+                put_file(put_url, hash_path.read_bytes(), user, password)
+        return 0
+    finally:
+        if staging_ctx:
+            staging_ctx.cleanup()
+
+
 def first_arg_is_device(args):
     if not args:
         return False
@@ -470,7 +987,7 @@ def pop_optional_device(args):
 
 
 def route_web_command(verb, rest):
-    if verb in {"status", "index", "home"}:
+    if verb in {"status", "index", "home", "list", "ls", "cores"}:
         ap = argparse.ArgumentParser(prog=f"m65j.py {verb}")
         ap.add_argument("device", nargs="?")
         ap.add_argument("--board", choices=("3", "6"))
@@ -552,8 +1069,20 @@ def route_remote_command(argv):
     if verb.startswith("at") or verb == "go64":
         return route_at_over_web(argv)
 
+    if verb in {"mirror", "make-mirror"}:
+        return mirror_main(rest)
+
+    if verb in {"populate", "populate-sd", "install-mirror"}:
+        return populate_main(rest)
+
+    if verb in {"latest", "fetch-latest", "update-cores", "altcores"}:
+        return latest_main(rest)
+
     if verb in {"keys", "--keys"}:
         return signing_main(["--keys", *rest])
+
+    if verb in {"check", "verify", "blessedness", "curse-check"}:
+        return check_main(rest)
 
     if verb in {"bless", "sign"}:
         if "--bless" not in rest:
@@ -953,12 +1482,28 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(
         description="Single client for pico-m65jtag serial, signing, and HTTP/JTAG delivery",
-        epilog=(
-            "Signing/HTTP commands: keys; bless [options] file; "
-            "push <device-url> file [options]; store <device-url> file [options]; "
-            "put <exact-put-url> file [options]. Web commands can use .m65j.config: "
-            "status; load file; get file; downloads-get name. Serial commands keep the form: "
-            "m65j.py <port> ATI or m65j.py <port> stream local.bit."
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Common commands:
+              m65j.py keys
+              m65j.py check sdcard/cores
+              m65j.py bless --board 6 core.bit
+              m65j.py mirror stable sdcard/cores --board all --overwrite --bless --yes
+              m65j.py populate stable --board all --overwrite --yes
+              m65j.py list [--board 6]
+              m65j.py push [device-url] core.bit --board 6
+              m65j.py store [device-url] core.bit --board 6
+              m65j.py load [device-url] /cores/core.cor --board 6
+              m65j.py get [device-url] /cores/core.cor -o core.cor
+              m65j.py downloads-get [device-url] fetched.bit -o fetched.bit
+              m65j.py put http://host/files/core.bit core.bit --board 6
+              m65j.py /dev/ttyACM0 ATI
+              m65j.py /dev/ttyACM0 stream local.bit
+
+            Web commands read .m65j.config, then ~/.m65j.config, when no device URL is supplied.
+            Use `device=http://<pico-ip>` or `ip=<pico-ip>` in that config file.
+            """
         ),
     )
     ap.add_argument("port", help="serial port, e.g. /dev/ttyACM0 or COM3")

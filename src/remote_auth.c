@@ -19,6 +19,8 @@ void remote_auth_reset(remote_auth_config_t *cfg)
     cfg->http_enabled = true;
     cfg->require_write_grant = true;
     cfg->http_port = 80;
+    cfg->fetch_interval_hours = 3;
+    snprintf(cfg->fetch_channel, sizeof cfg->fetch_channel, "stable");
     cfg->netmask = 0xffffff00u;
 }
 
@@ -69,6 +71,20 @@ static int hex_value(char c)
     if (c >= 'a' && c <= 'f') return 10 + c - 'a';
     if (c >= 'A' && c <= 'F') return 10 + c - 'A';
     return -1;
+}
+
+static bool parse_board_value(const char *s, uint8_t *out)
+{
+    if (!s || !out) return false;
+    if (ci_equal(s, "3") || ci_equal(s, "r3")) {
+        *out = 3;
+        return true;
+    }
+    if (ci_equal(s, "6") || ci_equal(s, "r6")) {
+        *out = 6;
+        return true;
+    }
+    return false;
 }
 
 static bool parse_hex_bytes(const char *s, uint8_t *out, size_t out_cap, size_t *out_len)
@@ -240,6 +256,38 @@ static bool parse_global(remote_auth_config_t *cfg, char *line)
     }
     if (ci_equal(key, "http") || ci_equal(key, "http_enabled") || ci_equal(key, "http_enable")) {
         return parse_bool_value(value, &cfg->http_enabled);
+    }
+    if (ci_equal(key, "autofetch") || ci_equal(key, "auto_fetch") || ci_equal(key, "auto_update")) {
+        return parse_bool_value(value, &cfg->autofetch_enabled);
+    }
+    if (ci_equal(key, "fetch_interval") ||
+        ci_equal(key, "fetch_interval_hours") ||
+        ci_equal(key, "autofetch_interval")) {
+        char *end = NULL;
+        unsigned long hours = strtoul(value, &end, 10);
+        if (*end || hours < 3u || hours > 8760u) return false;
+        cfg->fetch_interval_hours = (uint32_t)hours;
+        return true;
+    }
+    if (ci_equal(key, "fetch_board") ||
+        ci_equal(key, "fetch_board_rev") ||
+        ci_equal(key, "autofetch_board") ||
+        ci_equal(key, "board_rev")) {
+        return parse_board_value(value, &cfg->fetch_board_rev);
+    }
+    if (ci_equal(key, "fetch_base_url") ||
+        ci_equal(key, "mirror_url") ||
+        ci_equal(key, "autofetch_url") ||
+        ci_equal(key, "update_url")) {
+        snprintf(cfg->fetch_base_url, sizeof cfg->fetch_base_url, "%s", value);
+        return true;
+    }
+    if (ci_equal(key, "fetch_channel") ||
+        ci_equal(key, "mirror_channel") ||
+        ci_equal(key, "update_channel") ||
+        ci_equal(key, "channel")) {
+        snprintf(cfg->fetch_channel, sizeof cfg->fetch_channel, "%s", value);
+        return true;
     }
     if (ci_equal(key, "http_port") || ci_equal(key, "port")) {
         char *end = NULL;

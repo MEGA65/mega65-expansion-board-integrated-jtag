@@ -32,6 +32,8 @@
 #define M65_STREAM_COMMANDS_USB_ONLY 1
 #endif
 
+#define AT_SETTINGS_PATH "AT_SETTINGS.cfg"
+
 static bool sd_mounted = false;
 static remote_auth_config_t remote_cfg;
 
@@ -41,6 +43,18 @@ typedef enum {
 } command_mode_t;
 
 static command_mode_t command_mode = CMD_MODE_AT;
+
+typedef struct {
+    int autofetch; // -1 = use REMOTE_ENABLE.cfg default, 0 = off, 1 = on
+    uint32_t fetch_interval_hours;
+    uint8_t fetch_board_rev; // 0 = use REMOTE_ENABLE.cfg default
+} at_settings_t;
+
+static at_settings_t at_settings = {
+    .autofetch = -1,
+    .fetch_interval_hours = 0,
+    .fetch_board_rev = 0,
+};
 
 static void progress_cb(uint32_t done, uint32_t total, void *ctx)
 {
@@ -71,6 +85,35 @@ static void list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
 {
     (void)ctx;
     uart_cmd_printf("%s %lu %s\n", is_dir ? "DIR" : "CORE", (unsigned long)size, name);
+}
+
+static void uart_quoted(const char *s)
+{
+    uart_cmd_puts("\"");
+    if (s) {
+        for (; *s; s++) {
+            if (*s == '"' || *s == '\\') uart_cmd_printf("\\%c", *s);
+            else if ((unsigned char)*s >= 32u && (unsigned char)*s < 127u) uart_cmd_printf("%c", *s);
+            else uart_cmd_printf("\\x%02x", (unsigned)((unsigned char)*s));
+        }
+    }
+    uart_cmd_puts("\"");
+}
+
+static bool make_child_path(const char *dir, const char *name, char *out, size_t out_len)
+{
+    if (!dir || !dir[0] || strcmp(dir, "/") == 0) {
+        return snprintf(out, out_len, "/%s", name) < (int)out_len;
+    }
+    size_t n = strlen(dir);
+    const char *sep = (n && dir[n - 1] == '/') ? "" : "/";
+    return snprintf(out, out_len, "%s%s%s", dir, sep, name) < (int)out_len;
+}
+
+static uint8_t core_effective_board(const core_file_t *cf, const char *path)
+{
+    if (cf && cf->model_id) return cf->model_id;
+    return core_board_hint_from_name(path);
 }
 
 static void print_xilinx_status(const char *prefix, const jtag_status_t *st)
@@ -215,6 +258,121 @@ static bool ci_starts_with(const char *s, const char *prefix)
     return true;
 }
 
+static bool parse_bool_value(const char *s, bool *out)
+{
+    if (ci_equal(s, "1") || ci_equal(s, "ON") || ci_equal(s, "YES") || ci_equal(s, "TRUE")) {
+        *out = true;
+        return true;
+    }
+    if (ci_equal(s, "0") || ci_equal(s, "OFF") || ci_equal(s, "NO") || ci_equal(s, "FALSE")) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_board_value(const char *s, uint8_t *out)
+{
+    if (!s || !out) return false;
+    if (ci_equal(s, "3") || ci_equal(s, "R3")) {
+        *out = 3;
+        return true;
+    }
+    if (ci_equal(s, "6") || ci_equal(s, "R6")) {
+        *out = 6;
+        return true;
+    }
+    return false;
+}
+
+static void at_settings_reset_defaults(void)
+{
+    at_settings.autofetch = -1;
+    at_settings.fetch_interval_hours = 0;
+    at_settings.fetch_board_rev = 0;
+    remote_http_autofetch_reset_schedule();
+}
+
+static void at_settings_load(void)
+{
+    if (!ensure_mount_quiet()) return;
+
+    storage_file_t f = {0};
+    if (!storage_open(&f, AT_SETTINGS_PATH)) return;
+    uint32_t size = storage_size(&f);
+    if (size > 1024u) {
+        storage_close(&f);
+        return;
+    }
+    char buf[1025];
+    size_t got = 0;
+    bool ok = storage_read(&f, buf, size, &got);
+    storage_close(&f);
+    if (!ok || got != size) return;
+    buf[size] = 0;
+
+    char *save = NULL;
+    char *line = strtok_r(buf, "\n", &save);
+    while (line) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = 0;
+        line = trim_line(line);
+        char *eq = strchr(line, '=');
+        if (eq) {
+            *eq++ = 0;
+            char *key = trim_line(line);
+            char *value = trim_line(eq);
+            if (ci_equal(key, "autofetch")) {
+                bool b = false;
+                if (ci_equal(value, "REMOTE") || ci_equal(value, "DEFAULT") || ci_equal(value, "AUTO")) {
+                    at_settings.autofetch = -1;
+                } else if (parse_bool_value(value, &b)) {
+                    at_settings.autofetch = b ? 1 : 0;
+                }
+            } else if (ci_equal(key, "fetch_interval_hours")) {
+                char *end = NULL;
+                unsigned long hours = strtoul(value, &end, 10);
+                if (!*end && hours >= 3u) at_settings.fetch_interval_hours = (uint32_t)hours;
+            } else if (ci_equal(key, "fetch_board") || ci_equal(key, "fetch_board_rev")) {
+                uint8_t board = 0;
+                if (ci_equal(value, "REMOTE") || ci_equal(value, "DEFAULT") || ci_equal(value, "AUTO")) {
+                    at_settings.fetch_board_rev = 0;
+                } else if (parse_board_value(value, &board)) {
+                    at_settings.fetch_board_rev = board;
+                }
+            }
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+    remote_http_autofetch_reset_schedule();
+}
+
+static bool at_settings_save(void)
+{
+    if (!ensure_mount()) return false;
+    storage_file_t f = {0};
+    if (!storage_open_write(&f, AT_SETTINGS_PATH, true)) {
+        uart_cmd_printf("ERROR: AT&W open failed: %s\r\n", storage_last_error());
+        return false;
+    }
+    char buf[160];
+    int n = snprintf(buf, sizeof buf,
+                     "autofetch=%s\n"
+                     "fetch_interval_hours=%lu\n"
+                     "fetch_board=%s\n",
+                     at_settings.autofetch < 0 ? "remote" : (at_settings.autofetch ? "1" : "0"),
+                     (unsigned long)(at_settings.fetch_interval_hours ? at_settings.fetch_interval_hours : 3u),
+                     at_settings.fetch_board_rev == 3 ? "3" :
+                     at_settings.fetch_board_rev == 6 ? "6" : "remote");
+    size_t put = 0;
+    bool ok = n > 0 && n < (int)sizeof buf &&
+              storage_write(&f, buf, (size_t)n, &put) && put == (size_t)n &&
+              storage_sync(&f);
+    storage_close(&f);
+    if (!ok) uart_cmd_printf("ERROR: AT&W write failed: %s\r\n", storage_last_error());
+    return ok;
+}
+
 static char *parse_filename_arg(char *s, char **rest_out)
 {
     s = trim_line(s);
@@ -297,6 +455,7 @@ static void cmd_help(void)
         "+HELP: GO64                enter BASIC command mode\n"
         "+HELP: AT+VERSION?         firmware version and transport status\n"
         "+HELP: AT+CORELIST[=path]  list .BIT/.COR/.M65J files and dirs\n"
+        "+HELP: AT+COREDETAIL[=path] detailed list with COR title/version/board\n"
         "+HELP: AT+COREINFO=file    inspect core file\n"
         "+HELP: AT+CORETEST=file    read core payload from SD and discard\n"
         "+HELP: AT+JTAGLOAD=file    hijack JTAG and program core from SD\n"
@@ -305,6 +464,13 @@ static void cmd_help(void)
         "+HELP: AT+FILEWRITE=file len write core file to SD; needs write grant\n"
         "+HELP: AT+FETCH=url name   fetch http:// URL into DOWNLOADS/name\n"
         "+HELP: AT+DOWNLOADREAD=name read DOWNLOADS/name as raw bytes\n"
+        "+HELP: AT+AUTOFETCH[=0|1]  show/set mirror auto-update enable\n"
+        "+HELP: AT+FETCHINTERVAL[=hours] show/set auto-update interval; min 3\n"
+        "+HELP: AT+FETCHBOARD[=3|6|remote] show/set auto-update board manifest\n"
+        "+HELP: ATS60?              seconds since last successful auto-fetch\n"
+        "+HELP: ATS61?              auto-fetch running flag\n"
+        "+HELP: AT&W                save AT settings to SD card\n"
+        "+HELP: ATZ                 reload saved AT settings\n"
         "+HELP: AT+WRITEGRANT?      show write-authority status\n"
         "+HELP: AT+REMOTE?          show parsed REMOTE_ENABLE.cfg\n"
         "+HELP: AT+SDMODE[=auto|hw|soft] show/set SD transport before mount\n"
@@ -313,6 +479,42 @@ static void cmd_help(void)
         "+HELP: AT+HIJACK=1|0       manually assert/release JTAG hijack\n"
         "+HELP: AT+MOUNT            mount/remount SD card\n"
         "END\n");
+}
+
+static void cmd_atw(void)
+{
+    if (at_settings_save()) at_ok();
+}
+
+static void cmd_atz(void)
+{
+    at_settings_reset_defaults();
+    at_settings_load();
+    command_mode = CMD_MODE_AT;
+    at_ok();
+}
+
+static void cmd_s_register(char *arg)
+{
+    char *end = NULL;
+    unsigned long reg = strtoul(arg, &end, 10);
+    if (*end != '?' || end[1] != 0) {
+        at_error("S REGISTER IS READ ONLY; USE AT+AUTOFETCH OR AT+FETCHINTERVAL");
+        return;
+    }
+    switch (reg) {
+    case 60:
+        uart_cmd_printf("S60: %lu\r\n", (unsigned long)remote_http_autofetch_last_success_seconds());
+        at_ok();
+        break;
+    case 61:
+        uart_cmd_printf("S61: %lu\r\n", (unsigned long)(remote_http_autofetch_running() ? 1u : 0u));
+        at_ok();
+        break;
+    default:
+        at_error("UNKNOWN S REGISTER");
+        break;
+    }
 }
 
 static void cmd_version(void)
@@ -360,7 +562,7 @@ static void cmd_remote(void)
     remote_auth_format_ipv4(remote_cfg.static_ip, ip, sizeof ip);
     remote_auth_format_ipv4(remote_cfg.netmask, mask, sizeof mask);
     remote_auth_format_ipv4(remote_cfg.gateway, gw, sizeof gw);
-    uart_cmd_printf("+REMOTE: mode=%s ip=%s netmask=%s gateway=%s ssid=%s http=%lu port=%lu auth=%lu write_grant=%s signatures=%s keys=%lu rules=%lu\r\n",
+    uart_cmd_printf("+REMOTE: mode=%s ip=%s netmask=%s gateway=%s ssid=%s http=%lu port=%lu auth=%lu write_grant=%s signatures=%s autofetch=%lu interval_hours=%lu fetch_board=%s channel=%s base_url=%s keys=%lu rules=%lu\r\n",
                     remote_cfg.dhcp ? "dhcp" : "static",
                     ip, mask, gw,
                     remote_cfg.wifi_ssid[0] ? remote_cfg.wifi_ssid : "(unset)",
@@ -369,6 +571,11 @@ static void cmd_remote(void)
                     (unsigned long)((remote_cfg.http_user[0] || remote_cfg.http_password[0]) ? 1u : 0u),
                     remote_cfg.require_write_grant ? "required" : "not-required",
                     remote_cfg.require_signatures ? "required" : "optional",
+                    (unsigned long)(remote_cfg.autofetch_enabled ? 1u : 0u),
+                    (unsigned long)remote_cfg.fetch_interval_hours,
+                    core_board_label(remote_cfg.fetch_board_rev),
+                    remote_cfg.fetch_channel[0] ? remote_cfg.fetch_channel : "(unset)",
+                    remote_cfg.fetch_base_url[0] ? remote_cfg.fetch_base_url : "(unset)",
                     (unsigned long)remote_cfg.trusted_key_count,
                     (unsigned long)remote_cfg.rule_count);
 
@@ -382,6 +589,58 @@ static void cmd_remote(void)
                         (unsigned long)(remote_cfg.rules[i].allow_bitstreams ? 1u : 0u));
     }
     at_ok();
+}
+
+static void cmd_autofetch(char *arg, bool have_value)
+{
+    if (have_value) {
+        bool b = false;
+        if (!parse_bool_value(arg, &b)) {
+            at_error("AUTOFETCH EXPECTS 0 OR 1");
+            return;
+        }
+        at_settings.autofetch = b ? 1 : 0;
+        remote_http_autofetch_reset_schedule();
+    }
+    uart_cmd_printf("OK AF override=%d %s\r\n",
+                    at_settings.autofetch,
+                    remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+}
+
+static void cmd_fetch_interval(char *arg, bool have_value)
+{
+    if (have_value) {
+        char *end = NULL;
+        unsigned long hours = strtoul(arg, &end, 10);
+        if (*end || hours < 3u || hours > 8760u) {
+            at_error("FETCHINTERVAL MINIMUM IS 3 HOURS");
+            return;
+        }
+        at_settings.fetch_interval_hours = (uint32_t)hours;
+        remote_http_autofetch_reset_schedule();
+    }
+    uart_cmd_printf("OK FI override_hours=%lu %s\r\n",
+                    (unsigned long)at_settings.fetch_interval_hours,
+                    remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+}
+
+static void cmd_fetch_board(char *arg, bool have_value)
+{
+    if (have_value) {
+        uint8_t board = 0;
+        if (ci_equal(arg, "REMOTE") || ci_equal(arg, "DEFAULT") || ci_equal(arg, "AUTO")) {
+            at_settings.fetch_board_rev = 0;
+        } else if (parse_board_value(arg, &board)) {
+            at_settings.fetch_board_rev = board;
+        } else {
+            at_error("FETCHBOARD EXPECTS 3, 6, R3, R6 OR REMOTE");
+            return;
+        }
+        remote_http_autofetch_reset_schedule();
+    }
+    uart_cmd_printf("OK FB override_board=%s %s\r\n",
+                    at_settings.fetch_board_rev ? core_board_label(at_settings.fetch_board_rev) : "remote",
+                    remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
 }
 
 static void cmd_authority(void)
@@ -417,6 +676,72 @@ static void cmd_list(char *arg)
     uart_cmd_puts("END\n");
 }
 
+typedef struct {
+    const char *dir;
+} detail_list_ctx_t;
+
+static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+{
+    detail_list_ctx_t *dl = (detail_list_ctx_t *)ctx;
+    char path[256];
+    if (!make_child_path(dl && dl->dir ? dl->dir : "/", name, path, sizeof path)) {
+        uart_cmd_puts("+COREERR: path-too-long name=");
+        uart_quoted(name);
+        uart_cmd_puts("\n");
+        return;
+    }
+
+    if (is_dir) {
+        uart_cmd_printf("+COREDIR: size=%lu path=", (unsigned long)size);
+        uart_quoted(path);
+        uart_cmd_puts("\n");
+        return;
+    }
+
+    core_file_t cf;
+    if (!core_open(&cf, path)) {
+        uart_cmd_printf("+COREERR: size=%lu path=", (unsigned long)size);
+        uart_quoted(path);
+        uart_cmd_puts(" error=");
+        uart_quoted(core_last_error());
+        uart_cmd_puts("\n");
+        return;
+    }
+
+    uint8_t board = core_effective_board(&cf, path);
+    uart_cmd_printf("+COREDETAIL: size=%lu kind=%s board=%s board_id=%lu payload_offset=%lu payload_length=%lu expected_idcode=%08lx path=",
+                    (unsigned long)size,
+                    core_kind_name(cf.kind),
+                    core_board_label(board),
+                    (unsigned long)board,
+                    (unsigned long)cf.payload_offset,
+                    (unsigned long)cf.payload_length,
+                    (unsigned long)cf.expected_idcode);
+    uart_quoted(path);
+    uart_cmd_puts(" title=");
+    uart_quoted(cf.title[0] ? cf.title : "");
+    uart_cmd_puts(" version=");
+    uart_quoted(cf.version[0] ? cf.version : "");
+    uart_cmd_puts(" model=");
+    uart_quoted(cf.model[0] ? cf.model : "");
+    uart_cmd_printf(" model_id=%lu\n", (unsigned long)cf.model_id);
+    core_close(&cf);
+}
+
+static void cmd_detail_list(char *arg)
+{
+    if (!ensure_mount()) return;
+    char *path = unquote_filename(arg);
+    if (!path[0]) path = "/";
+    uart_cmd_printf("OK LD %s\n", path);
+    detail_list_ctx_t ctx = { .dir = path };
+    if (!storage_list_cores(path, detail_list_cb, &ctx)) {
+        uart_cmd_printf("ERR LD %s\n", storage_last_error());
+        return;
+    }
+    uart_cmd_puts("END\n");
+}
+
 static void cmd_info(char *arg)
 {
     if (!ensure_mount()) return;
@@ -432,14 +757,21 @@ static void cmd_info(char *arg)
         return;
     }
 
-    uart_cmd_printf("OK I %s kind=%s payload_offset=%lu payload_length=%lu expected_idcode=%08lx model_id=%lu model=%s\n",
+    uint8_t board = core_effective_board(&cf, name);
+    uart_cmd_printf("OK I %s kind=%s board=%s board_id=%lu payload_offset=%lu payload_length=%lu expected_idcode=%08lx title=",
                     cf.path,
                     core_kind_name(cf.kind),
+                    core_board_label(board),
+                    (unsigned long)board,
                     (unsigned long)cf.payload_offset,
                     (unsigned long)cf.payload_length,
-                    (unsigned long)cf.expected_idcode,
-                    (unsigned long)cf.model_id,
-                    cf.model[0] ? cf.model : "(unknown)");
+                    (unsigned long)cf.expected_idcode);
+    uart_quoted(cf.title[0] ? cf.title : "");
+    uart_cmd_puts(" version=");
+    uart_quoted(cf.version[0] ? cf.version : "");
+    uart_cmd_puts(" model=");
+    uart_quoted(cf.model[0] ? cf.model : "");
+    uart_cmd_printf(" model_id=%lu\n", (unsigned long)cf.model_id);
     core_close(&cf);
 }
 
@@ -1093,6 +1425,21 @@ static void dispatch_at(char *arg)
         return;
     }
 
+    if (ci_equal(arg, "Z")) {
+        cmd_atz();
+        return;
+    }
+
+    if (ci_equal(arg, "&W")) {
+        cmd_atw();
+        return;
+    }
+
+    if (toupper((unsigned char)arg[0]) == 'S') {
+        cmd_s_register(arg + 1);
+        return;
+    }
+
     if (toupper((unsigned char)arg[0]) == 'D') {
         cmd_atd(arg + 1);
         return;
@@ -1125,6 +1472,8 @@ static void dispatch_at(char *arg)
         cmd_version();
     } else if (ci_equal(cmd, "CORELIST") || ci_equal(cmd, "LIST")) {
         cmd_list(param);
+    } else if (ci_equal(cmd, "COREDETAIL") || ci_equal(cmd, "CORELS") || ci_equal(cmd, "DETAIL")) {
+        cmd_detail_list(param);
     } else if (ci_equal(cmd, "COREINFO") || ci_equal(cmd, "CORE") || ci_equal(cmd, "INFO")) {
         cmd_info(param);
     } else if (ci_equal(cmd, "CORETEST") || ci_equal(cmd, "TESTREAD")) {
@@ -1141,6 +1490,12 @@ static void dispatch_at(char *arg)
         cmd_fetch(param);
     } else if (ci_equal(cmd, "DOWNLOADREAD") || ci_equal(cmd, "READ")) {
         cmd_read_download(param);
+    } else if (ci_equal(cmd, "AUTOFETCH")) {
+        cmd_autofetch(param, value != NULL);
+    } else if (ci_equal(cmd, "FETCHINTERVAL")) {
+        cmd_fetch_interval(param, value != NULL);
+    } else if (ci_equal(cmd, "FETCHBOARD")) {
+        cmd_fetch_board(param, value != NULL);
     } else if (ci_equal(cmd, "WRITEGRANT") || ci_equal(cmd, "AUTH")) {
         cmd_authority();
     } else if (ci_equal(cmd, "REMOTE")) {
@@ -1173,16 +1528,19 @@ static void dispatch(char *line)
     }
 
     if (ci_equal(s, "GO64")) {
+        remote_http_autofetch_cancel("uart command");
         enter_basic_mode();
         return;
     }
 
     if (ci_starts_with(s, "AT")) {
+        remote_http_autofetch_cancel("uart command");
         dispatch_at(s + 2);
         return;
     }
 
 #if M65_ENABLE_LEGACY_UART_COMMANDS
+    remote_http_autofetch_cancel("uart command");
     char cmd = (char)toupper((unsigned char)s[0]);
     char *arg = trim_line(s + 1);
     if (!dispatch_legacy(cmd, arg)) {
@@ -1204,6 +1562,7 @@ int main(void)
     uart_cmd_init();
     jtag_gpio_init();
     storage_sd_probe();
+    at_settings_load();
     remote_http_init();
 
     uart_cmd_printf("OK BOOT %s\n", M65_VERSION_STRING);
@@ -1216,6 +1575,7 @@ int main(void)
     char line[256];
     for (;;) {
         remote_http_poll();
+        remote_http_autofetch_poll(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev);
         if (uart_cmd_read_line(line, sizeof line)) {
             dispatch(line);
         }
