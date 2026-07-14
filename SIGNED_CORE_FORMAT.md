@@ -72,37 +72,36 @@ both check against `game.bit`.
 List local public keys and the matching config lines:
 
 ```sh
-tools/bless-core.py --keys
+tools/uart_client.py keys
 ```
 
-If the selected private key does not exist, `bless-core.py` prompts to create it
-with OpenSSL and asks for a key name, defaulting to `default`.
+If the selected private key does not exist, the client prompts to create it with
+OpenSSL and asks for a key name, defaulting to `default`.
 
 Print the selected key's `REMOTE_ENABLE.cfg` entry:
 
 ```sh
-tools/bless-core.py --print-trusted-key core.bit
+tools/uart_client.py bless --print-trusted-key core.bit
 ```
 
 Create a signed transfer:
 
 ```sh
-tools/bless-core.py --board 6 --bless -o core.signed.bit core.bit
+tools/uart_client.py bless --board 6 -o core.signed.bit core.bit
 ```
 
 Upload in one command:
 
 ```sh
-tools/bless-core.py --board 6 \
-  --put http://mega65-jtag.local/files/core.bit core.bit
+tools/uart_client.py put http://mega65-jtag.local/files/core.bit \
+  core.bit --board 6
 ```
 
 Upload and JTAG in one command:
 
 ```sh
-tools/bless-core.py --board 6 \
-  --device http://mega65-jtag.local core.bit
+tools/uart_client.py push http://mega65-jtag.local core.bit --board 6
 ```
 
-If the input already has a signature trailer, `bless-core.py` prints an `INFO:`
+If the input already has a signature trailer, the client prints an `INFO:`
 message and uploads or copies it unchanged instead of appending another trailer.

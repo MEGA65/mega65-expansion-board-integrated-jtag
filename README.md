@@ -116,35 +116,44 @@ Replies are currently broadcast to both ports. This is intentional and keeps MEG
 ## UART commands
 
 ```text
-V                         version
-L [path]                  list .BIT/.COR/.M65J files and dirs
-I <file>                  inspect core file
-T <file>                  SD read-speed test; read payload and discard
-P <file>                  hijack JTAG and program existing SD core
-S <length> <idcode>        stream raw payload over serial; USB-only by default
-N <length>                 serial receive/discard speed test
-W <file> <length>          write a core file to SD; USB + physical WE required by default
-F <url> <name>             fetch http:// URL into DOWNLOADS/<name>
-R <name>                   read DOWNLOADS/<name> as raw bytes
-A                         show physical write-authority status
-D [auto|hw|soft]          show/set SD transport before mount
-J                         read JTAG IDCODE, using hijack
-X                         read Xilinx BOOTSTS/STAT/BYPASS via CFG_OUT
-H 1|0                     manually assert/release JTAG hijack
-M                         mount/remount SD card
-?                         help
+AT                         modem attention check
+ATI                        identify firmware and WiFi capability
+ATD*                       novelty dial command
+AT+GO64 or GO64            enter BASIC command mode
+AT+VERSION?                firmware version and transport status
+AT+CORELIST[=path]         list .BIT/.COR/.M65J files and dirs
+AT+COREINFO=file           inspect core file
+AT+CORETEST=file           SD read-speed test; read payload and discard
+AT+JTAGLOAD=file           hijack JTAG and program existing SD core
+AT+JTAGSTREAM=len idcode   stream raw payload over serial; USB-only by default
+AT+TESTSINK=len            serial receive/discard speed test
+AT+FILEWRITE=file len      write a core file to SD; USB + physical WE required by default
+AT+FETCH=url name          fetch http:// URL into DOWNLOADS/name
+AT+DOWNLOADREAD=name       read DOWNLOADS/name as raw bytes
+AT+WRITEGRANT?             show physical write-authority status
+AT+REMOTE?                 show parsed REMOTE_ENABLE.cfg
+AT+SDMODE[=auto|hw|soft]   show/set SD transport before mount
+AT+JTAGID?                 read JTAG IDCODE, using hijack
+AT+JTAGSTATUS?             read Xilinx BOOTSTS/STAT/BYPASS via CFG_OUT
+AT+HIJACK=1|0              manually assert/release JTAG hijack
+AT+MOUNT                   mount/remount SD card
+AT+HELP                    help
 ```
 
 Example:
 
 ```bash
-python3 tools/uart_client.py /dev/ttyACM0 V
+python3 tools/uart_client.py /dev/ttyACM0 ATI
 # or via the hardware UART:
-python3 tools/uart_client.py /dev/ttyUSB0 V
-python3 tools/uart_client.py /dev/ttyACM0 L /
-python3 tools/uart_client.py /dev/ttyACM0 I /cores/mega65r6.cor
-python3 tools/uart_client.py /dev/ttyACM0 P /cores/mega65r6.cor
+python3 tools/uart_client.py /dev/ttyUSB0 AT+VERSION?
+python3 tools/uart_client.py /dev/ttyACM0 AT+CORELIST=/
+python3 tools/uart_client.py /dev/ttyACM0 AT+COREINFO=/cores/mega65r6.cor
+python3 tools/uart_client.py /dev/ttyACM0 AT+JTAGLOAD=/cores/mega65r6.cor
 ```
+
+Set `M65_ENABLE_LEGACY_UART_COMMANDS=1` at compile time only if you need the
+early bring-up one-letter protocol. `tools/uart_client.py` still translates the
+old short forms for convenience.
 
 ## File handling
 
@@ -179,19 +188,19 @@ The JTAG bit ordering is:
 - IDCODE/status DR reads: LSB-first
 - Xilinx CFG_IN payload bytes: MSB-first per byte
 
-## v1.2 Xilinx status / close-out diagnostics
+## Xilinx status / close-out diagnostics
 
-This build keeps the v1.1 conservative post-configuration close-out and adds
-Xilinx configuration-register diagnostics via JTAG `CFG_IN`/`CFG_OUT`.
+This build uses conservative post-configuration close-out clocks and adds Xilinx
+configuration-register diagnostics via JTAG `CFG_IN`/`CFG_OUT`.
 
-New command:
+Command:
 
 ```text
-X                         read JTAG IDCODE plus Xilinx BOOTSTS/STAT/BYPASS
+AT+JTAGSTATUS?             read JTAG IDCODE plus Xilinx BOOTSTS/STAT/BYPASS
 ```
 
-After `P <file>` or `stream <local.bit>`, the firmware now prints a diagnostic
-line before the terminal `OK ... DONE` line:
+After `AT+JTAGLOAD=file` or `stream <local.bit>`, the firmware prints a
+diagnostic line before the terminal `OK ... DONE` line:
 
 ```text
 XSTAT P idcode=13636093 bootsts=xxxxxxxx stat=xxxxxxxx bypass=xxxxxxxx done=1 release_done=1 eos=1 startup=...
@@ -215,7 +224,7 @@ implementation.  The raw values are diagnostic; if they look byte/bit-swapped,
 compare working-vs-failing runs rather than trusting the decoded fields yet.
 
 
-## v1.3 write-gate policy
+## Write-gate policy
 
 Normal operation treats the SD card as read-only: the loader opens existing core
 files for reading and can load them, but it does not write to the filesystem
@@ -224,7 +233,7 @@ unless a guarded write command is accepted.
 The guarded file-write command is:
 
 ```text
-W <file.bit|file.cor|file.m65j> <length>
+AT+FILEWRITE=<file.bit|file.cor|file.m65j> <length>
 ```
 
 Release defaults are deliberately conservative:
@@ -255,14 +264,21 @@ release protocol.
 Remote HTTP uploads and firmware-side URL fetches can require a signed trailer.
 The format is documented in [SIGNED_CORE_FORMAT.md](SIGNED_CORE_FORMAT.md).
 
-Use `tools/bless-core.py --keys` to list local public keys and print the
-`trusted_key=` lines to copy into `REMOTE_ENABLE.cfg`.
+Use `tools/uart_client.py keys` to list local public keys and print the
+`trusted_key=` lines to copy into `REMOTE_ENABLE.cfg`. The same client can
+bless, store, or JTAG-push a core over HTTP:
+
+```sh
+tools/uart_client.py bless --board 6 core.bit
+tools/uart_client.py push http://mega65-jtag.local core.bit --board 6
+tools/uart_client.py store http://mega65-jtag.local core.bit --board 6
+```
 
 Useful commands:
 
 ```text
-F <http://url> <name>       fetch to DOWNLOADS/<name>
-R <name>                   read DOWNLOADS/<name>
+AT+FETCH=<http://url> <name>       fetch to DOWNLOADS/<name>
+AT+DOWNLOADREAD=<name>             read DOWNLOADS/<name>
 ```
 
 `REMOTE_ENABLE.cfg` controls enforcement:

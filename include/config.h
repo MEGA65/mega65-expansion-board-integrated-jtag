@@ -15,6 +15,12 @@
 // CMake enables pico_stdio_usb(); this switch controls the command parser use.
 #define M65_ENABLE_USB_CDC   1
 
+// The modem command surface is AT-style by default. Set this to 1 only when
+// you need the early bring-up one-letter protocol (`V`, `L`, `P`, etc.).
+#ifndef M65_ENABLE_LEGACY_UART_COMMANDS
+#define M65_ENABLE_LEGACY_UART_COMMANDS 0
+#endif
+
 // WiFi remote delivery is only built for Pico W-class boards when enabled in
 // CMake. Runtime enablement still requires /REMOTE_ENABLE.cfg on the SD card.
 #ifndef M65_WIFI_SUPPORTED
@@ -24,7 +30,7 @@
 // SD transport runtime policy. Both layouts are built into the firmware:
 //   M65_SD_MODE_HW_SPI             = legal RP2040 hardware-SPI pinout
 //   M65_SD_MODE_SCHEMATIC_BITBANG  = first fabbed schematic pinout
-// AUTO probes schematic-bitbang first, then hardware SPI. Use the `D` command
+// AUTO probes schematic-bitbang first, then hardware SPI. Use `AT+SDMODE=...`
 // before mounting SD to override the detected/default mode at runtime.
 #define M65_SD_MODE_AUTO                 0
 #define M65_SD_MODE_HW_SPI               1
@@ -93,4 +99,4 @@
 #define M65_JTAG_POST_BYPASS_IDLE_CLOCKS     1024u
 #define M65_JTAG_POST_TAP_RESET_IDLE_CLOCKS  1024u
 
-#define M65_VERSION_STRING   "pico-m65jtag 1.4-sd-transport"
+#define M65_VERSION_STRING   "pico-m65jtag v0.1-experimental"

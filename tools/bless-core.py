@@ -167,7 +167,7 @@ def print_keys() -> int:
     keys = iter_known_keys()
     if not keys:
         print(f"No signing keys found in {KEY_DIR}")
-        print("Create one with: tools/bless-core.py --yes --bless core.bit")
+        print("Create one with: tools/uart_client.py bless --yes core.bit")
         return 0
     print("Configured local signing keys:\n")
     for name, path in keys:
@@ -262,7 +262,7 @@ def device_put_url(device: str, name: str, board: int, store_only: bool) -> str:
     return f"{base}/jtag?name={qname}{board_q}"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("input", type=Path, nargs="?", help="input .bit/.cor/.m65j file")
     ap.add_argument("--key", type=Path, help="explicit P-256 EC private key PEM")
@@ -281,7 +281,7 @@ def main() -> int:
     ap.add_argument("--user", help="HTTP Basic auth user")
     ap.add_argument("--password", help="HTTP Basic auth password")
     ap.add_argument("--print-trusted-key", action="store_true", help="print REMOTE_ENABLE.cfg trusted_key line")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.keys:
         return print_keys()

@@ -25,6 +25,7 @@ FATFS_REPO       ?= https://github.com/carlk3/no-OS-FatFS-SD-SPI-RPi-Pico.git
 FATFS_PATH       ?= $(CURDIR)/third_party/no-OS-FatFS-SD-SPI-RPi-Pico
 M65_HAVE_SD_INIT_DRIVER ?= 0
 ENABLE_WIFI_REMOTE ?= 0
+M65_SD_MODE ?=
 
 UF2 := $(BUILD_DIR)/$(PROJECT).uf2
 ELF := $(BUILD_DIR)/$(PROJECT).elf
@@ -40,6 +41,7 @@ CONFIGURE_DEPS := sdk
 endif
 
 CMAKE_REMOTE_ARGS := -DM65_ENABLE_WIFI_REMOTE=$(if $(filter 1 ON on true TRUE yes YES,$(ENABLE_WIFI_REMOTE)),ON,OFF)
+CMAKE_SD_MODE_ARGS := $(if $(strip $(M65_SD_MODE)),-DM65_SD_MODE=$(M65_SD_MODE),)
 
 .PHONY: all help deps check-tools sdk fatfs configure build nofatfs clean distclean nuke \
         upload flash upload-picotool upload-uf2 picotool print-config terminal
@@ -69,6 +71,7 @@ help:
 	@echo "  PICO_SDK_PATH=...      Override SDK path"
 	@echo "  BUILD_DIR=build        Override build directory"
 	@echo "  ENABLE_WIFI_REMOTE=0   Set to 1 with PICO_BOARD=pico_w for HTTP remote support"
+	@echo "  M65_SD_MODE=...        Optional: M65_SD_MODE_AUTO, M65_SD_MODE_HW_SPI, M65_SD_MODE_SCHEMATIC_BITBANG"
 	@echo "  PICO_MOUNT=...         Mount point for upload-uf2, if autodetect fails"
 	@echo
 	@echo "Examples:"
@@ -123,7 +126,8 @@ configure: $(CONFIGURE_DEPS)
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
 		-DPICO_BOARD="$(PICO_BOARD)" \
 		$(CMAKE_FATFS_ARGS) \
-		$(CMAKE_REMOTE_ARGS)
+		$(CMAKE_REMOTE_ARGS) \
+		$(CMAKE_SD_MODE_ARGS)
 
 build: configure
 	cmake --build "$(BUILD_DIR)" --parallel
@@ -212,6 +216,7 @@ print-config:
 	@echo "USE_FATFS=$(USE_FATFS)"
 	@echo "FATFS_PATH=$(FATFS_PATH)"
 	@echo "ENABLE_WIFI_REMOTE=$(ENABLE_WIFI_REMOTE)"
+	@echo "M65_SD_MODE=$(M65_SD_MODE)"
 	@echo "UF2=$(UF2)"
 
 terminal:

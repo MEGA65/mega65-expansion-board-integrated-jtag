@@ -20,6 +20,7 @@ pico_sdk_init()
 option(M65_USE_FATFS "Build with FatFs storage backend" ON)
 option(M65_HAVE_SD_INIT_DRIVER "Call sd_init_driver() before f_mount(); usually not needed for recent carlk3 library" OFF)
 option(M65_ENABLE_WIFI_REMOTE "Build Pico W WiFi remote-delivery support" OFF)
+set(M65_SD_MODE "" CACHE STRING "Optional compile-time SD mode override: M65_SD_MODE_AUTO, M65_SD_MODE_HW_SPI, or M65_SD_MODE_SCHEMATIC_BITBANG")
 set(FATFS_SD_SPI_PATH "${CMAKE_CURRENT_LIST_DIR}/third_party/no-OS-FatFS-SD-SPI-RPi-Pico" CACHE PATH "Path to no-OS-FatFS-SD-SPI-RPi-Pico repository")
 
 add_executable(pico_m65jtag
@@ -41,6 +42,9 @@ target_include_directories(pico_m65jtag PRIVATE
     "${PICO_SDK_PATH}/lib/mbedtls/library"
 )
 target_compile_definitions(pico_m65jtag PRIVATE MBEDTLS_CONFIG_FILE="m65_mbedtls_config.h")
+if(M65_SD_MODE)
+    target_compile_definitions(pico_m65jtag PRIVATE M65_SD_MODE=${M65_SD_MODE})
+endif()
 
 target_link_libraries(pico_m65jtag
     pico_stdlib
