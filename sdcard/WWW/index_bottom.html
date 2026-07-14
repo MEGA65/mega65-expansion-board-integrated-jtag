@@ -1,5 +1,20 @@
       </tbody>
     </table>
   </main>
+  <script>
+    function deleteCore(url, name) {
+      if (!confirm('Delete ' + name + '?')) return;
+      fetch(url, { method: 'PUT', cache: 'no-store' })
+        .then(function (response) {
+          return response.text().then(function (text) {
+            if (!response.ok) throw new Error(text || response.status);
+            location.reload();
+          });
+        })
+        .catch(function (error) {
+          alert('Delete failed: ' + error.message);
+        });
+    }
+  </script>
 </body>
 </html>

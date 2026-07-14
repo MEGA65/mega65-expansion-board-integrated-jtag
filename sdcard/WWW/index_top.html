@@ -19,6 +19,8 @@
     </section>
     <nav class="boards">
       <span>Showing: {BOARD_LABEL}</span>
+      <span>Path: {CURRENT_PATH}</span>
+      {PARENT_LINK}
       <a href="{R3_URL}">R3 cores</a>
       <a href="{R6_URL}">R6 cores</a>
     </nav>
@@ -26,7 +28,6 @@
       <thead>
         <tr>
           <th>Core</th>
-          <th>Type</th>
           <th>Bytes</th>
           <th>Actions</th>
         </tr>

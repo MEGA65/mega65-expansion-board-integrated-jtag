@@ -137,6 +137,7 @@ typedef struct {
 typedef struct {
     page_builder_t *pb;
     const char *row_template;
+    const char *dir_path;
     uint8_t board_rev;
     bool truncated;
 } index_list_ctx_t;
@@ -192,6 +193,7 @@ static int find_header_end(const char *buf, size_t len, size_t *end_len);
 static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms);
 static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len);
 static err_t http_poll_cb(void *arg, struct tcp_pcb *pcb);
+static void html_escape(const char *in, char *out, size_t out_len);
 
 static remote_auth_config_t http_cfg;
 static http_conn_t http_conn;
@@ -279,23 +281,35 @@ static const char default_top[] =
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>MEGA65 JTAG</title>"
     "<style>"
-    "body{font-family:system-ui,sans-serif;margin:2rem;background:#f6f6f6;color:#111}"
-    "table{border-collapse:collapse;width:100%;background:#fff}"
-    "th,td{border-bottom:1px solid #ddd;padding:.55rem;text-align:left}"
-    ".status{margin:.8rem 0;padding:.7rem;background:#fff;border-left:4px solid #2563eb}"
-    "a{color:#0645ad}"
+    "body{font-family:Arial,sans-serif;margin:0;background:#0a0c10;color:#e8edf3}"
+    "main{width:min(980px,calc(100vw - 32px));margin:24px auto}"
+    "header{display:flex;align-items:center;gap:18px;margin-bottom:18px}"
+    "header img{width:320px;max-width:44vw;height:auto}"
+    "h1{font-size:24px;margin:0}.grant,.boards a,.boards span{background:#121821;border:1px solid #273142}"
+    ".grant{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 16px;padding:12px 14px;border-left:5px solid #a43838}"
+    ".grant-active{border-left-color:#2fa35b}.boards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}"
+    ".boards a,.boards span{padding:7px 10px}table{border-collapse:collapse;width:100%;background:#10161f}"
+    "th,td{border-bottom:1px solid #263140;padding:10px 12px;text-align:left;vertical-align:top}"
+    "th{background:#1b2531;color:#fff}.start{display:inline-block;margin-right:10px;padding:5px 9px;background:#1e7a46;color:#fff;text-decoration:none}"
+    ".core-name{font-weight:700}.meta{font-size:13px;color:#9fb0c3;margin-top:4px}.meta:empty{display:none}"
+    "a{color:#63b3ff}.delete{color:#ff7b7b;background:none;border:0;padding:0;font:inherit;text-decoration:underline;cursor:pointer}"
     "</style></head><body>"
-    "<h1>MEGA65 Expansion Board Integrated JTAG</h1>"
-    "<div class=\"status\">Write grant: {WRITE_GRANT_STATUS} "
-    "({WRITE_GRANT_SECONDS}s remaining, policy {WRITE_GRANT_REQUIRED})</div>"
-    "<p>Showing: {BOARD_LABEL} <a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a></p>"
-    "<table><thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Actions</th></tr></thead><tbody>\n";
+    "<main><header><img src=\"/WWW/mega65_320x64.png\" alt=\"MEGA65\" width=\"320\" height=\"64\">"
+    "<h1>Expansion Board Integrated JTAG</h1></header>"
+    "<section class=\"grant grant-{WRITE_GRANT_STATUS}\"><strong>Write grant:</strong> {WRITE_GRANT_STATUS} "
+    "<span>{WRITE_GRANT_SECONDS}s remaining</span><span>Policy: {WRITE_GRANT_REQUIRED}</span></section>"
+    "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a></nav>"
+    "<table><thead><tr><th>Core</th><th>Bytes</th><th>Actions</th></tr></thead><tbody>\n";
 static const char default_row[] =
-    "<tr><td><a href=\"{FILE_URL}\">{FILENAME}</a></td>"
-    "<td>{TYPE}</td><td>{SIZE}</td>"
-    "<td><a href=\"{FILE_URL}\">download</a> <a href=\"{JTAG_URL}\">jtag</a></td></tr>\n";
+    "<tr><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
+    "<a class=\"core-name\" href=\"{PRIMARY_URL}\">{FILENAME}</a><div class=\"meta\">{CORE_META}</div></td>"
+    "<td>{SIZE}</td><td>{ACTIONS}</td></tr>\n";
 static const char default_bottom[] =
-    "</tbody></table></body></html>\n";
+    "</tbody></table><script>"
+    "function deleteCore(u,n){if(!confirm('Delete '+n+'?'))return;"
+    "fetch(u,{method:'PUT',cache:'no-store'}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||r.status);location.reload();});})"
+    ".catch(function(e){alert('Delete failed: '+e.message);});}"
+    "</script></main></body></html>\n";
 
 static bool has_core_ext(const char *name)
 {
@@ -368,6 +382,50 @@ static bool ext_equal_ci(const char *a, const char *b)
         b++;
     }
     return *a == 0 && *b == 0;
+}
+
+static bool path_has_ext(const char *path, const char *ext)
+{
+    const char *dot = strrchr(path ? path : "", '.');
+    return dot && ext_equal_ci(dot, ext);
+}
+
+static void format_core_meta_html(const char *path, char *out, size_t out_len)
+{
+    if (!out_len) return;
+    out[0] = 0;
+    if (!path_has_ext(path, ".cor")) return;
+
+    core_file_t cf;
+    if (!core_open(&cf, path)) return;
+
+    char title[64], version[64], model[64];
+    html_escape(cf.title, title, sizeof title);
+    html_escape(cf.version, version, sizeof version);
+    html_escape(cf.model, model, sizeof model);
+
+    bool wrote = false;
+    size_t pos = 0;
+    if (title[0]) {
+        int n = snprintf(out + pos, out_len - pos, "%s", title);
+        if (n > 0) {
+            pos += (size_t)n < out_len - pos ? (size_t)n : out_len - pos - 1u;
+            wrote = true;
+        }
+    }
+    if (version[0] && pos + 1 < out_len) {
+        int n = snprintf(out + pos, out_len - pos, "%sVersion %s", wrote ? " | " : "", version);
+        if (n > 0) {
+            pos += (size_t)n < out_len - pos ? (size_t)n : out_len - pos - 1u;
+            wrote = true;
+        }
+    }
+    if (model[0] && pos + 1 < out_len) {
+        snprintf(out + pos, out_len - pos, "%sModel %s", wrote ? " | " : "", model);
+    } else if ((cf.model_id == 3 || cf.model_id == 6) && pos + 1 < out_len) {
+        snprintf(out + pos, out_len - pos, "%sModel R%u", wrote ? " | " : "", (unsigned)cf.model_id);
+    }
+    core_close(&cf);
 }
 
 static const char *content_type_for_path(const char *path)
@@ -459,6 +517,115 @@ static void url_encode(const char *in, char *out, size_t out_len)
         }
     }
     out[pos] = 0;
+}
+
+static void js_string_escape(const char *in, char *out, size_t out_len)
+{
+    size_t pos = 0;
+    if (!out_len) return;
+    for (; in && *in && pos + 1 < out_len; in++) {
+        unsigned char c = (unsigned char)*in;
+        const char *rep = NULL;
+        switch (c) {
+        case '\\': rep = "\\\\"; break;
+        case '\'': rep = "\\'"; break;
+        case '\n': rep = "\\n"; break;
+        case '\r': rep = "\\r"; break;
+        case '\t': rep = "\\t"; break;
+        default: break;
+        }
+        if (rep) {
+            size_t n = strlen(rep);
+            if (pos + n >= out_len) break;
+            memcpy(out + pos, rep, n);
+            pos += n;
+        } else if (c < 0x20) {
+            if (pos + 4 >= out_len) break;
+            snprintf(out + pos, out_len - pos, "\\x%02x", c);
+            pos += 4;
+        } else {
+            out[pos++] = (char)c;
+        }
+    }
+    out[pos] = 0;
+}
+
+static bool safe_index_path(const char *path)
+{
+    if (!path || !path[0]) return true;
+    if (strcmp(path, "/") == 0) return true;
+    size_t n = strlen(path);
+    if (n > 180) return false;
+    if (path[0] == '/') return false;
+    if (strstr(path, "..")) return false;
+    if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
+    return true;
+}
+
+static void normalise_index_path(const char *path, char *out, size_t out_len)
+{
+    if (!out_len) return;
+    if (!path || !path[0] || strcmp(path, "/") == 0) {
+        snprintf(out, out_len, "/");
+        return;
+    }
+    snprintf(out, out_len, "%s", path);
+    size_t n = strlen(out);
+    while (n > 1 && out[n - 1] == '/') out[--n] = 0;
+}
+
+static bool index_path_from_target(const char *target, char *out, size_t out_len)
+{
+    char decoded[192];
+    if (!parse_query_value(target, "path", decoded, sizeof decoded)) {
+        normalise_index_path("/", out, out_len);
+        return true;
+    }
+    normalise_index_path(decoded, out, out_len);
+    return safe_index_path(out);
+}
+
+static bool make_child_path(const char *dir_path, const char *name, char *out, size_t out_len)
+{
+    if (!name || !name[0]) return false;
+    if (!dir_path || !dir_path[0] || strcmp(dir_path, "/") == 0) {
+        return snprintf(out, out_len, "%s", name) < (int)out_len;
+    }
+    return snprintf(out, out_len, "%s/%s", dir_path, name) < (int)out_len;
+}
+
+static bool make_index_url(const char *dir_path, uint8_t board_rev, char *out, size_t out_len)
+{
+    char encoded[256];
+    const bool root = !dir_path || !dir_path[0] || strcmp(dir_path, "/") == 0;
+    if (root && board_rev != 3 && board_rev != 6) {
+        return snprintf(out, out_len, "/index.html") < (int)out_len;
+    }
+    if (!root) {
+        url_encode(dir_path, encoded, sizeof encoded);
+    } else {
+        encoded[0] = 0;
+    }
+    if (board_rev == 3 || board_rev == 6) {
+        if (root) return snprintf(out, out_len, "/index.html?board=%u", (unsigned)board_rev) < (int)out_len;
+        return snprintf(out, out_len, "/index.html?path=%s&board=%u", encoded, (unsigned)board_rev) < (int)out_len;
+    }
+    return snprintf(out, out_len, "/index.html?path=%s", encoded) < (int)out_len;
+}
+
+static bool make_parent_path(const char *dir_path, char *out, size_t out_len)
+{
+    if (!dir_path || !dir_path[0] || strcmp(dir_path, "/") == 0) return false;
+    snprintf(out, out_len, "%s", dir_path);
+    char *slash = strrchr(out, '/');
+    if (!slash) {
+        snprintf(out, out_len, "/");
+    } else if (slash == out) {
+        slash[1] = 0;
+    } else {
+        *slash = 0;
+    }
+    return true;
 }
 
 static int hex_value(char c)
@@ -706,6 +873,8 @@ static bool load_template(const char *path, char *buf, size_t buflen, const char
 
 static void substitution_value(const char *name,
                                const char *file_name,
+                               const char *file_path,
+                               const char *dir_path,
                                uint32_t size,
                                bool is_dir,
                                uint8_t board_rev,
@@ -714,6 +883,8 @@ static void substitution_value(const char *name,
 {
     char escaped[256];
     char encoded[256];
+    char js_name[256];
+    char url[320];
     char tmp[300];
     if (ci_equal(name, "WRITE_GRANT_STATUS")) {
         snprintf(out, out_len, "%s", write_gate_active() ? "active" : "inactive");
@@ -728,38 +899,86 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "BOARD_LABEL")) {
         snprintf(out, out_len, "%s", core_board_label(board_rev));
     } else if (ci_equal(name, "R3_URL")) {
-        snprintf(out, out_len, "/index.html?board=3");
+        make_index_url(dir_path, 3, out, out_len);
     } else if (ci_equal(name, "R6_URL")) {
-        snprintf(out, out_len, "/index.html?board=6");
+        make_index_url(dir_path, 6, out, out_len);
+    } else if (ci_equal(name, "CURRENT_PATH")) {
+        html_escape((dir_path && dir_path[0]) ? dir_path : "/", out, out_len);
+    } else if (ci_equal(name, "PARENT_LINK")) {
+        char parent[192];
+        if (make_parent_path(dir_path, parent, sizeof parent) &&
+            make_index_url(parent, board_rev, url, sizeof url)) {
+            snprintf(out, out_len, "<a href=\"%s\">Parent</a>", url);
+        } else {
+            snprintf(out, out_len, "");
+        }
     } else if (ci_equal(name, "FILENAME")) {
         html_escape(file_name ? file_name : "", out, out_len);
+    } else if (ci_equal(name, "FILENAME_ESCAPED")) {
+        html_escape(file_name ? file_name : "", out, out_len);
+    } else if (ci_equal(name, "FILENAME_JS")) {
+        js_string_escape(file_name ? file_name : "", out, out_len);
     } else if (ci_equal(name, "TYPE")) {
         snprintf(out, out_len, "%s", is_dir ? "DIR" : "CORE");
     } else if (ci_equal(name, "SIZE")) {
         if (is_dir) snprintf(out, out_len, "-");
         else snprintf(out, out_len, "%lu", (unsigned long)size);
-    } else if (ci_equal(name, "FILE_URL")) {
+    } else if (ci_equal(name, "PRIMARY_LABEL")) {
+        snprintf(out, out_len, "%s", is_dir ? "Open" : "Start Core");
+    } else if (ci_equal(name, "PRIMARY_URL")) {
         if (is_dir) {
-            snprintf(out, out_len, "#");
+            make_index_url(file_path, board_rev, out, out_len);
         } else {
-            url_encode(file_name ? file_name : "", encoded, sizeof encoded);
-            snprintf(out, out_len, "/files/%s", encoded);
-        }
-    } else if (ci_equal(name, "JTAG_URL")) {
-        if (is_dir) {
-            snprintf(out, out_len, "#");
-        } else {
-            url_encode(file_name ? file_name : "", encoded, sizeof encoded);
+            url_encode(file_path ? file_path : "", encoded, sizeof encoded);
             if (board_rev == 3 || board_rev == 6) {
                 snprintf(out, out_len, "/jtag?file=%s&board=%lu", encoded, (unsigned long)board_rev);
             } else {
                 snprintf(out, out_len, "/jtag?file=%s", encoded);
             }
         }
+    } else if (ci_equal(name, "FILE_URL")) {
+        if (is_dir) {
+            make_index_url(file_path, board_rev, out, out_len);
+        } else {
+            url_encode(file_path ? file_path : "", encoded, sizeof encoded);
+            snprintf(out, out_len, "/files/%s", encoded);
+        }
+    } else if (ci_equal(name, "JTAG_URL")) {
+        if (is_dir) {
+            make_index_url(file_path, board_rev, out, out_len);
+        } else {
+            url_encode(file_path ? file_path : "", encoded, sizeof encoded);
+            if (board_rev == 3 || board_rev == 6) {
+                snprintf(out, out_len, "/jtag?file=%s&board=%lu", encoded, (unsigned long)board_rev);
+            } else {
+                snprintf(out, out_len, "/jtag?file=%s", encoded);
+            }
+        }
+    } else if (ci_equal(name, "DELETE_URL")) {
+        if (is_dir) {
+            snprintf(out, out_len, "#");
+        } else {
+            url_encode(file_path ? file_path : "", encoded, sizeof encoded);
+            snprintf(out, out_len, "/delete?file=%s", encoded);
+        }
+    } else if (ci_equal(name, "ACTIONS")) {
+        if (is_dir) {
+            snprintf(out, out_len, "");
+        } else {
+            url_encode(file_path ? file_path : "", encoded, sizeof encoded);
+            js_string_escape(file_name ? file_name : "", js_name, sizeof js_name);
+            snprintf(out, out_len,
+                     "<a href=\"/files/%s\">download</a> "
+                     "<button class=\"delete\" type=\"button\" onclick=\"deleteCore('/delete?file=%s','%s')\">delete</button>",
+                     encoded, encoded, js_name);
+        }
+    } else if (ci_equal(name, "CORE_META")) {
+        if (is_dir) snprintf(out, out_len, "");
+        else format_core_meta_html(file_path, out, out_len);
     } else if (ci_equal(name, "PATH")) {
-        snprintf(out, out_len, "%s", file_name ? file_name : "");
+        snprintf(out, out_len, "%s", file_path ? file_path : "");
     } else if (ci_equal(name, "PATH_ESCAPED")) {
-        html_escape(file_name ? file_name : "", escaped, sizeof escaped);
+        html_escape(file_path ? file_path : "", escaped, sizeof escaped);
         snprintf(out, out_len, "%s", escaped);
     } else {
         snprintf(tmp, sizeof tmp, "{%s}", name);
@@ -770,6 +989,8 @@ static void substitution_value(const char *name,
 static void append_substituted(page_builder_t *pb,
                                const char *tmpl,
                                const char *file_name,
+                               const char *file_path,
+                               const char *dir_path,
                                uint32_t size,
                                bool is_dir,
                                uint8_t board_rev)
@@ -793,7 +1014,7 @@ static void append_substituted(page_builder_t *pb,
         memcpy(name, open + 1, n);
         name[n] = 0;
         char value[320];
-        substitution_value(name, file_name, size, is_dir, board_rev, value, sizeof value);
+        substitution_value(name, file_name, file_path, dir_path, size, is_dir, board_rev, value, sizeof value);
         page_append(pb, value);
         p = close + 1;
     }
@@ -806,14 +1027,19 @@ static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
         il->truncated = true;
         return;
     }
+    if (is_dir && ci_equal(name, "WWW")) return;
+
+    char full_path[256];
+    if (!make_child_path(il->dir_path, name, full_path, sizeof full_path)) return;
+
     if (!is_dir && (il->board_rev == 3 || il->board_rev == 6)) {
         core_file_t cf;
-        if (!core_open(&cf, name)) return;
-        bool match = core_matches_board(&cf, name, il->board_rev);
+        if (!core_open(&cf, full_path)) return;
+        bool match = core_matches_board(&cf, full_path, il->board_rev);
         core_close(&cf);
         if (!match) return;
     }
-    append_substituted(il->pb, il->row_template, name, size, is_dir, il->board_rev);
+    append_substituted(il->pb, il->row_template, name, full_path, il->dir_path, size, is_dir, il->board_rev);
 }
 
 static err_t http_close(http_conn_t *c)
@@ -926,6 +1152,10 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
     if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
         return send_error(c, 403, "Forbidden", "remote IP is not authorised");
     }
+    char dir_path[192];
+    if (!index_path_from_target(c->target, dir_path, sizeof dir_path)) {
+        return send_error(c, 400, "Bad Request", "unsafe index path");
+    }
 
     load_template("WWW/index_top.html", top_template, sizeof top_template, default_top);
     load_template("WWW/index_row.html", row_template, sizeof row_template, default_row);
@@ -933,20 +1163,21 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
 
     page_builder_t pb = { .buf = page_buf, .cap = sizeof page_buf };
     page_buf[0] = 0;
-    append_substituted(&pb, top_template, NULL, 0, false, board_rev);
+    append_substituted(&pb, top_template, NULL, NULL, dir_path, 0, false, board_rev);
 
     index_list_ctx_t il = {
         .pb = &pb,
         .row_template = row_template,
+        .dir_path = dir_path,
         .board_rev = board_rev,
     };
-    if (!storage_list_cores("/", index_cb, &il)) {
-        page_append(&pb, "<tr><td colspan=\"4\">SD list failed</td></tr>\n");
+    if (!storage_list_cores(dir_path, index_cb, &il)) {
+        page_append(&pb, "<tr><td colspan=\"3\">SD list failed</td></tr>\n");
     }
     if (il.truncated) {
-        page_append(&pb, "<tr><td colspan=\"4\">List truncated</td></tr>\n");
+        page_append(&pb, "<tr><td colspan=\"3\">List truncated</td></tr>\n");
     }
-    append_substituted(&pb, bottom_template, NULL, 0, false, board_rev);
+    append_substituted(&pb, bottom_template, NULL, NULL, dir_path, 0, false, board_rev);
     return send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
 }
 
@@ -1048,7 +1279,6 @@ static err_t start_downloads_download(http_conn_t *c, const char *path)
 static err_t program_file(http_conn_t *c, const char *path, uint8_t board_rev)
 {
     if (!check_perm(c, REMOTE_AUTH_BITSTREAMS)) return send_error(c, 403, "Forbidden", "JTAG programming is not authorised");
-    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
     if (!safe_file_path(path)) return send_error(c, 400, "Bad Request", "unsafe or unsupported file path");
 
     core_file_t cf;
@@ -1067,6 +1297,15 @@ static err_t program_file(http_conn_t *c, const char *path, uint8_t board_rev)
     core_close(&cf);
     if (!ok) return send_error(c, 500, "Internal Server Error", jtag_last_error());
     return send_response(c, 200, "OK", "text/plain", "OK JTAG DONE\n");
+}
+
+static err_t delete_file(http_conn_t *c, const char *path)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES)) return send_error(c, 403, "Forbidden", "file deletes are not authorised");
+    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
+    if (!safe_file_path(path)) return send_error(c, 400, "Bad Request", "unsafe or unsupported file path");
+    if (!storage_delete(path)) return send_error(c, 500, "Internal Server Error", storage_last_error());
+    return send_response(c, 200, "OK", "text/plain", "OK DELETE DONE\n");
 }
 
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len)
@@ -1364,6 +1603,13 @@ static err_t parse_headers(http_conn_t *c)
         }
         if (ci_equal(target_path, "/jtag")) {
             return begin_put_jtag(c);
+        }
+        if (ci_equal(target_path, "/delete")) {
+            char file[256];
+            if (!parse_query_value(c->target, "file", file, sizeof file)) {
+                return send_error(c, 400, "Bad Request", "missing file query parameter");
+            }
+            return delete_file(c, file);
         }
         return send_error(c, 404, "Not Found", "unknown PUT endpoint");
     }

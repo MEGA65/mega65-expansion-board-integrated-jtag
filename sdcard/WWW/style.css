@@ -4,8 +4,8 @@
 
 body {
   margin: 0;
-  background: #f2f2f2;
-  color: #161616;
+  background: #090c11;
+  color: #e8edf3;
   font-family: Arial, Helvetica, sans-serif;
 }
 
@@ -31,6 +31,7 @@ h1 {
   margin: 0;
   font-size: 24px;
   font-weight: 700;
+  color: #f6f8fb;
 }
 
 .grant {
@@ -40,16 +41,17 @@ h1 {
   align-items: center;
   margin-bottom: 16px;
   padding: 12px 14px;
-  background: #ffffff;
+  background: #121821;
+  border: 1px solid #273142;
   border-left: 5px solid #555555;
 }
 
 .grant-active {
-  border-left-color: #168a3a;
+  border-left-color: #2fa35b;
 }
 
 .grant-inactive {
-  border-left-color: #a72f2f;
+  border-left-color: #a43838;
 }
 
 .boards {
@@ -64,29 +66,65 @@ h1 {
 .boards a {
   display: inline-block;
   padding: 7px 10px;
-  background: #ffffff;
+  background: #121821;
+  border: 1px solid #273142;
 }
 
 table {
   width: 100%;
   border-collapse: collapse;
-  background: #ffffff;
+  background: #10161f;
 }
 
 th,
 td {
   padding: 10px 12px;
-  border-bottom: 1px solid #dddddd;
+  border-bottom: 1px solid #263140;
   text-align: left;
+  vertical-align: top;
 }
 
 th {
-  background: #202020;
+  background: #1b2531;
   color: #ffffff;
 }
 
 a {
-  color: #0057b8;
+  color: #63b3ff;
+}
+
+.start {
+  display: inline-block;
+  margin-right: 10px;
+  padding: 5px 9px;
+  background: #1e7a46;
+  color: #ffffff;
+  text-decoration: none;
+}
+
+.core-name {
+  font-weight: 700;
+}
+
+.meta {
+  margin-top: 4px;
+  color: #9fb0c3;
+  font-size: 13px;
+}
+
+.meta:empty {
+  display: none;
+}
+
+.delete {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #ff7b7b;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 @media (max-width: 620px) {
