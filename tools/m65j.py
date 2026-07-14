@@ -10,6 +10,8 @@ import sys
 import tempfile
 import textwrap
 import time
+import socket
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -693,8 +695,15 @@ def http_request(url, user=None, password=None, data=None, method=None):
     if user is not None or password is not None:
         token = base64.b64encode(f"{user or ''}:{password or ''}".encode()).decode()
         req.add_header("Authorization", f"Basic {token}")
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return r.read(), r.headers.get_content_type()
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.read(), r.headers.get_content_type()
+    except urllib.error.HTTPError as e:
+        body = e.read(240).decode("utf-8", "replace").strip()
+        detail = f": {body}" if body else ""
+        raise SystemExit(f"ERR HTTP {e.code} {e.reason} from {url}{detail}")
+    except (ConnectionResetError, TimeoutError, socket.timeout, urllib.error.URLError, OSError) as e:
+        raise SystemExit(f"ERR HTTP request failed for {url}: {e}")
 
 
 def device_put_url(device, name, board, store_only):

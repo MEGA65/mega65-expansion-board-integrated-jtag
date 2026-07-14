@@ -90,6 +90,7 @@ typedef enum {
     HTTP_RECV_HEADERS = 0,
     HTTP_RECV_BODY,
     HTTP_SEND_FILE,
+    HTTP_CLOSING,
     HTTP_CLOSED,
 } http_state_t;
 
@@ -189,6 +190,8 @@ typedef struct {
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len);
 static int find_header_end(const char *buf, size_t len, size_t *end_len);
 static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms);
+static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len);
+static err_t http_poll_cb(void *arg, struct tcp_pcb *pcb);
 
 static remote_auth_config_t http_cfg;
 static http_conn_t http_conn;
@@ -816,15 +819,30 @@ static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
 static err_t http_close(http_conn_t *c)
 {
     if (!c || !c->pcb) return ERR_OK;
-    if ((c->put_op == HTTP_PUT_FILE || c->jtag_spool) && c->state == HTTP_RECV_BODY) {
+    if (c->state != HTTP_CLOSING &&
+        (c->put_op == HTTP_PUT_FILE || c->jtag_spool) && c->state == HTTP_RECV_BODY) {
         signed_file_receive_abort(&c->signed_rx);
     }
-    if (c->jtag_active) {
+    if (c->state != HTTP_CLOSING && c->jtag_active) {
         jtag_program_writer_abort(&c->jtag);
         c->jtag_active = false;
     }
     struct tcp_pcb *pcb = c->pcb;
-    c->state = HTTP_CLOSED;
+    c->state = HTTP_CLOSING;
+    tcp_recv(pcb, NULL);
+    tcp_sent(pcb, http_sent);
+    tcp_poll(pcb, http_poll_cb, 2);
+    err_t err = tcp_close(pcb);
+    if (err == ERR_OK) {
+        c->pcb = NULL;
+        c->in_use = false;
+        c->state = HTTP_CLOSED;
+        return ERR_OK;
+    }
+    if (err == ERR_MEM) {
+        return ERR_OK;
+    }
+
     tcp_arg(pcb, NULL);
     tcp_recv(pcb, NULL);
     tcp_sent(pcb, NULL);
@@ -832,13 +850,10 @@ static err_t http_close(http_conn_t *c)
     tcp_poll(pcb, NULL, 0);
     c->pcb = NULL;
     c->in_use = false;
-    err_t err = tcp_close(pcb);
-    if (err != ERR_OK) {
-        tcp_abort(pcb);
-        c->aborted = true;
-        return ERR_ABRT;
-    }
-    return ERR_OK;
+    c->state = HTTP_CLOSED;
+    tcp_abort(pcb);
+    c->aborted = true;
+    return ERR_ABRT;
 }
 
 static bool tcp_write_copy(http_conn_t *c, const void *data, size_t len)
@@ -875,8 +890,8 @@ static err_t send_response(http_conn_t *c,
              "\r\n",
              code, reason, content_type ? content_type : "text/plain",
              (unsigned long)body_len);
-    tcp_write_copy(c, header, strlen(header));
-    tcp_write_copy(c, body, body_len);
+    if (!tcp_write_copy(c, header, strlen(header))) return http_close(c);
+    if (!tcp_write_copy(c, body, body_len)) return http_close(c);
     return http_close(c);
 }
 
@@ -1413,6 +1428,7 @@ static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
         return err;
     }
 
+    tcp_recved(pcb, p->tot_len);
     for (struct pbuf *q = p; q; q = q->next) {
         err_t perr = process_bytes(c, (const uint8_t *)q->payload, q->len);
         if (perr == ERR_ABRT || c->aborted) {
@@ -1421,7 +1437,6 @@ static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
         }
         if (c->state == HTTP_CLOSED) break;
     }
-    tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     return c->aborted ? ERR_ABRT : ERR_OK;
 }
@@ -1432,6 +1447,7 @@ static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
     (void)len;
     http_conn_t *c = (http_conn_t *)arg;
     if (c && c->state == HTTP_SEND_FILE) return send_file_chunk(c);
+    if (c && c->state == HTTP_CLOSING) return http_close(c);
     return ERR_OK;
 }
 
@@ -1440,6 +1456,7 @@ static err_t http_poll_cb(void *arg, struct tcp_pcb *pcb)
     (void)pcb;
     http_conn_t *c = (http_conn_t *)arg;
     if (c && c->state == HTTP_SEND_FILE) return send_file_chunk(c);
+    if (c && c->state == HTTP_CLOSING) return http_close(c);
     return ERR_OK;
 }
 

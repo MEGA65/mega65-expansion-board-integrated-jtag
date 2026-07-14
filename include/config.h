@@ -111,4 +111,4 @@
 #endif
 
 #define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG v0.1"
-#define M65_BUILD_MARKER     "lwipopts-rp2040-20260715"
+#define M65_BUILD_MARKER     "http-recved-before-close-20260715"
