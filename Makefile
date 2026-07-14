@@ -221,5 +221,5 @@ print-config:
 
 terminal:
 	@echo "Example command client:"
-	@echo "  python3 tools/uart_client.py /dev/ttyUSB0 V"
+	@echo "  python3 tools/m65j.py /dev/ttyUSB0 ATI"
 	@echo "or use picocom/minicom at 2000000 8N1."

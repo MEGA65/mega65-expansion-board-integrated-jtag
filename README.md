@@ -143,16 +143,16 @@ AT+HELP                    help
 Example:
 
 ```bash
-python3 tools/uart_client.py /dev/ttyACM0 ATI
+python3 tools/m65j.py /dev/ttyACM0 ATI
 # or via the hardware UART:
-python3 tools/uart_client.py /dev/ttyUSB0 AT+VERSION?
-python3 tools/uart_client.py /dev/ttyACM0 AT+CORELIST=/
-python3 tools/uart_client.py /dev/ttyACM0 AT+COREINFO=/cores/mega65r6.cor
-python3 tools/uart_client.py /dev/ttyACM0 AT+JTAGLOAD=/cores/mega65r6.cor
+python3 tools/m65j.py /dev/ttyUSB0 AT+VERSION?
+python3 tools/m65j.py /dev/ttyACM0 AT+CORELIST=/
+python3 tools/m65j.py /dev/ttyACM0 AT+COREINFO=/cores/mega65r6.cor
+python3 tools/m65j.py /dev/ttyACM0 AT+JTAGLOAD=/cores/mega65r6.cor
 ```
 
 Set `M65_ENABLE_LEGACY_UART_COMMANDS=1` at compile time only if you need the
-early bring-up one-letter protocol. `tools/uart_client.py` still translates the
+early bring-up one-letter protocol. `tools/m65j.py` still translates the
 old short forms for convenience.
 
 ## File handling
@@ -252,7 +252,7 @@ and copy files on a PC, or connect USB, assert the physical write-enable input,
 and upload with:
 
 ```bash
-python3 tools/uart_client.py /dev/ttyACM0 write local-core.bit remote-core.bit
+python3 tools/m65j.py /dev/ttyACM0 write local-core.bit remote-core.bit
 ```
 
 The upload is written to `remote-core.bit.tmp`, synced, then renamed into place
@@ -264,14 +264,33 @@ release protocol.
 Remote HTTP uploads and firmware-side URL fetches can require a signed trailer.
 The format is documented in [SIGNED_CORE_FORMAT.md](SIGNED_CORE_FORMAT.md).
 
-Use `tools/uart_client.py keys` to list local public keys and print the
+Use `tools/m65j.py keys` to list local public keys and print the
 `trusted_key=` lines to copy into `REMOTE_ENABLE.cfg`. The same client can
 bless, store, or JTAG-push a core over HTTP:
 
 ```sh
-tools/uart_client.py bless --board 6 core.bit
-tools/uart_client.py push http://mega65-jtag.local core.bit --board 6
-tools/uart_client.py store http://mega65-jtag.local core.bit --board 6
+tools/m65j.py bless --board 6 core.bit
+tools/m65j.py push http://mega65-jtag.local core.bit --board 6
+tools/m65j.py store http://mega65-jtag.local core.bit --board 6
+```
+
+For web commands, `tools/m65j.py` reads `.m65j.config` from the current
+directory first, then `~/.m65j.config`. A minimal client config is:
+
+```ini
+device=http://mega65-jtag.local
+# or:
+ip=192.168.1.65
+```
+
+With that in place, the device URL can be omitted:
+
+```sh
+tools/m65j.py status
+tools/m65j.py push core.bit --board 6
+tools/m65j.py load /cores/mega65r6.cor --board 6
+tools/m65j.py get /cores/mega65r6.cor -o mega65r6.cor
+tools/m65j.py downloads-get fetched.bit -o fetched.bit
 ```
 
 Useful commands:

@@ -72,7 +72,7 @@ both check against `game.bit`.
 List local public keys and the matching config lines:
 
 ```sh
-tools/uart_client.py keys
+tools/m65j.py keys
 ```
 
 If the selected private key does not exist, the client prompts to create it with
@@ -81,26 +81,26 @@ OpenSSL and asks for a key name, defaulting to `default`.
 Print the selected key's `REMOTE_ENABLE.cfg` entry:
 
 ```sh
-tools/uart_client.py bless --print-trusted-key core.bit
+tools/m65j.py bless --print-trusted-key core.bit
 ```
 
 Create a signed transfer:
 
 ```sh
-tools/uart_client.py bless --board 6 -o core.signed.bit core.bit
+tools/m65j.py bless --board 6 -o core.signed.bit core.bit
 ```
 
 Upload in one command:
 
 ```sh
-tools/uart_client.py put http://mega65-jtag.local/files/core.bit \
+tools/m65j.py put http://mega65-jtag.local/files/core.bit \
   core.bit --board 6
 ```
 
 Upload and JTAG in one command:
 
 ```sh
-tools/uart_client.py push http://mega65-jtag.local core.bit --board 6
+tools/m65j.py push http://mega65-jtag.local core.bit --board 6
 ```
 
 If the input already has a signature trailer, the client prints an `INFO:`
