@@ -63,6 +63,17 @@ bool storage_open(storage_file_t *f, const char *path)
     return true;
 }
 
+bool storage_open_write(storage_file_t *f, const char *path, bool truncate)
+{
+    if (!f || !path) return false;
+    BYTE mode = FA_WRITE | FA_CREATE_ALWAYS;
+    if (!truncate) mode = FA_WRITE | FA_OPEN_ALWAYS;
+    FRESULT fr = f_open(&active_file, path, mode);
+    if (fr != FR_OK) { set_err("f_open_write", fr); return false; }
+    f->impl = &active_file;
+    return true;
+}
+
 bool storage_read(storage_file_t *f, void *buf, size_t len, size_t *got)
 {
     if (!f || !f->impl || !buf) return false;
@@ -70,6 +81,24 @@ bool storage_read(storage_file_t *f, void *buf, size_t len, size_t *got)
     FRESULT fr = f_read((FIL *)f->impl, buf, (UINT)len, &br);
     if (got) *got = (size_t)br;
     if (fr != FR_OK) { set_err("f_read", fr); return false; }
+    return true;
+}
+
+bool storage_write(storage_file_t *f, const void *buf, size_t len, size_t *put)
+{
+    if (!f || !f->impl || !buf) return false;
+    UINT bw = 0;
+    FRESULT fr = f_write((FIL *)f->impl, buf, (UINT)len, &bw);
+    if (put) *put = (size_t)bw;
+    if (fr != FR_OK) { set_err("f_write", fr); return false; }
+    return true;
+}
+
+bool storage_sync(storage_file_t *f)
+{
+    if (!f || !f->impl) return false;
+    FRESULT fr = f_sync((FIL *)f->impl);
+    if (fr != FR_OK) { set_err("f_sync", fr); return false; }
     return true;
 }
 
@@ -113,6 +142,30 @@ static bool has_core_ext(const char *name)
     return (e1 == 'b' && e2 == 'i' && e3 == 't' && e4 == 0) ||
            (e1 == 'c' && e2 == 'o' && e3 == 'r' && e4 == 0) ||
            (e1 == 'm' && e2 == '6' && e3 == '5' && e4 == 'j' && e5 == 0);
+}
+
+bool storage_delete(const char *path)
+{
+    if (!path) return false;
+    FRESULT fr = f_unlink(path);
+    if (fr != FR_OK && fr != FR_NO_FILE) { set_err("f_unlink", fr); return false; }
+    return true;
+}
+
+bool storage_rename(const char *old_path, const char *new_path)
+{
+    if (!old_path || !new_path) return false;
+    FRESULT fr = f_rename(old_path, new_path);
+    if (fr != FR_OK) { set_err("f_rename", fr); return false; }
+    return true;
+}
+
+bool storage_mkdir(const char *path)
+{
+    if (!path || !path[0]) return false;
+    FRESULT fr = f_mkdir(path);
+    if (fr != FR_OK && fr != FR_EXIST) { set_err("f_mkdir", fr); return false; }
+    return true;
 }
 
 bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx)

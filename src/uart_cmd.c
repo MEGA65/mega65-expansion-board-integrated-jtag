@@ -15,12 +15,7 @@
 #define M65_ENABLE_USB_CDC 1
 #endif
 
-typedef enum {
-    CMD_SRC_UART = 0,
-    CMD_SRC_USB  = 1,
-} cmd_source_t;
-
-static cmd_source_t last_cmd_source = CMD_SRC_UART;
+static uart_cmd_source_t last_cmd_source = UART_CMD_SRC_UART;
 
 void uart_cmd_init(void)
 {
@@ -59,7 +54,7 @@ bool uart_cmd_read_line(char *buf, size_t buflen)
     while (uart_is_readable(M65_UART_ID)) {
         char c = (char)uart_getc(M65_UART_ID);
         if (feed_line_char(c, buf, buflen, &uart_pos)) {
-            last_cmd_source = CMD_SRC_UART;
+            last_cmd_source = UART_CMD_SRC_UART;
             return true;
         }
     }
@@ -73,7 +68,7 @@ bool uart_cmd_read_line(char *buf, size_t buflen)
     while ((n = stdio_get_until(tmp, (int)sizeof tmp, get_absolute_time())) > 0) {
         for (int i = 0; i < n; i++) {
             if (feed_line_char(tmp[i], buf, buflen, &usb_pos)) {
-                last_cmd_source = CMD_SRC_USB;
+                last_cmd_source = UART_CMD_SRC_USB;
                 return true;
             }
         }
@@ -134,10 +129,23 @@ bool uart_cmd_read_bytes(uint8_t *buf, size_t len, uint32_t timeout_ms)
     if (!buf && len) return false;
     if (len == 0) return true;
 
-    if (last_cmd_source == CMD_SRC_USB) {
+    if (last_cmd_source == UART_CMD_SRC_USB) {
         return read_usb_bytes_bulk(buf, len, timeout_ms);
     }
     return read_uart_bytes_bulk(buf, len, timeout_ms);
+}
+
+void uart_cmd_write_bytes(const uint8_t *buf, size_t len)
+{
+    if (!buf || !len) return;
+    if (last_cmd_source == UART_CMD_SRC_USB) {
+#if M65_ENABLE_USB_CDC
+        fwrite(buf, 1, len, stdout);
+        fflush(stdout);
+#endif
+        return;
+    }
+    uart_write_blocking(M65_UART_ID, buf, len);
 }
 
 void uart_cmd_puts(const char *s)
@@ -163,6 +171,20 @@ void uart_cmd_printf(const char *fmt, ...)
     vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
     uart_cmd_puts(tmp);
+}
+
+uart_cmd_source_t uart_cmd_last_source(void)
+{
+    return last_cmd_source;
+}
+
+const char *uart_cmd_source_name(uart_cmd_source_t src)
+{
+    switch (src) {
+    case UART_CMD_SRC_USB: return "USB";
+    case UART_CMD_SRC_UART: return "UART";
+    default: return "UNKNOWN";
+    }
 }
 
 char *trim_line(char *s)

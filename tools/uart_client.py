@@ -85,9 +85,9 @@ def read_response_lines(ser, cmd, timeout):
             text = line.decode("utf-8", "replace").rstrip("\r\n")
             print(text)
             last = time.monotonic()
-            if text == "END" or text.startswith("ERR ") or text in {"OK P DONE", "OK S DONE"} or text.startswith("OK N DONE") or text.startswith("OK T DONE"):
+            if text == "END" or text.startswith("ERR ") or text in {"OK P DONE", "OK S DONE"} or text.startswith("OK N DONE") or text.startswith("OK T DONE") or text.startswith("OK W DONE"):
                 break
-            if cmd[:1].upper() in {"V", "I", "J", "H", "M"} and text.startswith("OK "):
+            if cmd[:1].upper() in {"V", "I", "J", "H", "M", "A", "X"} and text.startswith("OK "):
                 break
         elif time.monotonic() - last > timeout:
             break
@@ -148,6 +148,7 @@ def drain_available_lines(ser):
                 or text.startswith("OK N DONE")
                 or text.startswith("OK T DONE")
                 or text.startswith("OK P DONE")
+                or text.startswith("OK W DONE")
             ):
                 terminal = text
     finally:
@@ -231,6 +232,62 @@ def sink_local_file(ser, local_path, timeout):
     read_response_lines(ser, "N", timeout=max(timeout, 20.0))
     return 0
 
+
+def wait_for_w_ready(ser, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        line = ser.readline()
+        if not line:
+            continue
+        text = line.decode("utf-8", "replace").rstrip("\r\n")
+        print(text)
+        if text.startswith("OK W READY"):
+            return True
+        if text.startswith("ERR "):
+            return False
+    print("ERR host timeout waiting for OK W READY", file=sys.stderr)
+    return False
+
+
+def write_local_file(ser, local_path, remote_path, timeout):
+    path = os.path.expanduser(local_path)
+    size = os.path.getsize(path)
+    if remote_path is None:
+        remote_path = os.path.basename(path)
+
+    ser.reset_input_buffer()
+    ser.write(f'W "{remote_path}" {size}\n'.encode("utf-8"))
+    ser.flush()
+    if not wait_for_w_ready(ser, timeout=10.0):
+        return 1
+
+    sent = 0
+    last_report = 0
+    terminal = None
+    chunk_size = 32768
+    start = time.monotonic()
+    with open(path, "rb") as f:
+        while sent < size:
+            chunk = f.read(min(chunk_size, size - sent))
+            if not chunk:
+                print("ERR host short read from local file", file=sys.stderr)
+                return 1
+            ser.write(chunk)
+            sent += len(chunk)
+            if sent - last_report >= 1048576 or sent == size:
+                ser.flush()
+                terminal = drain_available_lines(ser) or terminal
+                elapsed = max(time.monotonic() - start, 1e-6)
+                print(f"HOST_SENT {sent}/{size} {sent/elapsed/1024:.1f} KiB/s", file=sys.stderr)
+                last_report = sent
+    ser.flush()
+
+    if terminal is not None:
+        return 1 if terminal.startswith("ERR ") else 0
+
+    read_response_lines(ser, "W", timeout=max(timeout, 20.0))
+    return 0
+
 def main():
     ap = argparse.ArgumentParser(description="Tiny client for pico-m65jtag line protocol")
     ap.add_argument("port")
@@ -253,6 +310,12 @@ def main():
             if len(args.command) != 2:
                 ap.error("sink expects exactly one local .bit/.cor/.m65j filename")
             sys.exit(sink_local_file(ser, args.command[1], args.timeout))
+
+        if args.command[0].lower() in {"write", "upload", "install-file"}:
+            if len(args.command) not in {2, 3}:
+                ap.error("write expects: write localfile [remote-name]")
+            remote = args.command[2] if len(args.command) == 3 else None
+            sys.exit(write_local_file(ser, args.command[1], remote, args.timeout))
 
         cmd = " ".join(args.command).strip()
         if args.command[0].upper() == "P" and len(args.command) == 2:

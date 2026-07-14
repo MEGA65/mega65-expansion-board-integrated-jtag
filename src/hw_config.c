@@ -11,6 +11,8 @@
 #include "sd_driver/spi.h"
 #include "sd_driver/sd_card.h"
 
+void m65_sd_runtime_configure(spi_t *spi_p, sd_card_t *pSD);
+
 static spi_t spis[] = {
     {
         .hw_inst = M65_SD_SPI_ID,
@@ -37,6 +39,11 @@ static sd_card_t sd_cards[] = {
     }
 };
 
+static void configure_runtime_layout(void)
+{
+    m65_sd_runtime_configure(&spis[0], &sd_cards[0]);
+}
+
 size_t spi_get_num(void)
 {
     return sizeof spis / sizeof spis[0];
@@ -45,6 +52,7 @@ size_t spi_get_num(void)
 spi_t *spi_get_by_num(size_t num)
 {
     if (num >= spi_get_num()) return NULL;
+    if (num == 0) configure_runtime_layout();
     return &spis[num];
 }
 
@@ -56,5 +64,6 @@ size_t sd_get_num(void)
 sd_card_t *sd_get_by_num(size_t num)
 {
     if (num >= sd_get_num()) return NULL;
+    if (num == 0) configure_runtime_layout();
     return &sd_cards[num];
 }

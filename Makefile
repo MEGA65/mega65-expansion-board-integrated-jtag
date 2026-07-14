@@ -24,6 +24,7 @@ USE_FATFS        ?= 1
 FATFS_REPO       ?= https://github.com/carlk3/no-OS-FatFS-SD-SPI-RPi-Pico.git
 FATFS_PATH       ?= $(CURDIR)/third_party/no-OS-FatFS-SD-SPI-RPi-Pico
 M65_HAVE_SD_INIT_DRIVER ?= 0
+ENABLE_WIFI_REMOTE ?= 0
 
 UF2 := $(BUILD_DIR)/$(PROJECT).uf2
 ELF := $(BUILD_DIR)/$(PROJECT).elf
@@ -37,6 +38,8 @@ else
 CMAKE_FATFS_ARGS := -DM65_USE_FATFS=OFF
 CONFIGURE_DEPS := sdk
 endif
+
+CMAKE_REMOTE_ARGS := -DM65_ENABLE_WIFI_REMOTE=$(if $(filter 1 ON on true TRUE yes YES,$(ENABLE_WIFI_REMOTE)),ON,OFF)
 
 .PHONY: all help deps check-tools sdk fatfs configure build nofatfs clean distclean nuke \
         upload flash upload-picotool upload-uf2 picotool print-config terminal
@@ -65,6 +68,7 @@ help:
 	@echo "  PICO_BOARD=pico        Pico SDK board name: pico, pico_w, pico2, ..."
 	@echo "  PICO_SDK_PATH=...      Override SDK path"
 	@echo "  BUILD_DIR=build        Override build directory"
+	@echo "  ENABLE_WIFI_REMOTE=0   Set to 1 with PICO_BOARD=pico_w for HTTP remote support"
 	@echo "  PICO_MOUNT=...         Mount point for upload-uf2, if autodetect fails"
 	@echo
 	@echo "Examples:"
@@ -118,7 +122,8 @@ configure: $(CONFIGURE_DEPS)
 	cmake -S . -B "$(BUILD_DIR)" \
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
 		-DPICO_BOARD="$(PICO_BOARD)" \
-		$(CMAKE_FATFS_ARGS)
+		$(CMAKE_FATFS_ARGS) \
+		$(CMAKE_REMOTE_ARGS)
 
 build: configure
 	cmake --build "$(BUILD_DIR)" --parallel
@@ -206,6 +211,7 @@ print-config:
 	@echo "PICO_SDK_PATH=$(PICO_SDK_PATH)"
 	@echo "USE_FATFS=$(USE_FATFS)"
 	@echo "FATFS_PATH=$(FATFS_PATH)"
+	@echo "ENABLE_WIFI_REMOTE=$(ENABLE_WIFI_REMOTE)"
 	@echo "UF2=$(UF2)"
 
 terminal:

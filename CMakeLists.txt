@@ -19,6 +19,7 @@ pico_sdk_init()
 
 option(M65_USE_FATFS "Build with FatFs storage backend" ON)
 option(M65_HAVE_SD_INIT_DRIVER "Call sd_init_driver() before f_mount(); usually not needed for recent carlk3 library" OFF)
+option(M65_ENABLE_WIFI_REMOTE "Build Pico W WiFi remote-delivery support" OFF)
 set(FATFS_SD_SPI_PATH "${CMAKE_CURRENT_LIST_DIR}/third_party/no-OS-FatFS-SD-SPI-RPi-Pico" CACHE PATH "Path to no-OS-FatFS-SD-SPI-RPi-Pico repository")
 
 add_executable(pico_m65jtag
@@ -26,9 +27,20 @@ add_executable(pico_m65jtag
     src/uart_cmd.c
     src/jtag_gpio.c
     src/core_file.c
+    src/core_filter.c
+    src/remote_auth.c
+    src/remote_http.c
+    src/signed_file.c
+    src/write_gate.c
 )
 
 target_include_directories(pico_m65jtag PRIVATE include)
+target_include_directories(pico_m65jtag PRIVATE
+    "${PICO_SDK_PATH}/lib/mbedtls/include"
+    "${PICO_SDK_PATH}/lib/mbedtls/include/mbedtls"
+    "${PICO_SDK_PATH}/lib/mbedtls/library"
+)
+target_compile_definitions(pico_m65jtag PRIVATE MBEDTLS_CONFIG_FILE="m65_mbedtls_config.h")
 
 target_link_libraries(pico_m65jtag
     pico_stdlib
@@ -36,7 +48,18 @@ target_link_libraries(pico_m65jtag
     hardware_gpio
     hardware_timer
     hardware_spi
+    pico_mbedtls_crypto
 )
+
+if(M65_ENABLE_WIFI_REMOTE)
+    if(NOT PICO_CYW43_SUPPORTED)
+        message(FATAL_ERROR "M65_ENABLE_WIFI_REMOTE requires a Pico W-class board, e.g. -DPICO_BOARD=pico_w")
+    endif()
+    target_compile_definitions(pico_m65jtag PRIVATE M65_WIFI_SUPPORTED=1)
+    target_link_libraries(pico_m65jtag pico_cyw43_arch_lwip_poll)
+else()
+    target_compile_definitions(pico_m65jtag PRIVATE M65_WIFI_SUPPORTED=0)
+endif()
 
 if(M65_USE_FATFS)
     target_sources(pico_m65jtag PRIVATE
@@ -72,15 +95,29 @@ if(M65_USE_FATFS)
         "${FATFS_SPI_CMAKE_DIR}/source"
     )
 
+    target_sources(pico_m65jtag PRIVATE src/sd_transport.c)
+
+    set(FATFS_SPI_TARGET "")
     if(TARGET FatFs_SPI)
-        target_link_libraries(pico_m65jtag FatFs_SPI)
+        set(FATFS_SPI_TARGET FatFs_SPI)
     elseif(TARGET fatfs_spi)
-        target_link_libraries(pico_m65jtag fatfs_spi)
+        set(FATFS_SPI_TARGET fatfs_spi)
     elseif(TARGET fatfs_sd_spi)
-        target_link_libraries(pico_m65jtag fatfs_sd_spi)
+        set(FATFS_SPI_TARGET fatfs_sd_spi)
     else()
         message(FATAL_ERROR "FatFs backend was added, but no known CMake target was exported. Expected FatFs_SPI.")
     endif()
+
+    get_target_property(FATFS_SPI_SOURCES ${FATFS_SPI_TARGET} INTERFACE_SOURCES)
+    if(FATFS_SPI_SOURCES)
+        list(REMOVE_ITEM FATFS_SPI_SOURCES
+            "${FATFS_SPI_CMAKE_DIR}/sd_driver/sd_spi.c"
+            "${FATFS_SPI_CMAKE_DIR}/sd_driver/spi.c"
+        )
+        set_target_properties(${FATFS_SPI_TARGET} PROPERTIES INTERFACE_SOURCES "${FATFS_SPI_SOURCES}")
+    endif()
+
+    target_link_libraries(pico_m65jtag ${FATFS_SPI_TARGET})
 else()
     target_sources(pico_m65jtag PRIVATE src/storage_stub.c)
     target_compile_definitions(pico_m65jtag PRIVATE M65_USE_FATFS=0)

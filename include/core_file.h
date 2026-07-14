@@ -20,6 +20,8 @@ typedef struct {
     uint32_t payload_offset;
     uint32_t payload_length;
     uint32_t expected_idcode;
+    uint8_t model_id;
+    char model[32];
 } core_file_t;
 
 bool core_open(core_file_t *cf, const char *path);

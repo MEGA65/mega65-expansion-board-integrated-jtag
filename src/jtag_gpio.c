@@ -100,6 +100,8 @@ static void idle_clocks(unsigned n)
     for (unsigned i = 0; i < n; i++) tick(false, false);
 }
 
+static bool idcode_match(uint32_t seen, uint32_t expected);
+
 void jtag_gpio_init(void)
 {
     gpio_init(M65_JTAG_TCK_PIN);
@@ -120,14 +122,6 @@ void jtag_gpio_init(void)
 #endif
     gpio_set_dir(M65_JTAG_HIJACK_PIN, GPIO_OUT);
 
-#if M65_JTAG_DONE_PIN != 255
-    gpio_init(M65_JTAG_DONE_PIN);
-    gpio_set_dir(M65_JTAG_DONE_PIN, GPIO_IN);
-#endif
-#if M65_JTAG_INIT_B_PIN != 255
-    gpio_init(M65_JTAG_INIT_B_PIN);
-    gpio_set_dir(M65_JTAG_INIT_B_PIN, GPIO_IN);
-#endif
 }
 
 void jtag_hijack_claim(void)
@@ -319,85 +313,45 @@ bool jtag_get_last_status(jtag_status_t *st)
     return true;
 }
 
-static bool stream_cfg_in_from_reader(uint32_t payload_length,
-                                      jtag_stream_read_cb_t read_cb,
-                                      void *read_ctx,
-                                      const jtag_program_options_t *opts)
+static void jtag_finish_closeout(void)
 {
-    static uint8_t buf[4096];
-    uint32_t remaining = payload_length;
-    uint32_t done = 0;
-
-    if (!read_cb) {
-        set_err("missing payload reader");
-        return false;
-    }
-
-    // Run-Test/Idle -> Select-DR -> Capture-DR -> Shift-DR
-    tick(true, false);
-    tick(false, false);
-    tick(false, false);
-
-    while (remaining) {
-        size_t want = remaining > sizeof buf ? sizeof buf : remaining;
-        size_t got = 0;
-        if (!read_cb(read_ctx, buf, want, &got) || got != want) {
-            set_err("short read while streaming payload");
-            return false;
-        }
-
-        for (size_t i = 0; i < got; i++) {
-            uint8_t b = buf[i];
-            bool final_byte = (remaining == 1 && i == got - 1);
-            if (!final_byte) {
-                // CFG_IN payload is MSB-first per byte, TMS=0 for all bits.
-                tick_payload_bit((b & 0x80u) != 0, false);
-                tick_payload_bit((b & 0x40u) != 0, false);
-                tick_payload_bit((b & 0x20u) != 0, false);
-                tick_payload_bit((b & 0x10u) != 0, false);
-                tick_payload_bit((b & 0x08u) != 0, false);
-                tick_payload_bit((b & 0x04u) != 0, false);
-                tick_payload_bit((b & 0x02u) != 0, false);
-                tick_payload_bit((b & 0x01u) != 0, false);
-            } else {
-                tick_payload_bit((b & 0x80u) != 0, false);
-                tick_payload_bit((b & 0x40u) != 0, false);
-                tick_payload_bit((b & 0x20u) != 0, false);
-                tick_payload_bit((b & 0x10u) != 0, false);
-                tick_payload_bit((b & 0x08u) != 0, false);
-                tick_payload_bit((b & 0x04u) != 0, false);
-                tick_payload_bit((b & 0x02u) != 0, false);
-                tick_payload_bit((b & 0x01u) != 0, true);
-            }
-            remaining--;
-            done++;
-        }
-
-        if (opts && opts->progress_cb && ((done & 0xffffu) == 0 || done == payload_length)) {
-            opts->progress_cb(done, payload_length, opts->progress_ctx);
-        }
-    }
-
     // Exit1-DR -> Update-DR -> Run-Test/Idle
     tick(true, false);
     tick(false, false);
-    return true;
+
+    // Start-up close-out. 128 clocks was enough for the normal MEGA65 core,
+    // but some cores appear to fall through into configuration fallback/QSPI
+    // boot unless we keep the TAP in Run-Test/Idle for longer after JSTART.
+    // These counts are config.h tunables so we can trim them later.
+    shift_ir(XC7_IR_JSTART, XC7_IR_LEN);
+    idle_clocks(M65_JTAG_POST_JSTART_IDLE_CLOCKS);
+
+    // Put the device into an innocuous instruction and provide more idle clocks
+    // before selecting BYPASS/resetting the TAP. This is deliberately conservative
+    // and closer to what a vendor tool does than a minimal byte-shifter.
+    shift_ir(XC7_IR_ISC_NOOP, XC7_IR_LEN);
+    idle_clocks(M65_JTAG_POST_ISC_NOOP_IDLE_CLOCKS);
+
+    shift_ir(XC7_IR_BYPASS, XC7_IR_LEN);
+    idle_clocks(M65_JTAG_POST_BYPASS_IDLE_CLOCKS);
+
+    tap_reset();
+    idle_clocks(M65_JTAG_POST_TAP_RESET_IDLE_CLOCKS);
+
+    // Capture Xilinx config status before releasing the hijack switch. This is
+    // diagnostic only for now: shifting all bytes is not the same as proving
+    // CRC/DONE/EOS/startup state is good, so expose BOOTSTS/STAT/BYPASS to the
+    // command layer after OK/ERR.
+    last_status_valid = jtag_read_xilinx_status(&last_status);
 }
 
-static bool idcode_match(uint32_t seen, uint32_t expected)
+bool jtag_program_writer_begin(jtag_stream_writer_t *wr,
+                               uint32_t payload_length,
+                               uint32_t expected_idcode,
+                               const jtag_program_options_t *opts)
 {
-    if (expected == 0) return true;
-    // Version field can vary; compare with upper nibble masked off, matching the
-    // approach usually used for Xilinx IDCODE sanity checks.
-    return (seen & 0x0fffffffu) == (expected & 0x0fffffffu);
-}
-
-bool jtag_program_stream(uint32_t payload_length,
-                         uint32_t expected_idcode,
-                         jtag_stream_read_cb_t read_cb,
-                         void *read_ctx,
-                         const jtag_program_options_t *opts)
-{
+    if (!wr) return false;
+    memset(wr, 0, sizeof *wr);
     last_err[0] = 0;
     last_status_valid = false;
 
@@ -432,46 +386,120 @@ bool jtag_program_stream(uint32_t payload_length,
     sleep_ms(10);
 
     shift_ir(XC7_IR_CFG_IN, XC7_IR_LEN);
-    if (!stream_cfg_in_from_reader(payload_length, read_cb, read_ctx, opts)) {
-        if (release_after) jtag_hijack_release();
-        return false;
-    }
 
-    // Start-up close-out. 128 clocks was enough for the normal MEGA65 core,
-    // but some cores appear to fall through into configuration fallback/QSPI
-    // boot unless we keep the TAP in Run-Test/Idle for longer after JSTART.
-    // These counts are config.h tunables so we can trim them later.
-    shift_ir(XC7_IR_JSTART, XC7_IR_LEN);
-    idle_clocks(M65_JTAG_POST_JSTART_IDLE_CLOCKS);
+    // Run-Test/Idle -> Select-DR -> Capture-DR -> Shift-DR. The writer stays
+    // in Shift-DR until the final payload bit is written with TMS=1.
+    tick(true, false);
+    tick(false, false);
+    tick(false, false);
 
-    // Put the device into an innocuous instruction and provide more idle clocks
-    // before selecting BYPASS/resetting the TAP. This is deliberately conservative
-    // and closer to what a vendor tool does than a minimal byte-shifter.
-    shift_ir(XC7_IR_ISC_NOOP, XC7_IR_LEN);
-    idle_clocks(M65_JTAG_POST_ISC_NOOP_IDLE_CLOCKS);
-
-    shift_ir(XC7_IR_BYPASS, XC7_IR_LEN);
-    idle_clocks(M65_JTAG_POST_BYPASS_IDLE_CLOCKS);
-
-    tap_reset();
-    idle_clocks(M65_JTAG_POST_TAP_RESET_IDLE_CLOCKS);
-
-    // Capture Xilinx config status before releasing the hijack switch. This is
-    // diagnostic only for now: shifting all bytes is not the same as proving
-    // CRC/DONE/EOS/startup state is good, so expose BOOTSTS/STAT/BYPASS to the
-    // command layer after OK/ERR.
-    last_status_valid = jtag_read_xilinx_status(&last_status);
-
-#if M65_JTAG_DONE_PIN != 255
-    if (opts && opts->read_done_pin && gpio_get(M65_JTAG_DONE_PIN) == 0) {
-        set_err("DONE pin is low after JSTART");
-        if (release_after) jtag_hijack_release();
-        return false;
-    }
-#endif
-
-    if (release_after) jtag_hijack_release();
+    wr->payload_length = payload_length;
+    wr->expected_idcode = expected_idcode;
+    wr->release_after = release_after;
+    wr->progress_cb = opts ? opts->progress_cb : NULL;
+    wr->progress_ctx = opts ? opts->progress_ctx : NULL;
+    wr->active = true;
     return true;
+}
+
+bool jtag_program_writer_write(jtag_stream_writer_t *wr, const uint8_t *buf, size_t len)
+{
+    if (!wr || !wr->active || (!buf && len)) {
+        set_err("invalid JTAG writer");
+        return false;
+    }
+    if (wr->done + len > wr->payload_length) {
+        set_err("payload longer than declared length");
+        return false;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = buf[i];
+        bool final_byte = (wr->done + 1u) == wr->payload_length;
+        tick_payload_bit((b & 0x80u) != 0, false);
+        tick_payload_bit((b & 0x40u) != 0, false);
+        tick_payload_bit((b & 0x20u) != 0, false);
+        tick_payload_bit((b & 0x10u) != 0, false);
+        tick_payload_bit((b & 0x08u) != 0, false);
+        tick_payload_bit((b & 0x04u) != 0, false);
+        tick_payload_bit((b & 0x02u) != 0, false);
+        tick_payload_bit((b & 0x01u) != 0, final_byte);
+        wr->done++;
+
+        if (wr->progress_cb && ((wr->done & 0xffffu) == 0 || wr->done == wr->payload_length)) {
+            wr->progress_cb(wr->done, wr->payload_length, wr->progress_ctx);
+        }
+    }
+    return true;
+}
+
+bool jtag_program_writer_finish(jtag_stream_writer_t *wr)
+{
+    if (!wr || !wr->active) {
+        set_err("invalid JTAG writer");
+        return false;
+    }
+    if (wr->done != wr->payload_length) {
+        set_err("short payload");
+        jtag_program_writer_abort(wr);
+        return false;
+    }
+
+    jtag_finish_closeout();
+    if (wr->release_after) jtag_hijack_release();
+    wr->active = false;
+    return true;
+}
+
+void jtag_program_writer_abort(jtag_stream_writer_t *wr)
+{
+    if (!wr || !wr->active) return;
+    tap_reset();
+    if (wr->release_after) jtag_hijack_release();
+    wr->active = false;
+}
+
+static bool idcode_match(uint32_t seen, uint32_t expected)
+{
+    if (expected == 0) return true;
+    // Version field can vary; compare with upper nibble masked off, matching the
+    // approach usually used for Xilinx IDCODE sanity checks.
+    return (seen & 0x0fffffffu) == (expected & 0x0fffffffu);
+}
+
+bool jtag_program_stream(uint32_t payload_length,
+                         uint32_t expected_idcode,
+                         jtag_stream_read_cb_t read_cb,
+                         void *read_ctx,
+                         const jtag_program_options_t *opts)
+{
+    static uint8_t buf[4096];
+    jtag_stream_writer_t wr;
+
+    if (!read_cb) {
+        set_err("missing payload reader");
+        return false;
+    }
+
+    if (!jtag_program_writer_begin(&wr, payload_length, expected_idcode, opts)) return false;
+
+    uint32_t remaining = payload_length;
+    while (remaining) {
+        size_t want = remaining > sizeof buf ? sizeof buf : remaining;
+        size_t got = 0;
+        if (!read_cb(read_ctx, buf, want, &got) || got != want) {
+            set_err("short read while streaming payload");
+            jtag_program_writer_abort(&wr);
+            return false;
+        }
+        if (!jtag_program_writer_write(&wr, buf, got)) {
+            jtag_program_writer_abort(&wr);
+            return false;
+        }
+        remaining -= (uint32_t)got;
+    }
+
+    return jtag_program_writer_finish(&wr);
 }
 
 typedef struct {

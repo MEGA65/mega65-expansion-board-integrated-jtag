@@ -32,10 +32,33 @@ static uint32_t be32(const uint8_t *p)
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
+static void copy_fixed_string(char *dst, size_t dst_len, const uint8_t *src, size_t src_len)
+{
+    size_t n = 0;
+    if (!dst_len) return;
+    while (n + 1 < dst_len && n < src_len && src[n]) {
+        dst[n] = (char)src[n];
+        n++;
+    }
+    dst[n] = 0;
+}
+
 static bool skip_bytes(storage_file_t *f, uint32_t n)
 {
     uint32_t pos = storage_tell(f);
     return storage_seek(f, pos + n);
+}
+
+static bool parse_cor_header(core_file_t *cf)
+{
+    uint8_t hdr[128];
+    if (!storage_seek(&cf->file, 0) || !read_exact(&cf->file, hdr, sizeof hdr)) {
+        set_err("cannot read COR header");
+        return false;
+    }
+    copy_fixed_string(cf->model, sizeof cf->model, hdr + 0x50, 32);
+    cf->model_id = hdr[0x70];
+    return true;
 }
 
 static bool parse_m65j(core_file_t *cf)
@@ -201,6 +224,7 @@ bool core_open(core_file_t *cf, const char *path)
         // by the original Xilinx .bit file. Be a little more tolerant and scan
         // for the .bit wrapper if it is not exactly there.
         cf->kind = CORE_KIND_COR;
+        if (!parse_cor_header(cf)) { storage_close(&cf->file); return false; }
         if (!parse_xilinx_bit_at(cf, 4096)) {
             uint32_t bit_base = 0;
             if (!find_xilinx_bit_wrapper(cf, 0, 1024u * 1024u, &bit_base) ||

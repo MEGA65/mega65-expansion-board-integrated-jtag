@@ -15,14 +15,44 @@
 // CMake enables pico_stdio_usb(); this switch controls the command parser use.
 #define M65_ENABLE_USB_CDC   1
 
-// Suggested SPI pins for microSD. Your board can override these here.
-#define M65_SD_SPI_ID        spi0
-#define M65_SD_SCK_PIN       2u
-#define M65_SD_MOSI_PIN      3u
-#define M65_SD_MISO_PIN      4u
-#define M65_SD_CS_PIN        5u
-// #define M65_SD_SPI_BAUD      12500000u
-#define M65_SD_SPI_BAUD      33000000u
+// WiFi remote delivery is only built for Pico W-class boards when enabled in
+// CMake. Runtime enablement still requires /REMOTE_ENABLE.cfg on the SD card.
+#ifndef M65_WIFI_SUPPORTED
+#define M65_WIFI_SUPPORTED   0
+#endif
+
+// SD transport runtime policy. Both layouts are built into the firmware:
+//   M65_SD_MODE_HW_SPI             = legal RP2040 hardware-SPI pinout
+//   M65_SD_MODE_SCHEMATIC_BITBANG  = first fabbed schematic pinout
+// AUTO probes schematic-bitbang first, then hardware SPI. Use the `D` command
+// before mounting SD to override the detected/default mode at runtime.
+#define M65_SD_MODE_AUTO                 0
+#define M65_SD_MODE_HW_SPI               1
+#define M65_SD_MODE_SCHEMATIC_BITBANG    2
+#ifndef M65_SD_MODE
+#define M65_SD_MODE                      M65_SD_MODE_AUTO
+#endif
+#define M65_SD_AUTO_FALLBACK_MODE        M65_SD_MODE_SCHEMATIC_BITBANG
+
+#define M65_SD_HW_SPI_ID        spi0
+#define M65_SD_HW_SCK_PIN       2u
+#define M65_SD_HW_MOSI_PIN      3u
+#define M65_SD_HW_MISO_PIN      4u
+#define M65_SD_HW_CS_PIN        5u
+
+#define M65_SD_SOFT_SCK_PIN     4u
+#define M65_SD_SOFT_MOSI_PIN    3u
+#define M65_SD_SOFT_MISO_PIN    5u
+#define M65_SD_SOFT_CS_PIN      2u
+
+#define M65_SD_SPI_ID           M65_SD_HW_SPI_ID
+#define M65_SD_SCK_PIN          M65_SD_SOFT_SCK_PIN
+#define M65_SD_MOSI_PIN         M65_SD_SOFT_MOSI_PIN
+#define M65_SD_MISO_PIN         M65_SD_SOFT_MISO_PIN
+#define M65_SD_CS_PIN           M65_SD_SOFT_CS_PIN
+#define M65_SD_SPI_BAUD      12500000u
+#define M65_SD_BITBANG_LOW_HALF_PERIOD_US 2u
+#define M65_SD_BITBANG_FAST_DELAY_LOOPS   0u
 
 // Pico-side JTAG pins.
 #define M65_JTAG_TCK_PIN     6u
@@ -34,11 +64,22 @@
 #define M65_JTAG_HIJACK_PIN  10u
 #define M65_JTAG_HIJACK_ACTIVE_HIGH 1
 
-// Optional status pins. Set to 255 to disable if not wired.
-#define M65_JTAG_DONE_PIN    255u
-#define M65_JTAG_INIT_B_PIN  255u
+// Physical write-enable authority input. Default wiring is a momentary button
+// or removable jumper from GP11 to GND; the internal pull-up makes open = off.
+// If this is 255, destructive SD write commands are disabled.
+#define M65_WRITE_ENABLE_PIN             11u
+#define M65_WRITE_ENABLE_ACTIVE_LOW      1
+#define M65_WRITE_ENABLE_TIMEOUT_MS      120000u
+#define M65_WRITE_COMMANDS_USB_ONLY      1
+#define M65_STREAM_COMMANDS_USB_ONLY     1
 
+#ifndef M65_LED_PIN
+#ifdef PICO_DEFAULT_LED_PIN
 #define M65_LED_PIN          PICO_DEFAULT_LED_PIN
+#else
+#define M65_LED_PIN          255u
+#endif
+#endif
 
 // Conservative default. Set to 0 for fastest CPU bit-bang.
 // This is a loop count, not an exact frequency. Use a scope and tune it.
@@ -52,4 +93,4 @@
 #define M65_JTAG_POST_BYPASS_IDLE_CLOCKS     1024u
 #define M65_JTAG_POST_TAP_RESET_IDLE_CLOCKS  1024u
 
-#define M65_VERSION_STRING   "pico-m65jtag 1.2-xstatus"
+#define M65_VERSION_STRING   "pico-m65jtag 1.4-sd-transport"

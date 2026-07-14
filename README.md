@@ -20,10 +20,10 @@ Edit `include/config.h` for your board. See also `PINOUT.md` for the TE0790/XMOD
 GP0   UART TX, normally to TE0790/XMOD J2 B
 GP1   UART RX, normally to TE0790/XMOD J2 A
 
-GP2   SD SCK
+GP2   SD CS
 GP3   SD MOSI
-GP4   SD MISO
-GP5   SD CS
+GP4   SD SCK
+GP5   SD MISO
 
 GP6   JTAG TCK, normally to TE0790/XMOD J2 C through hijack switch
 GP7   JTAG TMS, normally to TE0790/XMOD J2 H through hijack switch
@@ -31,13 +31,15 @@ GP8   JTAG TDI, normally to TE0790/XMOD J2 F through hijack switch
 GP9   JTAG TDO, normally to TE0790/XMOD J2 D; listen-only/shared is usually OK
 
 GP10  JTAG_HIJACK, active high by default
-GP11  DONE input, optional
-GP12  INIT_B input, optional
+GP11  WRITE_ENABLE, active-low physical write-authority button/jumper
+GP12  spare
 ```
 
-TDO does not normally need switching: it is target-driven and both the Pico and
-TE0790 can listen as inputs. The hijack switch should arbitrate TCK/TMS/TDI and
-any other active control outputs.
+A 4-bit bus switch can arbitrate TCK/TMS/TDI/TDO cleanly. The switch should default to TE0790 passthrough when `JTAG_HIJACK` is inactive.
+
+The default SD transport is `AUTO`: the firmware probes the first fabbed
+schematic pinout with bit-banged SPI, then the corrected hardware-SPI pinout.
+Use `D auto`, `D soft`, or `D hw` before mounting SD to force a mode at runtime.
 
 ## Build
 
@@ -53,7 +55,7 @@ The default build is now FatFs-enabled and will clone:
 - Raspberry Pi `pico-sdk` into `.deps/pico-sdk`
 - `carlk3/no-OS-FatFS-SD-SPI-RPi-Pico` into `third_party/no-OS-FatFS-SD-SPI-RPi-Pico`
 
-The important fix versus v0.2 is that this project now adds the FatFs backend
+This project adds the FatFs backend
 from the repository's `FatFs_SPI/` subdirectory. The repo root itself does not
 have a `CMakeLists.txt`.
 
@@ -117,8 +119,17 @@ Replies are currently broadcast to both ports. This is intentional and keeps MEG
 V                         version
 L [path]                  list .BIT/.COR/.M65J files and dirs
 I <file>                  inspect core file
-P <file>                  hijack JTAG and program core
+T <file>                  SD read-speed test; read payload and discard
+P <file>                  hijack JTAG and program existing SD core
+S <length> <idcode>        stream raw payload over serial; USB-only by default
+N <length>                 serial receive/discard speed test
+W <file> <length>          write a core file to SD; USB + physical WE required by default
+F <url> <name>             fetch http:// URL into DOWNLOADS/<name>
+R <name>                   read DOWNLOADS/<name> as raw bytes
+A                         show physical write-authority status
+D [auto|hw|soft]          show/set SD transport before mount
 J                         read JTAG IDCODE, using hijack
+X                         read Xilinx BOOTSTS/STAT/BYPASS via CFG_OUT
 H 1|0                     manually assert/release JTAG hijack
 M                         mount/remount SD card
 ?                         help
@@ -202,3 +213,65 @@ a working MEGA65 core with a failing AExp/Amiga core.
 Caveat: the CFG_OUT readback path is still a first-cut single-device-chain
 implementation.  The raw values are diagnostic; if they look byte/bit-swapped,
 compare working-vs-failing runs rather than trusting the decoded fields yet.
+
+
+## v1.3 write-gate policy
+
+Normal operation treats the SD card as read-only: the loader opens existing core
+files for reading and can load them, but it does not write to the filesystem
+unless a guarded write command is accepted.
+
+The guarded file-write command is:
+
+```text
+W <file.bit|file.cor|file.m65j> <length>
+```
+
+Release defaults are deliberately conservative:
+
+```text
+M65_WRITE_ENABLE_PIN         GP11
+M65_WRITE_ENABLE_ACTIVE_LOW  1      # button/jumper to GND
+M65_WRITE_ENABLE_TIMEOUT_MS  120000 # 2 minute authority window
+M65_WRITE_COMMANDS_USB_ONLY  1      # MEGA65-side UART cannot write files
+M65_STREAM_COMMANDS_USB_ONLY 1      # MEGA65-side UART cannot stream arbitrary bitstreams
+```
+
+So the MEGA65-accessible UART can list and launch already-installed cores, but
+cannot persistently install new FPGA code. Users can either remove the SD card
+and copy files on a PC, or connect USB, assert the physical write-enable input,
+and upload with:
+
+```bash
+python3 tools/uart_client.py /dev/ttyACM0 write local-core.bit remote-core.bit
+```
+
+The upload is written to `remote-core.bit.tmp`, synced, then renamed into place
+after a complete transfer. Raw sector writes are intentionally not part of the
+release protocol.
+
+## Signed remote files and downloads
+
+Remote HTTP uploads and firmware-side URL fetches can require a signed trailer.
+The format is documented in [SIGNED_CORE_FORMAT.md](SIGNED_CORE_FORMAT.md).
+
+Use `tools/bless-core.py --keys` to list local public keys and print the
+`trusted_key=` lines to copy into `REMOTE_ENABLE.cfg`.
+
+Useful commands:
+
+```text
+F <http://url> <name>       fetch to DOWNLOADS/<name>
+R <name>                   read DOWNLOADS/<name>
+```
+
+`REMOTE_ENABLE.cfg` controls enforcement:
+
+```ini
+require_signatures=1
+trusted_key=p256:04...
+```
+
+When signatures are required, unsigned or badly signed uploads/fetches are
+deleted instead of being committed. `PUT /jtag` spools signed transfers to SD,
+verifies them, and only then programs JTAG.
