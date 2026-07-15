@@ -293,6 +293,11 @@ static const char default_top[] =
     "th{background:#1b2531;color:#fff}.start{display:inline-block;margin-right:10px;padding:5px 9px;background:#1e7a46;color:#fff;text-decoration:none}"
     ".core-name{font-weight:700}.meta{font-size:13px;color:#9fb0c3;margin-top:4px}.meta:empty{display:none}"
     "a{color:#63b3ff}.delete{color:#ff7b7b;background:none;border:0;padding:0;font:inherit;text-decoration:underline;cursor:pointer}"
+    ".launch-overlay{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;background:rgba(2,4,8,.82)}"
+    ".launch-overlay.active{display:flex}.launch-panel{width:min(680px,calc(100vw - 36px));padding:32px;background:#0e141c;border:2px solid #33445a;box-shadow:0 24px 80px rgba(0,0,0,.65)}"
+    ".launch-title{font-size:42px;font-weight:800;text-transform:uppercase;color:#fff}.launch-subtitle{margin-top:6px;color:#9fb0c3;font-size:16px}"
+    ".launch-progress{height:34px;margin-top:22px;overflow:hidden;background:#070a0f;border:1px solid #40536d}.launch-progress span{display:block;width:0;height:100%;background:repeating-linear-gradient(135deg,#1f7f4a 0,#1f7f4a 18px,#63b3ff 18px,#63b3ff 36px)}"
+    ".launch-overlay.failed .launch-progress span{background:repeating-linear-gradient(135deg,#a43838 0,#a43838 18px,#ff7b7b 18px,#ff7b7b 36px)}"
     "</style></head><body>"
     "<main><header><img src=\"/WWW/mega65_320x64.png\" alt=\"MEGA65\" width=\"320\" height=\"64\">"
     "<h1>Expansion Board Integrated JTAG</h1></header>"
@@ -305,10 +310,15 @@ static const char default_row[] =
     "<a class=\"core-name\" href=\"{PRIMARY_URL}\">{FILENAME}</a><div class=\"meta\">{CORE_META}</div></td>"
     "<td>{SIZE}</td><td>{ACTIONS}</td></tr>\n";
 static const char default_bottom[] =
-    "</tbody></table><script>"
+    "</tbody></table><div id=\"launchOverlay\" class=\"launch-overlay\" aria-live=\"polite\"><div class=\"launch-panel\">"
+    "<div class=\"launch-title\">Launching Core</div><div class=\"launch-subtitle\">Programming FPGA</div>"
+    "<div class=\"launch-progress\"><span id=\"launchProgress\"></span></div></div></div><script>"
+    "function showLaunchOverlay(){var o=document.getElementById('launchOverlay'),b=document.getElementById('launchProgress');if(!o||!b)return;o.classList.add('active');b.style.transition='none';b.style.width='0%';b.offsetHeight;b.style.transition='width 10s linear';b.style.width='100%';}"
+    "function launchCore(u){showLaunchOverlay();fetch(u,{method:'GET',cache:'no-store'}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||r.status);location.reload();});}).catch(function(e){var o=document.getElementById('launchOverlay');if(o)o.classList.add('failed');alert('Launch failed: '+e.message);location.reload();});}"
     "function deleteCore(u,n){if(!confirm('Delete '+n+'?'))return;"
     "fetch(u,{method:'PUT',cache:'no-store'}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||r.status);location.reload();});})"
     ".catch(function(e){alert('Delete failed: '+e.message);});}"
+    "document.addEventListener('click',function(e){var a=e.target.closest?e.target.closest('a[href]'):null;if(!a)return;var u=new URL(a.href,window.location.href);if(u.pathname!='/jtag')return;e.preventDefault();launchCore(u.pathname+u.search);});"
     "</script></main></body></html>\n";
 
 static bool has_core_ext(const char *name)
@@ -390,7 +400,25 @@ static bool path_has_ext(const char *path, const char *ext)
     return dot && ext_equal_ci(dot, ext);
 }
 
-static void format_core_meta_html(const char *path, char *out, size_t out_len)
+static void format_core_label_html(const char *path, const char *file_name, bool is_dir, char *out, size_t out_len)
+{
+    if (!out_len) return;
+    out[0] = 0;
+    if (!is_dir && path_has_ext(path, ".cor")) {
+        core_file_t cf;
+        if (core_open(&cf, path)) {
+            if (cf.title[0]) {
+                html_escape(cf.title, out, out_len);
+                core_close(&cf);
+                return;
+            }
+            core_close(&cf);
+        }
+    }
+    html_escape(file_name ? file_name : "", out, out_len);
+}
+
+static void format_core_meta_html(const char *path, const char *file_name, char *out, size_t out_len)
 {
     if (!out_len) return;
     out[0] = 0;
@@ -399,15 +427,15 @@ static void format_core_meta_html(const char *path, char *out, size_t out_len)
     core_file_t cf;
     if (!core_open(&cf, path)) return;
 
-    char title[64], version[64], model[64];
-    html_escape(cf.title, title, sizeof title);
+    char filename[256], version[64], model[64];
+    html_escape(file_name ? file_name : "", filename, sizeof filename);
     html_escape(cf.version, version, sizeof version);
     html_escape(cf.model, model, sizeof model);
 
     bool wrote = false;
     size_t pos = 0;
-    if (title[0]) {
-        int n = snprintf(out + pos, out_len - pos, "%s", title);
+    if (cf.title[0] && filename[0]) {
+        int n = snprintf(out + pos, out_len - pos, "%s", filename);
         if (n > 0) {
             pos += (size_t)n < out_len - pos ? (size_t)n : out_len - pos - 1u;
             wrote = true;
@@ -913,7 +941,7 @@ static void substitution_value(const char *name,
             snprintf(out, out_len, "");
         }
     } else if (ci_equal(name, "FILENAME")) {
-        html_escape(file_name ? file_name : "", out, out_len);
+        format_core_label_html(file_path, file_name, is_dir, out, out_len);
     } else if (ci_equal(name, "FILENAME_ESCAPED")) {
         html_escape(file_name ? file_name : "", out, out_len);
     } else if (ci_equal(name, "FILENAME_JS")) {
@@ -974,7 +1002,7 @@ static void substitution_value(const char *name,
         }
     } else if (ci_equal(name, "CORE_META")) {
         if (is_dir) snprintf(out, out_len, "");
-        else format_core_meta_html(file_path, out, out_len);
+        else format_core_meta_html(file_path, file_name, out, out_len);
     } else if (ci_equal(name, "PATH")) {
         snprintf(out, out_len, "%s", file_path ? file_path : "");
     } else if (ci_equal(name, "PATH_ESCAPED")) {

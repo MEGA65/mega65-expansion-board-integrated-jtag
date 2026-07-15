@@ -111,4 +111,4 @@
 #endif
 
 #define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG v0.1"
-#define M65_BUILD_MARKER     "web-ui-dark-delete-20260715"
+#define M65_BUILD_MARKER     "web-ui-launch-overlay-20260715"

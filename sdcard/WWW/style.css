@@ -127,6 +127,73 @@ a {
   cursor: pointer;
 }
 
+.launch-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(2, 4, 8, 0.82);
+}
+
+.launch-overlay.active {
+  display: flex;
+}
+
+.launch-panel {
+  width: min(680px, calc(100vw - 36px));
+  padding: 32px;
+  background: #0e141c;
+  border: 2px solid #33445a;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.65);
+}
+
+.launch-title {
+  font-size: 42px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  color: #ffffff;
+}
+
+.launch-subtitle {
+  margin-top: 6px;
+  color: #9fb0c3;
+  font-size: 16px;
+}
+
+.launch-progress {
+  height: 34px;
+  margin-top: 22px;
+  overflow: hidden;
+  background: #070a0f;
+  border: 1px solid #40536d;
+}
+
+.launch-progress span {
+  display: block;
+  width: 0%;
+  height: 100%;
+  background: repeating-linear-gradient(
+    135deg,
+    #1f7f4a 0,
+    #1f7f4a 18px,
+    #63b3ff 18px,
+    #63b3ff 36px
+  );
+}
+
+.launch-overlay.failed .launch-progress span {
+  background: repeating-linear-gradient(
+    135deg,
+    #a43838 0,
+    #a43838 18px,
+    #ff7b7b 18px,
+    #ff7b7b 36px
+  );
+}
+
 @media (max-width: 620px) {
   header {
     display: block;
@@ -135,5 +202,9 @@ a {
   header img {
     max-width: 100%;
     margin-bottom: 12px;
+  }
+
+  .launch-title {
+    font-size: 30px;
   }
 }
