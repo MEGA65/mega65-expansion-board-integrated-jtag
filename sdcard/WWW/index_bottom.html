@@ -4,7 +4,7 @@
   <div id="launchOverlay" class="launch-overlay" aria-live="polite">
     <div class="launch-panel">
       <div class="launch-title">Launching Core</div>
-      <div class="launch-subtitle">Programming FPGA</div>
+      <div class="launch-subtitle">Core injection in progress</div>
       <div class="launch-progress"><span id="launchProgress"></span></div>
     </div>
   </div>
@@ -13,6 +13,13 @@
       var overlay = document.getElementById('launchOverlay');
       var bar = document.getElementById('launchProgress');
       if (!overlay || !bar) return;
+      overlay.style.position = 'fixed';
+      overlay.style.inset = '0';
+      overlay.style.zIndex = '1000';
+      overlay.style.display = 'flex';
+      overlay.style.alignItems = 'center';
+      overlay.style.justifyContent = 'center';
+      overlay.style.background = 'radial-gradient(circle at 50% 44%, rgba(124, 8, 8, 0.38), rgba(2, 4, 8, 0.92) 58%), rgba(2, 4, 8, 0.88)';
       overlay.classList.add('active');
       bar.style.transition = 'none';
       bar.style.width = '0%';
@@ -21,21 +28,34 @@
       bar.style.width = '100%';
     }
 
+    function afterPaint(callback) {
+      if (window.requestAnimationFrame) {
+        requestAnimationFrame(function () {
+          setTimeout(callback, 60);
+        });
+      } else {
+        setTimeout(callback, 60);
+      }
+    }
+
     function launchCore(url) {
       showLaunchOverlay();
-      fetch(url, { method: 'GET', cache: 'no-store', headers: { 'Accept': 'text/plain' } })
-        .then(function (response) {
-          return response.text().then(function (text) {
-            if (!response.ok) throw new Error(text || response.status);
-            location.reload();
+      afterPaint(function () {
+        fetch(url, { method: 'GET', cache: 'no-store', headers: { 'Accept': 'text/plain' } })
+          .then(function (response) {
+            return response.text().then(function (text) {
+              if (!response.ok) throw new Error(text || response.status);
+              location.reload();
+            });
+          })
+          .catch(function (error) {
+            var overlay = document.getElementById('launchOverlay');
+            if (overlay) overlay.classList.add('failed');
+            setTimeout(function () {
+              location.reload();
+            }, 1200);
           });
-        })
-        .catch(function (error) {
-          var overlay = document.getElementById('launchOverlay');
-          if (overlay) overlay.classList.add('failed');
-          alert('Launch failed: ' + error.message);
-          location.reload();
-        });
+      });
     }
 
     function deleteCore(url, name) {
@@ -52,14 +72,21 @@
         });
     }
 
-    document.addEventListener('click', function (event) {
-      var link = event.target.closest ? event.target.closest('a[href]') : null;
-      if (!link) return;
-      var url = new URL(link.href, window.location.href);
-      if (url.pathname !== '/jtag') return;
-      event.preventDefault();
-      launchCore(url.pathname + url.search);
-    });
+    function launchTarget(link) {
+      var resolver = document.createElement('a');
+      resolver.href = link.href;
+      return {
+        path: resolver.pathname,
+        request: resolver.pathname + resolver.search
+      };
+    }
+
+    function launchCoreLink(link) {
+      var target = launchTarget(link);
+      if (target.path !== '/jtag') return true;
+      launchCore(target.request);
+      return false;
+    }
   </script>
 </body>
 </html>

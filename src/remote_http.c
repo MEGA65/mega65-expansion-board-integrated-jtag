@@ -35,8 +35,11 @@
 #ifndef M65_HTTP_IO_CHUNK
 #define M65_HTTP_IO_CHUNK 1024u
 #endif
-#ifndef M65_HTTP_TEMPLATE_MAX
-#define M65_HTTP_TEMPLATE_MAX 1536u
+#ifndef M65_HTTP_ROW_TEMPLATE_MAX
+#define M65_HTTP_ROW_TEMPLATE_MAX 1024u
+#endif
+#ifndef M65_HTTP_TEMPLATE_CHUNK
+#define M65_HTTP_TEMPLATE_CHUNK 128u
 #endif
 
 #if !M65_WIFI_SUPPORTED
@@ -135,6 +138,12 @@ typedef struct {
 } page_builder_t;
 
 typedef struct {
+    bool in_placeholder;
+    char name[48];
+    size_t name_len;
+} template_parser_t;
+
+typedef struct {
     page_builder_t *pb;
     const char *row_template;
     const char *dir_path;
@@ -215,9 +224,7 @@ static absolute_time_t wifi_poll_due;
 static int wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
 static char http_status_buf[128] = "wifi=inactive hardware=not-probed";
 static char page_buf[M65_HTTP_PAGE_MAX];
-static char top_template[M65_HTTP_TEMPLATE_MAX];
-static char row_template[M65_HTTP_TEMPLATE_MAX];
-static char bottom_template[M65_HTTP_TEMPLATE_MAX];
+static char row_template[M65_HTTP_ROW_TEMPLATE_MAX];
 static absolute_time_t next_autofetch_due;
 static bool autofetch_schedule_valid;
 static bool autofetch_running;
@@ -283,8 +290,6 @@ static const char default_top[] =
     "<style>"
     "body{font-family:Arial,sans-serif;margin:0;background:#0a0c10;color:#e8edf3}"
     "main{width:min(980px,calc(100vw - 32px));margin:24px auto}"
-    "header{display:flex;align-items:center;gap:18px;margin-bottom:18px}"
-    "header img{width:320px;max-width:44vw;height:auto}"
     "h1{font-size:24px;margin:0}.grant,.boards a,.boards span{background:#121821;border:1px solid #273142}"
     ".grant{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 16px;padding:12px 14px;border-left:5px solid #a43838}"
     ".grant-active{border-left-color:#2fa35b}.boards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}"
@@ -293,14 +298,8 @@ static const char default_top[] =
     "th{background:#1b2531;color:#fff}.start{display:inline-block;margin-right:10px;padding:5px 9px;background:#1e7a46;color:#fff;text-decoration:none}"
     ".core-name{font-weight:700}.meta{font-size:13px;color:#9fb0c3;margin-top:4px}.meta:empty{display:none}"
     "a{color:#63b3ff}.delete{color:#ff7b7b;background:none;border:0;padding:0;font:inherit;text-decoration:underline;cursor:pointer}"
-    ".launch-overlay{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;background:rgba(2,4,8,.82)}"
-    ".launch-overlay.active{display:flex}.launch-panel{width:min(680px,calc(100vw - 36px));padding:32px;background:#0e141c;border:2px solid #33445a;box-shadow:0 24px 80px rgba(0,0,0,.65)}"
-    ".launch-title{font-size:42px;font-weight:800;text-transform:uppercase;color:#fff}.launch-subtitle{margin-top:6px;color:#9fb0c3;font-size:16px}"
-    ".launch-progress{height:34px;margin-top:22px;overflow:hidden;background:#070a0f;border:1px solid #40536d}.launch-progress span{display:block;width:0;height:100%;background:repeating-linear-gradient(135deg,#1f7f4a 0,#1f7f4a 18px,#63b3ff 18px,#63b3ff 36px)}"
-    ".launch-overlay.failed .launch-progress span{background:repeating-linear-gradient(135deg,#a43838 0,#a43838 18px,#ff7b7b 18px,#ff7b7b 36px)}"
     "</style></head><body>"
-    "<main><header><img src=\"/WWW/mega65_320x64.png\" alt=\"MEGA65\" width=\"320\" height=\"64\">"
-    "<h1>Expansion Board Integrated JTAG</h1></header>"
+    "<main><h1>Expansion Board Integrated JTAG</h1>"
     "<section class=\"grant grant-{WRITE_GRANT_STATUS}\"><strong>Write grant:</strong> {WRITE_GRANT_STATUS} "
     "<span>{WRITE_GRANT_SECONDS}s remaining</span><span>Policy: {WRITE_GRANT_REQUIRED}</span></section>"
     "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a></nav>"
@@ -310,15 +309,9 @@ static const char default_row[] =
     "<a class=\"core-name\" href=\"{PRIMARY_URL}\">{FILENAME}</a><div class=\"meta\">{CORE_META}</div></td>"
     "<td>{SIZE}</td><td>{ACTIONS}</td></tr>\n";
 static const char default_bottom[] =
-    "</tbody></table><div id=\"launchOverlay\" class=\"launch-overlay\" aria-live=\"polite\"><div class=\"launch-panel\">"
-    "<div class=\"launch-title\">Launching Core</div><div class=\"launch-subtitle\">Programming FPGA</div>"
-    "<div class=\"launch-progress\"><span id=\"launchProgress\"></span></div></div></div><script>"
-    "function showLaunchOverlay(){var o=document.getElementById('launchOverlay'),b=document.getElementById('launchProgress');if(!o||!b)return;o.classList.add('active');b.style.transition='none';b.style.width='0%';b.offsetHeight;b.style.transition='width 10s linear';b.style.width='100%';}"
-    "function launchCore(u){showLaunchOverlay();fetch(u,{method:'GET',cache:'no-store',headers:{'Accept':'text/plain'}}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||r.status);location.reload();});}).catch(function(e){var o=document.getElementById('launchOverlay');if(o)o.classList.add('failed');alert('Launch failed: '+e.message);location.reload();});}"
-    "function deleteCore(u,n){if(!confirm('Delete '+n+'?'))return;"
-    "fetch(u,{method:'PUT',cache:'no-store'}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||r.status);location.reload();});})"
-    ".catch(function(e){alert('Delete failed: '+e.message);});}"
-    "document.addEventListener('click',function(e){var a=e.target.closest?e.target.closest('a[href]'):null;if(!a)return;var u=new URL(a.href,window.location.href);if(u.pathname!='/jtag')return;e.preventDefault();launchCore(u.pathname+u.search);});"
+    "</tbody></table><script>"
+    "function launchCoreLink(){return true;}"
+    "function deleteCore(){alert('Delete requires the WWW interface files on the SD card.');}"
     "</script></main></body></html>\n";
 
 static bool has_core_ext(const char *name)
@@ -1025,6 +1018,67 @@ static void substitution_value(const char *name,
     }
 }
 
+static bool template_placeholder_char(char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+static void template_flush_literal(page_builder_t *pb, template_parser_t *tp, const char *suffix, size_t suffix_len)
+{
+    page_append_n(pb, "{", 1);
+    page_append_n(pb, tp->name, tp->name_len);
+    if (suffix && suffix_len) page_append_n(pb, suffix, suffix_len);
+    tp->in_placeholder = false;
+    tp->name_len = 0;
+}
+
+static void template_feed_char(page_builder_t *pb,
+                               template_parser_t *tp,
+                               char ch,
+                               const char *file_name,
+                               const char *file_path,
+                               const char *dir_path,
+                               uint32_t size,
+                               bool is_dir,
+                               uint8_t board_rev)
+{
+    if (!tp->in_placeholder) {
+        if (ch == '{') {
+            tp->in_placeholder = true;
+            tp->name_len = 0;
+        } else {
+            page_append_n(pb, &ch, 1);
+        }
+        return;
+    }
+
+    if (ch == '}') {
+        if (tp->name_len == 0) {
+            template_flush_literal(pb, tp, "}", 1);
+            return;
+        }
+        tp->name[tp->name_len] = 0;
+        char value[320];
+        substitution_value(tp->name, file_name, file_path, dir_path, size, is_dir, board_rev, value, sizeof value);
+        page_append(pb, value);
+        tp->in_placeholder = false;
+        tp->name_len = 0;
+        return;
+    }
+
+    if (!template_placeholder_char(ch) || tp->name_len + 1u >= sizeof tp->name) {
+        template_flush_literal(pb, tp, &ch, 1);
+        return;
+    }
+
+    tp->name[tp->name_len++] = ch;
+}
+
+static void template_finish(page_builder_t *pb, template_parser_t *tp)
+{
+    if (tp->in_placeholder) template_flush_literal(pb, tp, NULL, 0);
+}
+
 static void append_substituted(page_builder_t *pb,
                                const char *tmpl,
                                const char *file_name,
@@ -1034,29 +1088,56 @@ static void append_substituted(page_builder_t *pb,
                                bool is_dir,
                                uint8_t board_rev)
 {
-    const char *p = tmpl;
-    while (p && *p) {
-        const char *open = strchr(p, '{');
-        if (!open) {
-            page_append(pb, p);
-            break;
-        }
-        page_append_n(pb, p, (size_t)(open - p));
-        const char *close = strchr(open + 1, '}');
-        if (!close) {
-            page_append(pb, open);
-            break;
-        }
-        char name[48];
-        size_t n = (size_t)(close - open - 1);
-        if (n >= sizeof name) n = sizeof name - 1u;
-        memcpy(name, open + 1, n);
-        name[n] = 0;
-        char value[320];
-        substitution_value(name, file_name, file_path, dir_path, size, is_dir, board_rev, value, sizeof value);
-        page_append(pb, value);
-        p = close + 1;
+    template_parser_t tp = {0};
+    for (const char *p = tmpl; p && *p; p++) {
+        template_feed_char(pb, &tp, *p, file_name, file_path, dir_path, size, is_dir, board_rev);
     }
+    template_finish(pb, &tp);
+}
+
+static bool append_substituted_file(page_builder_t *pb,
+                                    const char *path,
+                                    const char *file_name,
+                                    const char *file_path,
+                                    const char *dir_path,
+                                    uint32_t size,
+                                    bool is_dir,
+                                    uint8_t board_rev)
+{
+    storage_file_t f = {0};
+    if (!storage_open(&f, path)) return false;
+
+    template_parser_t tp = {0};
+    uint8_t chunk[M65_HTTP_TEMPLATE_CHUNK];
+    bool ok = true;
+    for (;;) {
+        size_t got = 0;
+        if (!storage_read(&f, chunk, sizeof chunk, &got)) {
+            ok = false;
+            break;
+        }
+        if (got == 0) break;
+        for (size_t i = 0; i < got; i++) {
+            template_feed_char(pb, &tp, (char)chunk[i], file_name, file_path, dir_path, size, is_dir, board_rev);
+        }
+    }
+    storage_close(&f);
+    if (ok) template_finish(pb, &tp);
+    return ok;
+}
+
+static void append_template_or_fallback(page_builder_t *pb,
+                                        const char *path,
+                                        const char *fallback,
+                                        const char *file_name,
+                                        const char *file_path,
+                                        const char *dir_path,
+                                        uint32_t size,
+                                        bool is_dir,
+                                        uint8_t board_rev)
+{
+    if (append_substituted_file(pb, path, file_name, file_path, dir_path, size, is_dir, board_rev)) return;
+    append_substituted(pb, fallback, file_name, file_path, dir_path, size, is_dir, board_rev);
 }
 
 static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
@@ -1299,13 +1380,11 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         return send_error(c, 400, "Bad Request", "unsafe index path");
     }
 
-    load_template("WWW/index_top.html", top_template, sizeof top_template, default_top);
     load_template("WWW/index_row.html", row_template, sizeof row_template, default_row);
-    load_template("WWW/index_bottom.html", bottom_template, sizeof bottom_template, default_bottom);
 
     page_builder_t pb = { .buf = page_buf, .cap = sizeof page_buf };
     page_buf[0] = 0;
-    append_substituted(&pb, top_template, NULL, NULL, dir_path, 0, false, board_rev);
+    append_template_or_fallback(&pb, "WWW/index_top.html", default_top, NULL, NULL, dir_path, 0, false, board_rev);
 
     index_list_ctx_t il = {
         .pb = &pb,
@@ -1319,7 +1398,7 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
     if (il.truncated) {
         page_append(&pb, "<tr><td colspan=\"3\">List truncated</td></tr>\n");
     }
-    append_substituted(&pb, bottom_template, NULL, NULL, dir_path, 0, false, board_rev);
+    append_template_or_fallback(&pb, "WWW/index_bottom.html", default_bottom, NULL, NULL, dir_path, 0, false, board_rev);
     return send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
 }
 
