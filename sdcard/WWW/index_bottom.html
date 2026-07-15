@@ -23,7 +23,7 @@
 
     function launchCore(url) {
       showLaunchOverlay();
-      fetch(url, { method: 'GET', cache: 'no-store' })
+      fetch(url, { method: 'GET', cache: 'no-store', headers: { 'Accept': 'text/plain' } })
         .then(function (response) {
           return response.text().then(function (text) {
             if (!response.ok) throw new Error(text || response.status);

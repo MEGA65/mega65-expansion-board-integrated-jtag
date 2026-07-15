@@ -314,7 +314,7 @@ static const char default_bottom[] =
     "<div class=\"launch-title\">Launching Core</div><div class=\"launch-subtitle\">Programming FPGA</div>"
     "<div class=\"launch-progress\"><span id=\"launchProgress\"></span></div></div></div><script>"
     "function showLaunchOverlay(){var o=document.getElementById('launchOverlay'),b=document.getElementById('launchProgress');if(!o||!b)return;o.classList.add('active');b.style.transition='none';b.style.width='0%';b.offsetHeight;b.style.transition='width 10s linear';b.style.width='100%';}"
-    "function launchCore(u){showLaunchOverlay();fetch(u,{method:'GET',cache:'no-store'}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||r.status);location.reload();});}).catch(function(e){var o=document.getElementById('launchOverlay');if(o)o.classList.add('failed');alert('Launch failed: '+e.message);location.reload();});}"
+    "function launchCore(u){showLaunchOverlay();fetch(u,{method:'GET',cache:'no-store',headers:{'Accept':'text/plain'}}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||r.status);location.reload();});}).catch(function(e){var o=document.getElementById('launchOverlay');if(o)o.classList.add('failed');alert('Launch failed: '+e.message);location.reload();});}"
     "function deleteCore(u,n){if(!confirm('Delete '+n+'?'))return;"
     "fetch(u,{method:'PUT',cache:'no-store'}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||r.status);location.reload();});})"
     ".catch(function(e){alert('Delete failed: '+e.message);});}"
@@ -788,6 +788,17 @@ static bool ci_equal_n(const char *a, const char *b, size_t n)
     return true;
 }
 
+static bool ci_contains_n(const char *haystack, size_t haystack_len, const char *needle)
+{
+    size_t needle_len = strlen(needle);
+    if (!needle_len) return true;
+    if (!haystack || haystack_len < needle_len) return false;
+    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
+        if (ci_equal_n(haystack + i, needle, needle_len)) return true;
+    }
+    return false;
+}
+
 static bool ci_equal(const char *a, const char *b)
 {
     while (*a && *b) {
@@ -1156,6 +1167,109 @@ static err_t send_error(http_conn_t *c, int code, const char *reason, const char
     return send_response(c, code, reason, "text/plain", body);
 }
 
+static bool request_wants_html(const http_conn_t *c)
+{
+    const char *accept = header_value(c->header, "Accept");
+    return accept && ci_contains_n(accept, header_value_len(accept), "text/html");
+}
+
+static bool safe_redirect_path(const char *path)
+{
+    if (!path || path[0] != '/') return false;
+    if (path[1] == '/') return false;
+    size_t n = strlen(path);
+    if (!n || n > 220) return false;
+    if (strstr(path, "..")) return false;
+    if (strcmp(path, "/") != 0) {
+        const char index_path[] = "/index.html";
+        size_t index_len = sizeof index_path - 1u;
+        if (!starts_with(path, index_path)) return false;
+        if (path[index_len] != 0 && path[index_len] != '?') return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)path[i];
+        if (c < 0x20 || c == 0x7f) return false;
+        if (c == '\\' || c == '"' || c == '\'' || c == '<' || c == '>') return false;
+    }
+    return true;
+}
+
+static bool copy_redirect_candidate(const char *value, size_t value_len, char *out, size_t out_len)
+{
+    if (!value || !out_len) return false;
+    while (value_len && isspace((unsigned char)*value)) {
+        value++;
+        value_len--;
+    }
+    while (value_len && isspace((unsigned char)value[value_len - 1])) value_len--;
+    if (!value_len || value_len >= 256) return false;
+
+    char tmp[256];
+    memcpy(tmp, value, value_len);
+    tmp[value_len] = 0;
+
+    const char *path = tmp;
+    const char *scheme = strstr(tmp, "://");
+    if (scheme) {
+        const char *host = scheme + 3;
+        path = strchr(host, '/');
+        if (!path) path = "/index.html";
+    } else if (tmp[0] != '/') {
+        return false;
+    }
+
+    if (!safe_redirect_path(path)) return false;
+    snprintf(out, out_len, "%s", path);
+    return true;
+}
+
+static void jtag_return_target(const http_conn_t *c, char *out, size_t out_len)
+{
+    if (!out_len) return;
+    snprintf(out, out_len, "/index.html");
+
+    char value[256];
+    if (parse_query_value(c->target, "return", value, sizeof value) &&
+        copy_redirect_candidate(value, strlen(value), out, out_len)) {
+        return;
+    }
+
+    const char *referer = header_value(c->header, "Referer");
+    (void)copy_redirect_candidate(referer, header_value_len(referer), out, out_len);
+}
+
+static err_t send_redirect(http_conn_t *c, const char *location)
+{
+    if (!safe_redirect_path(location)) location = "/index.html";
+
+    char escaped[256];
+    char body[384];
+    html_escape(location, escaped, sizeof escaped);
+    int body_n = snprintf(body, sizeof body,
+                          "<!doctype html><html><head><meta charset=\"utf-8\">"
+                          "<meta http-equiv=\"refresh\" content=\"0;url=%s\">"
+                          "<title>JTAG complete</title></head><body>"
+                          "JTAG complete. Returning to <a href=\"%s\">core list</a>."
+                          "</body></html>\n",
+                          escaped, escaped);
+    size_t body_len = body_n < 0 ? 0u : (body_n >= (int)sizeof body ? sizeof body - 1u : (size_t)body_n);
+
+    char header[512];
+    snprintf(header, sizeof header,
+             "HTTP/1.0 303 See Other\r\n"
+             "Connection: close\r\n"
+             "Location: %s\r\n"
+             "Content-Type: text/html; charset=utf-8\r\n"
+             "Content-Length: %lu\r\n"
+             "Cache-Control: no-store\r\n"
+             "\r\n",
+             location,
+             (unsigned long)body_len);
+    if (!tcp_write_copy(c, header, strlen(header))) return http_close(c);
+    if (!tcp_write_copy(c, body, body_len)) return http_close(c);
+    return http_close(c);
+}
+
 static bool check_perm(http_conn_t *c, remote_auth_perm_t perm)
 {
     return remote_auth_allowed(&http_cfg, c->remote_ip, perm);
@@ -1324,6 +1438,11 @@ static err_t program_file(http_conn_t *c, const char *path, uint8_t board_rev)
     bool ok = jtag_program_core(&cf, &opts);
     core_close(&cf);
     if (!ok) return send_error(c, 500, "Internal Server Error", jtag_last_error());
+    if (request_wants_html(c)) {
+        char target[256];
+        jtag_return_target(c, target, sizeof target);
+        return send_redirect(c, target);
+    }
     return send_response(c, 200, "OK", "text/plain", "OK JTAG DONE\n");
 }
 
