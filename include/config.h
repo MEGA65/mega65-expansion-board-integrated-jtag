@@ -83,7 +83,7 @@
 
 // Give USB CDC a chance to enumerate before SD-backed settings and WiFi
 // connection attempts can block boot progress.
-#define M65_REMOTE_INIT_DELAY_MS         15000u
+#define M65_REMOTE_INIT_DELAY_MS         2000u
 #define M65_WIFI_CONNECT_TIMEOUT_MS      5000u
 
 #ifndef M65_LED_PIN
