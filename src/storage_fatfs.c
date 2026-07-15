@@ -13,6 +13,9 @@
 // driver. The common carlk3/no-OS-FatFS-SD-SPI-RPi-Pico project provides ff.h,
 // diskio.h, and optionally sd_init_driver().
 #include "ff.h"
+#if __has_include("diskio.h")
+#include "diskio.h"
+#endif
 #if __has_include("sd_driver/sd_card.h")
 #include "sd_driver/sd_card.h"
 #endif
@@ -28,7 +31,21 @@ static bool mounted;
 
 static void set_err(const char *where, FRESULT fr)
 {
-    snprintf(last_err, sizeof(last_err), "%s: FatFs error %d", where, (int)fr);
+    snprintf(last_err, sizeof(last_err), "%s: FatFs error %d transport=%s",
+             where, (int)fr, storage_sd_transport_name());
+}
+
+static void reset_sd_driver_state(void)
+{
+#if __has_include("hw_config.h") && defined(STA_NOINIT)
+    for (size_t i = 0; i < sd_get_num(); ++i) {
+        sd_card_t *sd = sd_get_by_num(i);
+        if (sd) {
+            sd->m_Status |= STA_NOINIT;
+            sd->mounted = false;
+        }
+    }
+#endif
 }
 
 const char *storage_last_error(void)
@@ -50,6 +67,13 @@ bool storage_mount(void)
     }
 #endif
     FRESULT fr = f_mount(&fs, "", 1);
+    if (fr != FR_OK) {
+        f_unmount("");
+        reset_sd_driver_state();
+        storage_sd_probe();
+        sleep_ms(20);
+        fr = f_mount(&fs, "", 1);
+    }
     if (fr != FR_OK) { set_err("f_mount", fr); return false; }
     last_err[0] = 0;
     mounted = true;

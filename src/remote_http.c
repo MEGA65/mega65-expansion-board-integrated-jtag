@@ -20,6 +20,9 @@
 #ifndef M65_WIFI_CONNECT_TIMEOUT_MS
 #define M65_WIFI_CONNECT_TIMEOUT_MS 15000u
 #endif
+#ifndef M65_WIFI_RETRY_DELAY_MS
+#define M65_WIFI_RETRY_DELAY_MS 60000u
+#endif
 #ifndef M65_WIFI_HW_PROBE_WATCHDOG_MS
 #define M65_WIFI_HW_PROBE_WATCHDOG_MS 10000u
 #endif
@@ -30,7 +33,7 @@
 #define M65_HTTP_HEADER_MAX 1536u
 #endif
 #ifndef M65_HTTP_PAGE_MAX
-#define M65_HTTP_PAGE_MAX 8192u
+#define M65_HTTP_PAGE_MAX 65536u
 #endif
 #ifndef M65_HTTP_IO_CHUNK
 #define M65_HTTP_IO_CHUNK 1024u
@@ -40,6 +43,9 @@
 #endif
 #ifndef M65_HTTP_TEMPLATE_CHUNK
 #define M65_HTTP_TEMPLATE_CHUNK 128u
+#endif
+#ifndef M65_HTTP_INDEX_MAX_ROWS
+#define M65_HTTP_INDEX_MAX_ROWS 100u
 #endif
 
 #if !M65_WIFI_SUPPORTED
@@ -147,6 +153,7 @@ typedef struct {
     page_builder_t *pb;
     const char *row_template;
     const char *dir_path;
+    uint16_t rows;
     uint8_t board_rev;
     bool truncated;
 } index_list_ctx_t;
@@ -216,14 +223,15 @@ static bool remote_init_after_probe_pending;
 static uint32_t wifi_hardware_fault_stage;
 static uint32_t wifi_probe_attempts;
 static int wifi_init_rc = -9999;
-static char wifi_diag_buf[192];
+static char wifi_diag_buf[320];
 static wifi_assoc_state_t wifi_assoc_state = WIFI_ASSOC_OFF;
 static absolute_time_t wifi_assoc_deadline;
 static absolute_time_t wifi_assoc_retry_at;
+static absolute_time_t wifi_recover_at;
+static bool wifi_recover_scheduled;
 static absolute_time_t wifi_poll_due;
 static int wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
 static char http_status_buf[128] = "wifi=inactive hardware=not-probed";
-static char page_buf[M65_HTTP_PAGE_MAX];
 static char row_template[M65_HTTP_ROW_TEMPLATE_MAX];
 static absolute_time_t next_autofetch_due;
 static bool autofetch_schedule_valid;
@@ -283,6 +291,31 @@ static void wifi_hw_status_blocked(void)
     }
 }
 
+static uint32_t wifi_recover_seconds(void)
+{
+    if (!wifi_recover_scheduled) return 0u;
+    int64_t us = absolute_time_diff_us(get_absolute_time(), wifi_recover_at);
+    if (us <= 0) return 0u;
+    return (uint32_t)((us + 999999ll) / 1000000ll);
+}
+
+static void wifi_schedule_recover(const char *reason)
+{
+    wifi_assoc_state = WIFI_ASSOC_FAILED;
+    http_is_active = false;
+    wifi_recover_scheduled = true;
+    wifi_recover_at = make_timeout_time_ms(M65_WIFI_RETRY_DELAY_MS);
+    snprintf(http_status_buf, sizeof http_status_buf,
+             "wifi=retry reason=%s in=%lus",
+             reason ? reason : "unknown",
+             (unsigned long)(M65_WIFI_RETRY_DELAY_MS / 1000u));
+}
+
+static void wifi_clear_recover(void)
+{
+    wifi_recover_scheduled = false;
+}
+
 static const char default_top[] =
     "<!doctype html><html><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -305,7 +338,7 @@ static const char default_top[] =
     "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a></nav>"
     "<table><thead><tr><th>Core</th><th>Bytes</th><th>Actions</th></tr></thead><tbody>\n";
 static const char default_row[] =
-    "<tr><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
+    "<tr class=\"entry-row\" data-kind=\"{TYPE}\"><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
     "<a class=\"core-name\" href=\"{PRIMARY_URL}\">{FILENAME}</a><div class=\"meta\">{CORE_META}</div></td>"
     "<td>{SIZE}</td><td>{ACTIONS}</td></tr>\n";
 static const char default_bottom[] =
@@ -1148,6 +1181,10 @@ static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
         return;
     }
     if (is_dir && ci_equal(name, "WWW")) return;
+    if (il->rows >= M65_HTTP_INDEX_MAX_ROWS) {
+        il->truncated = true;
+        return;
+    }
 
     char full_path[256];
     if (!make_child_path(il->dir_path, name, full_path, sizeof full_path)) return;
@@ -1160,6 +1197,7 @@ static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
         if (!match) return;
     }
     append_substituted(il->pb, il->row_template, name, full_path, il->dir_path, size, is_dir, il->board_rev);
+    il->rows++;
 }
 
 static err_t http_close(http_conn_t *c)
@@ -1382,7 +1420,12 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
 
     load_template("WWW/index_row.html", row_template, sizeof row_template, default_row);
 
-    page_builder_t pb = { .buf = page_buf, .cap = sizeof page_buf };
+    char *page_buf = (char *)malloc(M65_HTTP_PAGE_MAX);
+    if (!page_buf) {
+        return send_error(c, 503, "Service Unavailable", "not enough memory to build index page");
+    }
+
+    page_builder_t pb = { .buf = page_buf, .cap = M65_HTTP_PAGE_MAX };
     page_buf[0] = 0;
     append_template_or_fallback(&pb, "WWW/index_top.html", default_top, NULL, NULL, dir_path, 0, false, board_rev);
 
@@ -1399,7 +1442,9 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         page_append(&pb, "<tr><td colspan=\"3\">List truncated</td></tr>\n");
     }
     append_template_or_fallback(&pb, "WWW/index_bottom.html", default_bottom, NULL, NULL, dir_path, 0, false, board_rev);
-    return send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
+    err_t ret = send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
+    free(page_buf);
+    return ret;
 }
 
 static err_t send_file_chunk(http_conn_t *c)
@@ -2748,9 +2793,7 @@ static const char *wifi_link_name(int status)
 static void remote_http_finish_wifi_join(void)
 {
     if (!listen_http(http_cfg.http_port)) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=http-listen-failed");
-        wifi_assoc_state = WIFI_ASSOC_FAILED;
-        http_is_active = false;
+        wifi_schedule_recover("http-listen-failed");
         return;
     }
 
@@ -2761,6 +2804,7 @@ static void remote_http_finish_wifi_join(void)
     snprintf(http_status_buf, sizeof http_status_buf, "wifi=up ip=%s port=%u", ip_text, (unsigned)http_cfg.http_port);
     http_is_active = true;
     wifi_assoc_state = WIFI_ASSOC_HTTP_ACTIVE;
+    wifi_clear_recover();
 }
 
 static void remote_http_poll_wifi_join(void)
@@ -2778,24 +2822,18 @@ static void remote_http_poll_wifi_join(void)
                                                    CYW43_AUTH_WPA2_AES_PSK);
             wifi_assoc_retry_at = make_timeout_time_ms(1000u);
             if (rc != 0) {
-                snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-retry-failed rc=%d", rc);
-                wifi_assoc_state = WIFI_ASSOC_FAILED;
-                http_is_active = false;
+                wifi_schedule_recover("connect-retry-failed");
                 return;
             }
         }
         status = CYW43_LINK_JOIN;
     } else if (status < 0) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-failed status=%s", wifi_link_name(status));
-        wifi_assoc_state = WIFI_ASSOC_FAILED;
-        http_is_active = false;
+        wifi_schedule_recover(wifi_link_name(status));
         return;
     }
 
     if (absolute_time_diff_us(get_absolute_time(), wifi_assoc_deadline) <= 0) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-timeout status=%s", wifi_link_name(status));
-        wifi_assoc_state = WIFI_ASSOC_FAILED;
-        http_is_active = false;
+        wifi_schedule_recover("connect-timeout");
         return;
     }
 
@@ -2811,6 +2849,7 @@ void remote_http_init(void)
     http_is_active = false;
     wifi_assoc_state = WIFI_ASSOC_OFF;
     wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
+    wifi_clear_recover();
 
     if (!cyw43_is_ready) {
         if (wifi_hardware_blocked) {
@@ -2824,7 +2863,7 @@ void remote_http_init(void)
     }
 
     if (!storage_mount()) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 remote=config-unavailable");
+        wifi_schedule_recover("config-unavailable");
         return;
     }
 
@@ -2856,8 +2895,7 @@ void remote_http_init(void)
     watchdog_disable();
     wifi_hw_probe_marker_clear();
     if (rc != 0) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=connect-start-failed rc=%d", rc);
-        wifi_assoc_state = WIFI_ASSOC_FAILED;
+        wifi_schedule_recover("connect-start-failed");
         return;
     }
 
@@ -2883,6 +2921,13 @@ void remote_http_poll(void)
     if (absolute_time_diff_us(now, wifi_poll_due) > 0) return;
     wifi_poll_due = delayed_by_us(now, M65_WIFI_POLL_INTERVAL_US);
     cyw43_arch_poll();
+    if (wifi_assoc_state == WIFI_ASSOC_FAILED && wifi_recover_scheduled &&
+        absolute_time_diff_us(now, wifi_recover_at) <= 0) {
+        wifi_recover_scheduled = false;
+        cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+        remote_http_init();
+        return;
+    }
     if (wifi_assoc_state == WIFI_ASSOC_CONNECTING) remote_http_poll_wifi_join();
 }
 
@@ -2906,7 +2951,7 @@ const char *remote_http_wifi_summary(void)
 const char *remote_http_wifi_diag(void)
 {
     snprintf(wifi_diag_buf, sizeof wifi_diag_buf,
-             "supported=1 board=%s ready=%lu blocked=%lu known_present=%lu pending=%lu remote_after_probe=%lu attempts=%lu init_rc=%d fault_stage=%s status=\"%s\"",
+             "supported=1 board=%s ready=%lu blocked=%lu known_present=%lu pending=%lu remote_after_probe=%lu attempts=%lu init_rc=%d fault_stage=%s retry=%lu retry_seconds=%lu status=\"%s\"",
              M65_PICO_BOARD_NAME,
              (unsigned long)(cyw43_is_ready ? 1u : 0u),
              (unsigned long)(wifi_hardware_blocked ? 1u : 0u),
@@ -2916,6 +2961,8 @@ const char *remote_http_wifi_diag(void)
              (unsigned long)wifi_probe_attempts,
              wifi_init_rc,
              wifi_hw_stage_name(wifi_hardware_fault_stage),
+             (unsigned long)(wifi_recover_scheduled ? 1u : 0u),
+             (unsigned long)wifi_recover_seconds(),
              http_status_buf);
     return wifi_diag_buf;
 }

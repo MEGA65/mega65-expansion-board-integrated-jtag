@@ -5,6 +5,7 @@
 
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
+#include "hardware/watchdog.h"
 
 #include "config.h"
 #include "uart_cmd.h"
@@ -502,7 +503,7 @@ static void cmd_help(void)
         "+HELP: ATS60?              seconds since last successful auto-fetch\n"
         "+HELP: ATS61?              auto-fetch running flag\n"
         "+HELP: AT&W                save AT settings to SD card\n"
-        "+HELP: ATZ                 reload saved AT settings\n"
+        "+HELP: ATZ                 soft reboot Pico and reload saved settings\n"
         "+HELP: AT+WRITEGRANT?      show write-authority status\n"
         "+HELP: AT+REMOTE?          show parsed REMOTE_ENABLE.cfg\n"
         "+HELP: AT+WIFI?            show live WiFi/HTTP status\n"
@@ -523,10 +524,10 @@ static void cmd_atw(void)
 
 static void cmd_atz(void)
 {
-    at_settings_reset_defaults();
-    at_settings_load();
-    command_mode = CMD_MODE_AT;
     at_ok();
+    sleep_ms(50);
+    watchdog_reboot(0, 0, 10);
+    for (;;) tight_loop_contents();
 }
 
 static void cmd_s_register(char *arg)
