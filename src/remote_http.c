@@ -73,6 +73,13 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
 }
 void remote_http_autofetch_reset_schedule(void) {}
 void remote_http_autofetch_cancel(const char *reason) { (void)reason; }
+bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
+{
+    (void)enabled_override;
+    (void)interval_hours_override;
+    (void)board_rev_override;
+    return false;
+}
 const char *remote_http_autofetch_status(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
 {
     (void)enabled_override;
@@ -207,6 +214,7 @@ typedef struct {
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len);
 static int find_header_end(const char *buf, size_t len, size_t *end_len);
 static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms);
+static bool autofetch_start_manifest(uint8_t board_rev);
 static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len);
 static err_t http_poll_cb(void *arg, struct tcp_pcb *pcb);
 static void html_escape(const char *in, char *out, size_t out_len);
@@ -989,7 +997,7 @@ static void substitution_value(const char *name,
         if (is_dir) snprintf(out, out_len, "-");
         else snprintf(out, out_len, "%lu", (unsigned long)size);
     } else if (ci_equal(name, "PRIMARY_LABEL")) {
-        snprintf(out, out_len, "%s", is_dir ? "Open" : "Start Core");
+        snprintf(out, out_len, "%s", is_dir ? "Open" : "Warp Core");
     } else if (ci_equal(name, "PRIMARY_URL")) {
         if (is_dir) {
             make_index_url(file_path, board_rev, out, out_len);
@@ -2400,6 +2408,28 @@ static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms)
 void remote_http_autofetch_cancel(const char *reason)
 {
     autofetch_cancel(reason ? reason : "operator activity", 900000u);
+}
+
+bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
+{
+    (void)enabled_override;
+    if (!http_is_active) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=blocked reason=wifi-http-inactive");
+        return false;
+    }
+    if (autofetch_running || autofetch_state != AUTOFETCH_IDLE) {
+        return false;
+    }
+
+    uint32_t interval_hours = effective_fetch_interval(interval_hours_override);
+    uint8_t board_rev = effective_fetch_board(board_rev_override);
+    http_cfg.fetch_interval_hours = interval_hours;
+    autofetch_schedule_valid = false;
+    if (!autofetch_start_manifest(board_rev)) {
+        autofetch_schedule_after(900000u);
+        return false;
+    }
+    return true;
 }
 
 static bool read_manifest_line(uint32_t *offset, char *line, size_t line_len, bool *eof)

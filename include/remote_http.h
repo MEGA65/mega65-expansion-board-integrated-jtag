@@ -16,6 +16,7 @@ bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err
 void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override);
 void remote_http_autofetch_reset_schedule(void);
 void remote_http_autofetch_cancel(const char *reason);
+bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override);
 const char *remote_http_autofetch_status(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override);
 uint32_t remote_http_autofetch_last_success_seconds(void);
 bool remote_http_autofetch_running(void);

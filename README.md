@@ -355,18 +355,22 @@ Firmware-side fetch support remains deliberately small:
 `fetch_channel`, `fetch_board=3|6`, and `autofetch=1` in `REMOTE_ENABLE.cfg`.
 For channel `stable` and board `6`, the firmware fetches
 `stable-r6.sha256`, verifies the signed manifest first, then fetches only
-changed signed core files listed in it. `AT+AUTOFETCH?` reports status,
-`AT+AUTOFETCH=0|1` overrides enablement, `AT+FETCHINTERVAL=<hours>` sets the
-interval with a minimum of 3 hours, `AT+FETCHBOARD=3|6|remote` selects the
-board-specific manifest, and `AT&W`/`ATZ` save/reload those AT settings from
-`AT_SETTINGS.cfg`. `ATS60?` reports seconds since the last successful
-auto-fetch and `ATS61?` reports the running flag.
+changed signed core files listed in it. `AT+FETCHSTATUS?` reports status
+without interrupting a running fetch, `AT+FETCHNOW[=3|6|remote]` starts a
+mirror fetch immediately, `AT+AUTOFETCH=0|1` overrides enablement,
+`AT+FETCHINTERVAL=<hours>` sets the interval with a minimum of 3 hours,
+`AT+FETCHBOARD=3|6|remote` selects the board-specific manifest, and
+`AT&W`/`ATZ` save/reload those AT settings from `AT_SETTINGS.cfg`. `ATS60?`
+reports seconds since the last successful auto-fetch and `ATS61?` reports the
+running flag.
 
 Useful commands:
 
 ```text
 AT+FETCH=<http://url> <name>       fetch to DOWNLOADS/<name>
 AT+DOWNLOADREAD=<name>             read DOWNLOADS/<name>
+AT+FETCHSTATUS?                    show mirror fetch status
+AT+FETCHNOW[=3|6|remote]           start mirror fetch immediately
 AT+FETCHBOARD=3|6|remote           select autofetch board manifest
 ```
 

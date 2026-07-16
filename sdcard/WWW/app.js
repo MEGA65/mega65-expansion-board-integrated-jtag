@@ -25,8 +25,8 @@
       overlay.setAttribute('aria-live', 'polite');
       overlay.innerHTML =
         '<div class="launch-panel">' +
-          '<div class="launch-title">Launching Core</div>' +
-          '<div class="launch-subtitle">Core injection in progress</div>' +
+          '<div class="launch-title">Warp Core</div>' +
+          '<div class="launch-subtitle">Beaming core down via JTAG...</div>' +
           '<div class="launch-progress"><span id="launchProgress"></span></div>' +
         '</div>';
       document.body.appendChild(overlay);

@@ -286,6 +286,48 @@ static bool parse_board_value(const char *s, uint8_t *out)
     return false;
 }
 
+static bool parse_fetch_board_or_remote(const char *s, uint8_t *out)
+{
+    if (!s || !out) return false;
+    if (ci_equal(s, "REMOTE") || ci_equal(s, "DEFAULT") || ci_equal(s, "AUTO")) {
+        *out = 0;
+        return true;
+    }
+    return parse_board_value(s, out);
+}
+
+static bool at_command_preserves_autofetch(const char *arg)
+{
+    char tmp[48];
+    arg = trim_line((char *)arg);
+    if (*arg == 0) return false;
+
+    if (toupper((unsigned char)arg[0]) == 'S') {
+        char *end = NULL;
+        unsigned long reg = strtoul(arg + 1, &end, 10);
+        return (reg == 60u || reg == 61u) && end && *end == '?' && end[1] == 0;
+    }
+
+    if (*arg != '+') return false;
+    arg++;
+    size_t n = 0;
+    while (arg[n] && arg[n] != '=' && arg[n] != '?' && !isspace((unsigned char)arg[n]) && n + 1 < sizeof tmp) {
+        tmp[n] = arg[n];
+        n++;
+    }
+    tmp[n] = 0;
+    bool query_only = arg[n] == '?' || arg[n] == 0;
+    if (!query_only && arg[n] != '=') return false;
+
+    if (ci_equal(tmp, "FETCHSTATUS") || ci_equal(tmp, "AUTOFETCHSTATUS") || ci_equal(tmp, "AFSTATUS")) return true;
+    if (ci_equal(tmp, "FETCHNOW") || ci_equal(tmp, "AUTOFETCHNOW") || ci_equal(tmp, "AFNOW")) return true;
+    if (query_only &&
+        (ci_equal(tmp, "AUTOFETCH") || ci_equal(tmp, "FETCHINTERVAL") || ci_equal(tmp, "FETCHBOARD"))) {
+        return true;
+    }
+    return false;
+}
+
 static void at_settings_reset_defaults(void)
 {
     at_settings.autofetch = -1;
@@ -498,6 +540,8 @@ static void cmd_help(void)
         "+HELP: AT+FETCH=url name   fetch http:// URL into DOWNLOADS/name\n"
         "+HELP: AT+DOWNLOADREAD=name read DOWNLOADS/name as raw bytes\n"
         "+HELP: AT+AUTOFETCH[=0|1]  show/set mirror auto-update enable\n"
+        "+HELP: AT+FETCHSTATUS?      show mirror auto-update/fetch status\n"
+        "+HELP: AT+FETCHNOW[=3|6|remote] fetch mirror manifest now\n"
         "+HELP: AT+FETCHINTERVAL[=hours] show/set auto-update interval; min 3\n"
         "+HELP: AT+FETCHBOARD[=3|6|remote] show/set auto-update board manifest\n"
         "+HELP: ATS60?              seconds since last successful auto-fetch\n"
@@ -693,9 +737,7 @@ static void cmd_fetch_board(char *arg, bool have_value)
 {
     if (have_value) {
         uint8_t board = 0;
-        if (ci_equal(arg, "REMOTE") || ci_equal(arg, "DEFAULT") || ci_equal(arg, "AUTO")) {
-            at_settings.fetch_board_rev = 0;
-        } else if (parse_board_value(arg, &board)) {
+        if (parse_fetch_board_or_remote(arg, &board)) {
             at_settings.fetch_board_rev = board;
         } else {
             at_error("FETCHBOARD EXPECTS 3, 6, R3, R6 OR REMOTE");
@@ -706,6 +748,41 @@ static void cmd_fetch_board(char *arg, bool have_value)
     uart_cmd_printf("OK FB override_board=%s %s\r\n",
                     at_settings.fetch_board_rev ? core_board_label(at_settings.fetch_board_rev) : "remote",
                     remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+}
+
+static void cmd_fetch_status(void)
+{
+    uart_cmd_printf("+FETCHSTATUS: %s\r\n",
+                    remote_http_autofetch_status(at_settings.autofetch,
+                                                 at_settings.fetch_interval_hours,
+                                                 at_settings.fetch_board_rev));
+    at_ok();
+}
+
+static void cmd_fetch_now(char *arg, bool have_value, bool query)
+{
+    if (query) {
+        cmd_fetch_status();
+        return;
+    }
+
+    uint8_t board = at_settings.fetch_board_rev;
+    if (have_value) {
+        if (!parse_fetch_board_or_remote(arg, &board)) {
+            at_error("FETCHNOW EXPECTS 3, 6, R3, R6 OR REMOTE");
+            return;
+        }
+    }
+
+    bool started = remote_http_autofetch_start_now(at_settings.autofetch,
+                                                  at_settings.fetch_interval_hours,
+                                                  board);
+    uart_cmd_printf("+FETCHNOW: started=%lu %s\r\n",
+                    (unsigned long)(started ? 1u : 0u),
+                    remote_http_autofetch_status(at_settings.autofetch,
+                                                 at_settings.fetch_interval_hours,
+                                                 board));
+    at_ok();
 }
 
 static void cmd_authority(void)
@@ -1583,6 +1660,10 @@ static void dispatch_at(char *arg)
         cmd_read_download(param);
     } else if (ci_equal(cmd, "AUTOFETCH")) {
         cmd_autofetch(param, value != NULL);
+    } else if (ci_equal(cmd, "FETCHSTATUS") || ci_equal(cmd, "AUTOFETCHSTATUS") || ci_equal(cmd, "AFSTATUS")) {
+        cmd_fetch_status();
+    } else if (ci_equal(cmd, "FETCHNOW") || ci_equal(cmd, "AUTOFETCHNOW") || ci_equal(cmd, "AFNOW")) {
+        cmd_fetch_now(param, value != NULL, query != NULL);
     } else if (ci_equal(cmd, "FETCHINTERVAL")) {
         cmd_fetch_interval(param, value != NULL);
     } else if (ci_equal(cmd, "FETCHBOARD")) {
@@ -1631,7 +1712,9 @@ static void dispatch(char *line)
     }
 
     if (ci_starts_with(s, "AT")) {
-        remote_http_autofetch_cancel("uart command");
+        if (!at_command_preserves_autofetch(s + 2)) {
+            remote_http_autofetch_cancel("uart command");
+        }
         dispatch_at(s + 2);
         return;
     }
