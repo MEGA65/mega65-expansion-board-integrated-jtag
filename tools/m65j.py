@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import concurrent.futures
 import hashlib
+import ipaddress
 import os
 import re
 import struct
@@ -88,6 +90,62 @@ def format_port_info(port):
     return " ".join(parts)
 
 
+IDENTITY_RE = re.compile(r"\br([036])\s*:\s*([A-Za-z0-9._-]+)\b", re.IGNORECASE)
+
+
+def parse_identity_text(text):
+    match = IDENTITY_RE.search(text or "")
+    if not match:
+        return None
+    board = f"r{match.group(1)}".lower()
+    name = match.group(2)
+    return {"identity": f"{board}:{name}", "board": board, "name": name}
+
+
+def identity_matches(identity, target):
+    if not identity or not target:
+        return False
+    target_l = target.lower()
+    if ":" in target_l:
+        return identity.get("identity", "").lower() == target_l
+    return identity.get("name", "").lower() == target_l
+
+
+def is_ip_literal(value):
+    try:
+        ipaddress.ip_address(str(value).strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def is_web_target_arg(value):
+    lower = str(value).lower()
+    return (
+        "://" in lower
+        or lower == "localhost"
+        or lower.startswith("[")
+        or is_ip_literal(value)
+        or ("." in lower and "/" not in lower and "\\" not in lower)
+    )
+
+
+def looks_like_machine_name(value):
+    text = str(value)
+    if not text or len(text) > 24:
+        return False
+    if "/" in text or "\\" in text or ":" in text:
+        return False
+    if is_web_target_arg(text) or is_serial_port_arg(text):
+        return False
+    return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", text) is not None
+
+
+def looks_like_machine_target(value):
+    text = str(value)
+    return looks_like_machine_name(text) or re.fullmatch(r"r[036]:[A-Za-z0-9][A-Za-z0-9._-]{0,23}", text, re.IGNORECASE) is not None
+
+
 def is_m65j_descriptor_port(port):
     text = port_info_text(port).lower()
     product = str(getattr(port, "product", "") or "").lower()
@@ -108,38 +166,77 @@ def is_pico_cdc_port(port):
     return "raspberry pi" in text and ("pico" in text or "board cdc" in text)
 
 
-def probe_m65j_port(serial, device, baud):
+def _serial_read_until_ok(ser, deadline):
+    lines = []
+    while time.monotonic() < deadline:
+        line = ser.readline()
+        if not line:
+            continue
+        text = line.decode("utf-8", "replace").strip()
+        if text:
+            lines.append(text)
+        if text == "OK" or text.startswith("ERR ") or text.startswith("ERROR:") or text == "NO CARRIER":
+            break
+    return lines
+
+
+def probe_m65j_port_identity(serial, device, baud):
     try:
         with serial.Serial(device, baud, timeout=0.08, write_timeout=0.25) as ser:
             time.sleep(0.05)
             ser.reset_input_buffer()
             ser.write(b"ATI\n")
             ser.flush()
-            deadline = time.monotonic() + 0.9
-            seen = []
-            while time.monotonic() < deadline:
-                line = ser.readline()
-                if not line:
-                    continue
-                text = line.decode("utf-8", "replace").strip()
-                if text:
-                    seen.append(text)
-                joined = "\n".join(seen)
-                if M65J_ATI_PREFIX in joined or "pico-m65jtag" in joined:
-                    return True
-                if text == "OK" and seen:
-                    break
+            seen = _serial_read_until_ok(ser, time.monotonic() + 0.9)
+            joined = "\n".join(seen)
+            if M65J_ATI_PREFIX not in joined and "pico-m65jtag" not in joined:
+                return None
+            identity = parse_identity_text(joined)
+            ser.reset_input_buffer()
+            ser.write(b"AT+MACHINE?\n")
+            ser.flush()
+            machine_lines = _serial_read_until_ok(ser, time.monotonic() + 0.8)
+            identity = parse_identity_text("\n".join(machine_lines)) or identity
+            return {
+                "kind": "serial",
+                "device": device,
+                "port": device,
+                "identity": identity["identity"] if identity else "",
+                "board": identity["board"] if identity else "r0",
+                "name": identity["name"] if identity else "",
+                "detail": joined,
+            }
     except (OSError, getattr(serial, "SerialException", OSError)):
-        return False
-    return False
+        return None
+
+
+def probe_m65j_port(serial, device, baud):
+    return probe_m65j_port_identity(serial, device, baud) is not None
+
+
+def usb_probe_candidates():
+    list_ports = load_list_ports_module()
+    ports = sorted(list_ports.comports(), key=lambda p: getattr(p, "device", ""))
+    descriptor_matches = [p for p in ports if is_m65j_descriptor_port(p)]
+    pico_matches = [p for p in ports if is_pico_cdc_port(p) and p not in descriptor_matches]
+    return descriptor_matches, pico_matches
+
+
+def discover_usb_machines(baud):
+    serial = load_serial_module()
+    descriptor_matches, pico_matches = usb_probe_candidates()
+    machines = []
+    for port in [*descriptor_matches, *pico_matches]:
+        info = probe_m65j_port_identity(serial, port.device, baud)
+        if info:
+            info["description"] = format_port_info(port)
+            machines.append(info)
+    return machines
 
 
 def autodetect_serial_port(baud):
     serial = load_serial_module()
-    list_ports = load_list_ports_module()
-    ports = sorted(list_ports.comports(), key=lambda p: getattr(p, "device", ""))
-    descriptor_matches = [p for p in ports if is_m65j_descriptor_port(p)]
-
+    descriptor_matches, pico_matches = usb_probe_candidates()
     if len(descriptor_matches) == 1:
         port = descriptor_matches[0]
         print(f"INFO: auto-detected MEGA65 JTAG serial device: {format_port_info(port)}", file=sys.stderr)
@@ -148,7 +245,7 @@ def autodetect_serial_port(baud):
         details = "\n  ".join(format_port_info(p) for p in descriptor_matches)
         raise SystemExit(f"Multiple MEGA65 JTAG serial devices found; pass -s/--device:\n  {details}")
 
-    candidates = [p for p in ports if is_pico_cdc_port(p)]
+    candidates = pico_matches
     if not candidates:
         return None
 
@@ -622,6 +719,172 @@ def normalize_device(device):
     return device
 
 
+def local_ipv4_addresses():
+    addrs = set()
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM)
+        for info in infos:
+            ip = info[4][0]
+            addr = ipaddress.ip_address(ip)
+            if not addr.is_loopback and not addr.is_link_local:
+                addrs.add(ip)
+    except OSError:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            addr = ipaddress.ip_address(ip)
+            if not addr.is_loopback and not addr.is_link_local:
+                addrs.add(ip)
+    except OSError:
+        pass
+
+    try:
+        p = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        for line in p.stdout.splitlines():
+            match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", line)
+            if match:
+                addrs.add(match.group(1))
+    except (OSError, ValueError):
+        pass
+
+    return sorted(addrs)
+
+
+def local_24_scan_hosts():
+    hosts = []
+    seen = set()
+    for ip in local_ipv4_addresses():
+        try:
+            network = ipaddress.ip_network(f"{ip}/24", strict=False)
+        except ValueError:
+            continue
+        for host in network.hosts():
+            text = str(host)
+            if text not in seen:
+                seen.add(text)
+                hosts.append(text)
+    return hosts
+
+
+def probe_http_identity(host, timeout=0.25):
+    try:
+        with socket.create_connection((host, 80), timeout=timeout) as s:
+            s.settimeout(timeout)
+            req = (
+                f"GET /identity HTTP/1.0\r\n"
+                f"Host: {host}\r\n"
+                "Connection: close\r\n"
+                "Accept: text/plain\r\n"
+                "\r\n"
+            ).encode("ascii")
+            s.sendall(req)
+            chunks = []
+            total = 0
+            while total < 2048:
+                chunk = s.recv(512)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+    except OSError:
+        return None
+
+    raw = b"".join(chunks).decode("utf-8", "replace")
+    if not raw.startswith("HTTP/"):
+        return None
+    status = raw.splitlines()[0] if raw else ""
+    if " 200 " not in status:
+        return None
+    body = raw.split("\r\n\r\n", 1)[-1].strip()
+    identity = parse_identity_text(body)
+    if not identity:
+        return None
+    return {
+        "kind": "web",
+        "device": f"http://{host}",
+        "url": f"http://{host}",
+        "identity": identity["identity"],
+        "board": identity["board"],
+        "name": identity["name"],
+        "description": f"http://{host}",
+    }
+
+
+def discover_web_machines(match_name=None):
+    hosts = local_24_scan_hosts()
+    if not hosts:
+        return []
+    machines = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
+        futures = {executor.submit(probe_http_identity, host): host for host in hosts}
+        for future in concurrent.futures.as_completed(futures):
+            info = future.result()
+            if not info:
+                continue
+            if match_name and not identity_matches(info, match_name):
+                continue
+            machines.append(info)
+    return sorted(machines, key=lambda m: (m.get("name", ""), m.get("device", "")))
+
+
+def resolve_machine_name(target, baud, quiet=False):
+    usb_matches = [m for m in discover_usb_machines(baud) if identity_matches(m, target)]
+    if len(usb_matches) == 1:
+        info = usb_matches[0]
+        if not quiet:
+            print(f"INFO: matched {target} on USB: {info.get('description', info['device'])}", file=sys.stderr)
+        return "serial", info["device"]
+    if len(usb_matches) > 1:
+        details = "\n  ".join(f"{m.get('identity') or 'r0:unnamed'} {m.get('description', m['device'])}" for m in usb_matches)
+        raise SystemExit(f"Multiple USB machines match {target}; use -s/--device:\n  {details}")
+
+    if not quiet:
+        print(f"INFO: no USB machine named {target}; scanning local /24 HTTP port 80", file=sys.stderr)
+    web_matches = discover_web_machines(target)
+    if len(web_matches) == 1:
+        info = web_matches[0]
+        if not quiet:
+            print(f"INFO: matched {target} on web: {info['url']}", file=sys.stderr)
+        return "web", info["url"]
+    if len(web_matches) > 1:
+        details = "\n  ".join(f"{m.get('identity')} {m.get('url')}" for m in web_matches)
+        raise SystemExit(f"Multiple web machines match {target}; pass a URL:\n  {details}")
+    raise SystemExit(f"No MEGA65 JTAG machine named {target} found on USB or local /24 HTTP")
+
+
+def resolve_target_arg(target, baud, quiet=False):
+    if is_serial_port_arg(target):
+        return "serial", target
+    if is_web_target_arg(target):
+        return "web", normalize_device(target)
+    if looks_like_machine_target(target):
+        return resolve_machine_name(target, baud, quiet=quiet)
+    return None, target
+
+
+def list_available_machines(baud):
+    rows = []
+    for info in discover_usb_machines(baud):
+        rows.append(("usb", info.get("identity") or "r0:unnamed", info.get("description", info["device"])))
+    for info in discover_web_machines():
+        rows.append(("web", info.get("identity") or "r0:unnamed", info.get("url", info["device"])))
+    if not rows:
+        print("No MEGA65 JTAG machines found on USB or local /24 HTTP.")
+        return 1
+    for kind, identity, where in sorted(rows, key=lambda r: (r[1].lower(), r[0], r[2])):
+        print(f"{kind:6} {identity:32} {where}")
+    return 0
+
+
 def read_client_config():
     cfg = {}
     for path in CONFIG_FILES:
@@ -652,13 +915,25 @@ def configured_serial_port(cfg=None):
     return None
 
 
+def configured_machine(cfg=None):
+    cfg = read_client_config() if cfg is None else cfg
+    for key in ("machine", "machine_name", "name", "target"):
+        value = cfg.get(key)
+        if value and looks_like_machine_target(value):
+            return value
+    value = cfg.get("device")
+    if value and looks_like_machine_target(value):
+        return value
+    return None
+
+
 def configured_device(cfg=None):
     if CLI_WEB_URL:
         return normalize_device(CLI_WEB_URL)
     cfg = read_client_config() if cfg is None else cfg
     device = cfg.get("url") or cfg.get("web_url") or cfg.get("http_url") or cfg.get("base_url")
     legacy_device = cfg.get("device")
-    if not device and legacy_device and not is_serial_port_arg(legacy_device):
+    if not device and legacy_device and not is_serial_port_arg(legacy_device) and not looks_like_machine_target(legacy_device):
         device = legacy_device
     if not device:
         ip = cfg.get("ip") or cfg.get("host")
@@ -1127,6 +1402,44 @@ def first_arg_is_device(args):
     return "." in value and "/" not in value and "\\" not in value
 
 
+def known_top_level_command(value):
+    lower = str(value).lower()
+    upper = str(value).upper()
+    if upper.startswith("AT") or upper == "GO64":
+        return True
+    if upper in {
+        "?", "V", "L", "LIST", "DIR", "LS", "LL", "DETAIL", "COREDETAIL",
+        "CORELS", "I", "T", "P", "LOAD", "PROGRAM", "JTAGLOAD", "S", "N",
+        "W", "F", "R", "A", "D", "J", "X", "H", "M", "STATUS", "VERSION",
+        "VER", "IDENTIFY", "ABOUT", "WIFI", "HTTP", "SDCARD", "SDSTATUS",
+        "MACHINE", "MACHINENAME", "IDENTITY",
+    }:
+        return True
+    return lower in {
+        "web", "net", "tcp", "status", "index", "home", "list", "ls", "cores",
+        "load", "program", "jtag-file", "jtagload", "get", "download",
+        "file-get", "downloads-get", "read-download", "download-get",
+        "mirror", "make-mirror", "populate", "populate-sd", "install-mirror",
+        "latest", "fetch-latest", "update-cores", "altcores", "keys",
+        "check", "verify", "blessedness", "curse-check", "bless", "sign",
+        "push", "jtag", "jtag-push", "store", "store-file", "http-store",
+        "put", "http-put", "signing", "stream", "push-local", "program-local",
+        "write", "upload", "install-file", "sink", "dummy", "rx-test",
+        "machine", "machines",
+    }
+
+
+def first_arg_is_target(args):
+    if not args:
+        return False
+    value = args[0]
+    if is_serial_port_arg(value) or is_web_target_arg(value):
+        return True
+    if looks_like_machine_target(value) and not known_top_level_command(value):
+        return True
+    return False
+
+
 def is_serial_port_arg(value):
     lower = str(value).lower()
     return (
@@ -1143,6 +1456,7 @@ def parse_leading_global_options(argv):
         "url": None,
         "baud": None,
         "timeout": None,
+        "list": False,
     }
     rest = []
     i = 0
@@ -1151,6 +1465,11 @@ def parse_leading_global_options(argv):
         if arg == "--":
             rest.extend(argv[i + 1:])
             break
+
+        if arg in {"-l", "--list-machines"}:
+            opts["list"] = True
+            i += 1
+            continue
 
         if arg in {"-s", "--device", "--serial", "--tty"}:
             if i + 1 >= len(argv):
@@ -1216,6 +1535,25 @@ def rewrite_command_first_serial(argv):
     return argv
 
 
+def rewrite_command_first_target(argv):
+    argv = rewrite_command_first_serial(argv)
+    if len(argv) < 2:
+        return argv
+    verb = argv[0].lower()
+    if verb in {
+        "load", "program", "jtagload",
+        "push", "jtag", "jtag-push",
+        "stream", "push-local", "program-local",
+        "store", "write", "upload", "install-file",
+        "sink", "dummy", "rx-test",
+        "status", "index", "home", "list", "ls", "cores",
+        "get", "download", "file-get", "downloads-get", "read-download",
+        "download-get",
+    } and first_arg_is_target([argv[1]]):
+        return [argv[1], argv[0], *argv[2:]]
+    return argv
+
+
 def serial_command_candidate(argv):
     if not argv:
         return False
@@ -1229,6 +1567,7 @@ def serial_command_candidate(argv):
         "CORELS", "I", "T", "P", "LOAD", "PROGRAM", "JTAGLOAD", "S", "N",
         "W", "F", "R", "A", "D", "J", "X", "H", "M", "STATUS", "VERSION",
         "VER", "IDENTIFY", "ABOUT", "WIFI", "HTTP", "SDCARD", "SDSTATUS",
+        "MACHINE", "MACHINENAME", "IDENTITY",
     }:
         return True
     return lower in {
@@ -1249,7 +1588,7 @@ def serial_preferred_even_with_web_config(argv):
         "?", "V", "L", "LIST", "DIR", "LS", "LL", "DETAIL", "COREDETAIL",
         "CORELS", "I", "T", "P", "S", "N", "W", "F", "R", "A", "D",
         "J", "X", "H", "M", "VERSION", "VER", "IDENTIFY", "ABOUT",
-        "WIFI", "HTTP", "SDCARD", "SDSTATUS",
+        "WIFI", "HTTP", "SDCARD", "SDSTATUS", "MACHINE", "MACHINENAME", "IDENTITY",
     }:
         return True
     return lower in {"stream", "sink", "dummy", "rx-test", "push-local", "program-local"}
@@ -1276,6 +1615,17 @@ def pop_optional_device(args):
 
 
 def route_web_command(verb, rest):
+    if verb in {"identity", "machine", "name"}:
+        device, rest = pop_optional_device(rest)
+        ap = argparse.ArgumentParser(prog=f"m65j.py {verb}")
+        ap.add_argument("--user")
+        ap.add_argument("--password")
+        args = ap.parse_args(rest)
+        user, password = config_auth(args.user, args.password)
+        body, _ = http_request(web_url(device, "/identity"), user, password)
+        print(body.decode("utf-8", "replace"), end="")
+        return 0
+
     if verb in {"status", "index", "home", "list", "ls", "cores"}:
         ap = argparse.ArgumentParser(prog=f"m65j.py {verb}")
         ap.add_argument("device", nargs="?")
@@ -1325,6 +1675,10 @@ def route_web_command(verb, rest):
 def route_at_over_web(argv):
     cmd = " ".join(argv).strip()
     upper = cmd.upper()
+    if upper.startswith("AT+MACHINE") or upper.startswith("AT+IDENTITY"):
+        body, _ = http_request(web_url(None, "/identity"))
+        print(body.decode("utf-8", "replace"), end="")
+        return 0
     if upper in {"AT", "ATI"} or upper.startswith(("AT+VERSION", "AT+CORELIST", "AT+HELP", "AT+WRITEGRANT", "AT+REMOTE")):
         return web_status()
     if upper.startswith("AT+JTAGLOAD="):
@@ -1350,6 +1704,9 @@ def route_remote_command(argv):
         if routed is not None:
             return routed
         return route_remote_command(rest)
+
+    if verb in {"machines", "list-machines", "discover"}:
+        return list_available_machines(2_000_000)
 
     routed = route_web_command(verb, rest)
     if routed is not None:
@@ -1410,6 +1767,21 @@ def route_remote_command(argv):
         return signing_main(rest)
 
     return None
+
+
+def command_can_use_default_target(argv):
+    if not argv:
+        return True
+    verb = argv[0].lower()
+    if serial_command_candidate(argv):
+        return True
+    return verb in {
+        "web", "net", "tcp", "status", "index", "home", "list", "ls", "cores",
+        "load", "program", "jtag-file", "jtagload", "get", "download",
+        "file-get", "downloads-get", "read-download", "download-get",
+        "push", "jtag", "jtag-push", "store", "store-file", "http-store",
+        "put", "http-put", "populate", "populate-sd", "install-mirror",
+    }
 
 
 def read_exact(f, n):
@@ -1500,7 +1872,8 @@ def read_response_lines(ser, cmd, timeout):
                 "I", "VERSION", "VER", "COREINFO", "CORE", "INFO",
                 "WRITEGRANT", "AUTH", "SDMODE", "JTAGID", "JTAGSTATUS",
                 "XSTATUS", "HIJACK", "MOUNT", "WIFI", "HTTP",
-                "SDCARD", "SDSTATUS",
+                "SDCARD", "SDSTATUS", "MACHINE", "MACHINENAME", "NAME",
+                "IDENTITY",
             }
         return command[:1].upper() in {"V", "I", "J", "H", "M", "A", "X", "D"}
 
@@ -1738,6 +2111,8 @@ def translate_manual_command(parts):
         return f"AT+{upper}?"
     if upper in {"SDCARD", "SDSTATUS"}:
         return "AT+SDCARD?"
+    if upper in {"MACHINE", "MACHINENAME", "IDENTITY"}:
+        return f"AT+MACHINE={rest}" if rest else "AT+MACHINE?"
     if upper in {"IDENTIFY", "ABOUT"}:
         return "ATI"
     if upper in {"L", "LIST", "DIR"}:
@@ -1849,16 +2224,36 @@ def main(argv=None):
     baud = global_opts["baud"] if global_opts["baud"] is not None else 2_000_000
     timeout = global_opts["timeout"] if global_opts["timeout"] is not None else 5.0
 
-    argv = rewrite_command_first_serial(argv)
+    if global_opts["list"]:
+        return list_available_machines(baud)
+
+    argv = rewrite_command_first_target(argv)
+    cfg = read_client_config()
 
     serial_port = None
     if CLI_SERIAL_DEVICE:
         serial_port = CLI_SERIAL_DEVICE
-    elif argv and is_serial_port_arg(argv[0]):
-        serial_port = argv[0]
+    elif CLI_WEB_URL:
+        kind, value = resolve_target_arg(CLI_WEB_URL, baud)
+        if kind == "serial":
+            serial_port = value
+        elif kind == "web":
+            CLI_WEB_URL = value
+    elif argv and first_arg_is_target(argv):
+        kind, value = resolve_target_arg(argv[0], baud)
         argv = argv[1:]
-    elif not argv and not CLI_WEB_URL and configured_device() is None:
-        serial_port = configured_serial_port() or autodetect_serial_port(baud)
+        if kind == "serial":
+            serial_port = value
+        elif kind == "web":
+            CLI_WEB_URL = value
+    elif configured_machine(cfg) and configured_device(cfg) is None and configured_serial_port(cfg) is None and command_can_use_default_target(argv):
+        kind, value = resolve_target_arg(configured_machine(cfg), baud)
+        if kind == "serial":
+            serial_port = value
+        elif kind == "web":
+            CLI_WEB_URL = value
+    elif not argv and not CLI_WEB_URL and configured_device(cfg) is None:
+        serial_port = configured_serial_port(cfg) or autodetect_serial_port(baud)
         if serial_port:
             argv = ["ATI"]
     else:
@@ -1880,6 +2275,9 @@ def main(argv=None):
         epilog=textwrap.dedent(
             """\
             Common commands:
+              m65j.py -l
+              m65j.py mymega list
+              m65j.py r6:mymega push core.bit --board 6
               m65j.py -s /dev/ttyACM0 ATI
               m65j.py -s /dev/ttyACM0 push local.bit
               m65j.py -u http://mega65-jtag.local status
@@ -1903,13 +2301,16 @@ def main(argv=None):
               m65j.py /dev/ttyACM0 stream local.bit
 
             Global target options may be placed before the command:
+              -l, --list-machines   list USB and local /24 HTTP machines
               -s, --device <tty>     serial TTY, e.g. /dev/ttyACM0
-              -u, --url <url>        board HTTP URL, e.g. http://mega65-jtag.local
+              -u, --url <url|name>   board HTTP URL, IP address, or machine name
 
             The client reads .m65j.config, then ~/.m65j.config.
             Use `serial=/dev/ttyACM0` for the USB TTY and `url=http://<pico-ip>`
-            or `ip=<pico-ip>` for the HTTP URL. If neither is configured, a
-            single connected MEGA65 JTAG Pico USB CDC device is auto-detected.
+            or `ip=<pico-ip>` for the HTTP URL. Use `machine=mymega` to resolve
+            by machine name, checking USB first and then local /24 HTTP. If no
+            target is configured, a single connected MEGA65 JTAG Pico USB CDC
+            device is auto-detected.
             """
         ),
     )
@@ -1918,10 +2319,13 @@ def main(argv=None):
     ap.add_argument("command", nargs=argparse.REMAINDER,
                     help="serial command to send, e.g. ATI, AT+JTAGID?, AT+JTAGLOAD=/core.bit, or stream local.bit")
     ap.add_argument("-s", "--device", "--serial", dest="serial_device", help="serial TTY, e.g. /dev/ttyACM0")
-    ap.add_argument("-u", "--url", dest="web_url", help="board HTTP URL, e.g. http://mega65-jtag.local")
+    ap.add_argument("-u", "--url", dest="web_url", help="board HTTP URL, IP address, or machine name")
+    ap.add_argument("-l", "--list-machines", action="store_true", help="list USB and local /24 HTTP machines")
     ap.add_argument("--baud", type=int, default=2_000_000)
     ap.add_argument("--timeout", type=float, default=5.0)
     args = ap.parse_args(argv)
+    if args.list_machines:
+        return list_available_machines(args.baud)
     if not args.command:
         ap.error("missing command")
     return run_serial_command(args.serial_device or args.port, args.command, args.baud, args.timeout)

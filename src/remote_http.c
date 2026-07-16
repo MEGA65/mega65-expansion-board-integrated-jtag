@@ -9,6 +9,7 @@
 #include "core_file.h"
 #include "core_filter.h"
 #include "jtag_gpio.h"
+#include "machine_identity.h"
 #include "remote_auth.h"
 #include "signed_file.h"
 #include "storage.h"
@@ -1294,6 +1295,15 @@ static err_t send_error(http_conn_t *c, int code, const char *reason, const char
     return send_response(c, code, reason, "text/plain", body);
 }
 
+static err_t send_identity(http_conn_t *c)
+{
+    char identity[48];
+    char body[56];
+    machine_identity_format(identity, sizeof identity);
+    snprintf(body, sizeof body, "%s\n", identity);
+    return send_response(c, 200, "OK", "text/plain", body);
+}
+
 static bool request_wants_html(const http_conn_t *c)
 {
     const char *accept = header_value(c->header, "Accept");
@@ -1815,6 +1825,18 @@ static err_t parse_headers(http_conn_t *c)
     if (sscanf(c->header, "%7s %255s %15s", c->method, c->target, version) != 3) {
         return send_error(c, 400, "Bad Request", "cannot parse request line");
     }
+
+    char target_path[256];
+    snprintf(target_path, sizeof target_path, "%s", c->target);
+    char *query = strchr(target_path, '?');
+    if (query) *query = 0;
+
+    if (ci_equal(c->method, "GET") &&
+        (ci_equal(target_path, "/identity") || ci_equal(target_path, "/id") ||
+         ci_equal(target_path, "/machine"))) {
+        return send_identity(c);
+    }
+
     if (!basic_auth_ok(c)) {
         const char body[] = "401 Unauthorized\n";
         const char header[] =
@@ -1831,11 +1853,6 @@ static err_t parse_headers(http_conn_t *c)
     c->content_length = 0;
     const char *cl = header_value(c->header, "Content-Length");
     if (cl) c->content_length = (uint32_t)strtoul(cl, NULL, 10);
-
-    char target_path[256];
-    snprintf(target_path, sizeof target_path, "%s", c->target);
-    char *query = strchr(target_path, '?');
-    if (query) *query = 0;
 
     if (ci_equal(c->method, "GET")) {
         if (ci_equal(target_path, "/") || ci_equal(target_path, "/index.html")) {
@@ -2901,6 +2918,10 @@ void remote_http_init(void)
     if (!remote_auth_load(&http_cfg, err, sizeof err)) {
         snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 remote=%s", err);
         return;
+    }
+    if (machine_identity_board_rev() == 0u &&
+        (http_cfg.fetch_board_rev == 3u || http_cfg.fetch_board_rev == 6u)) {
+        machine_identity_set_board_rev(http_cfg.fetch_board_rev);
     }
     if (!http_cfg.http_enabled) {
         snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 http=0");

@@ -158,6 +158,7 @@ AT+FETCHSTATUS?            show mirror auto-update/fetch status
 AT+FETCHNOW[=3|6|remote]   fetch mirror manifest now
 AT+FETCHINTERVAL[=hours]   show/set auto-update interval; min 3
 AT+FETCHBOARD=3|6|remote   select autofetch board manifest
+AT+MACHINE[=name]          show/set machine name; saved in AT_SETTINGS.cfg
 ATS60?                     seconds since last successful auto-fetch
 ATS61?                     auto-fetch running flag
 AT&W                       save AT settings to SD card
@@ -317,21 +318,26 @@ tools/m65j.py -s /dev/ttyACM0 push local.bit
 ```
 
 `tools/m65j.py` reads `.m65j.config` from the current directory first, then
-`~/.m65j.config`. Use `serial=` for the USB TTY and `url=` for the HTTP
-interface:
+`~/.m65j.config`. Use `serial=` for the USB TTY, `url=` for the HTTP
+interface, or `machine=` for a named board:
 
 ```ini
 serial=/dev/ttyACM0
 url=http://mega65-jtag.local
 # or:
 ip=192.168.1.65
+# or:
+machine=mymega
 ```
 
 With that in place, the target can be omitted. Raw AT-style and one-letter
 commands use the configured serial port; web commands use the configured URL:
 
 ```sh
+tools/m65j.py -l
 tools/m65j.py status
+tools/m65j.py mymega list
+tools/m65j.py r6:mymega push core.bit --board 6
 tools/m65j.py list --board 6
 tools/m65j.py check sdcard/cores
 tools/m65j.py push core.bit --board 6
@@ -342,11 +348,27 @@ tools/m65j.py mirror stable sdcard/cores --board all --overwrite --bless --yes
 tools/m65j.py populate stable --board all --overwrite --yes
 ```
 
-If neither `serial=` nor `url=`/`ip=` is configured and no `-s`/`-u` option is
-given, `m65j.py` auto-detects a single connected MEGA65 JTAG Pico USB CDC
-device. New firmware identifies itself to the host as product
-`MEGA65 Expansion Board Integrated JTAG`; older builds are recognised by a
-brief `ATI` probe on Raspberry Pi Pico CDC ports.
+`AT+MACHINE=name` accepts 1 to 24 ASCII letters, digits, dot, dash, or
+underscore. The value is saved to `AT_SETTINGS.cfg`, appears in `ATI` and
+`AT+VERSION?`, and is appended to the USB product string after USB
+re-enumerates. On boot, settings are loaded after the normal USB-safe delay and
+the firmware briefly reconnects USB if a saved machine name is present.
+
+If neither `serial=` nor `url=`/`ip=`/`machine=` is configured and no
+`-s`/`-u` option or machine-name target is given, `m65j.py` auto-detects a
+single connected MEGA65 JTAG Pico USB CDC device. New firmware identifies
+itself to the host as product `MEGA65 Expansion Board Integrated JTAG`
+optionally followed by the machine name; older builds are recognised by a brief
+`ATI` probe on Raspberry Pi Pico CDC ports. Machine-name targets check matching
+USB devices first, then scan port 80 on each local `/24` subnet for
+`GET /identity`. Use `m65j.py -l` to list discovered USB and HTTP machines.
+
+The HTTP identity endpoint is intentionally tiny and unauthenticated for
+discovery:
+
+```text
+GET /identity    returns r3:name, r6:name, or r0:name
+```
 
 `mirror` runs on the host and uses the alt-core/filehost downloader. Supply a
 release tag such as `stable`, `unstable`, or `nightly` as the first positional
@@ -396,6 +418,7 @@ AT+DOWNLOADREAD=<name>             read DOWNLOADS/<name>
 AT+FETCHSTATUS?                    show mirror fetch status
 AT+FETCHNOW[=3|6|remote]           start mirror fetch immediately
 AT+FETCHBOARD=3|6|remote           select autofetch board manifest
+AT+MACHINE[=name]                  show/set discovery machine name
 ```
 
 `REMOTE_ENABLE.cfg` controls enforcement:

@@ -29,9 +29,11 @@ add_executable(pico_m65jtag
     src/jtag_gpio.c
     src/core_file.c
     src/core_filter.c
+    src/machine_identity.c
     src/remote_auth.c
     src/remote_http.c
     src/signed_file.c
+    src/usb_descriptors.c
     src/write_gate.c
 )
 
@@ -47,6 +49,7 @@ target_compile_definitions(pico_m65jtag PRIVATE
     USBD_MANUFACTURER="MEGA65"
     USBD_PRODUCT="MEGA65 Expansion Board Integrated JTAG"
     USBD_DESC_STR_MAX=64
+    PICO_STDIO_USB_USE_DEFAULT_DESCRIPTORS=0
 )
 if(M65_SD_MODE)
     target_compile_definitions(pico_m65jtag PRIVATE M65_SD_MODE=${M65_SD_MODE})

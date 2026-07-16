@@ -111,4 +111,4 @@
 #endif
 
 #define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG v0.1"
-#define M65_BUILD_MARKER     "autofetch-now-status-20260715"
+#define M65_BUILD_MARKER     "machine-identity-20260716"

@@ -6,6 +6,7 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/watchdog.h"
+#include "tusb.h"
 
 #include "config.h"
 #include "uart_cmd.h"
@@ -13,6 +14,7 @@
 #include "core_file.h"
 #include "core_filter.h"
 #include "jtag_gpio.h"
+#include "machine_identity.h"
 #include "remote_auth.h"
 #include "remote_http.h"
 #include "write_gate.h"
@@ -44,6 +46,8 @@ typedef enum {
 } command_mode_t;
 
 static command_mode_t command_mode = CMD_MODE_AT;
+static bool usb_reconnect_pending = false;
+static absolute_time_t usb_reconnect_at;
 
 typedef struct {
     int autofetch; // -1 = use REMOTE_ENABLE.cfg default, 0 = off, 1 = on
@@ -61,6 +65,28 @@ static void progress_cb(uint32_t done, uint32_t total, void *ctx)
 {
     (void)ctx;
     uart_cmd_printf("PROG %lu/%lu\n", (unsigned long)done, (unsigned long)total);
+}
+
+static void usb_reconnect_schedule(void)
+{
+#if M65_ENABLE_USB_CDC
+    usb_reconnect_pending = true;
+    usb_reconnect_at = make_timeout_time_ms(250);
+#endif
+}
+
+static void usb_reconnect_poll(void)
+{
+#if M65_ENABLE_USB_CDC
+    if (!usb_reconnect_pending ||
+        absolute_time_diff_us(get_absolute_time(), usb_reconnect_at) > 0) {
+        return;
+    }
+    usb_reconnect_pending = false;
+    tud_disconnect();
+    sleep_ms(250);
+    tud_connect();
+#endif
 }
 
 static bool ensure_mount(void)
@@ -333,6 +359,8 @@ static void at_settings_reset_defaults(void)
     at_settings.autofetch = -1;
     at_settings.fetch_interval_hours = 0;
     at_settings.fetch_board_rev = 0;
+    machine_identity_set_name("");
+    machine_identity_set_board_rev(0);
     remote_http_autofetch_reset_schedule();
 }
 
@@ -383,10 +411,16 @@ static void at_settings_load(void)
                 } else if (parse_board_value(value, &board)) {
                     at_settings.fetch_board_rev = board;
                 }
+                machine_identity_set_board_rev(at_settings.fetch_board_rev);
+            } else if (ci_equal(key, "machine") || ci_equal(key, "machine_name") || ci_equal(key, "name")) {
+                if (machine_identity_valid_name(value)) {
+                    machine_identity_set_name(value);
+                }
             }
         }
         line = strtok_r(NULL, "\n", &save);
     }
+    machine_identity_set_board_rev(at_settings.fetch_board_rev);
     remote_http_autofetch_reset_schedule();
 }
 
@@ -402,11 +436,13 @@ static bool at_settings_save(void)
     int n = snprintf(buf, sizeof buf,
                      "autofetch=%s\n"
                      "fetch_interval_hours=%lu\n"
-                     "fetch_board=%s\n",
+                     "fetch_board=%s\n"
+                     "machine_name=%s\n",
                      at_settings.autofetch < 0 ? "remote" : (at_settings.autofetch ? "1" : "0"),
                      (unsigned long)(at_settings.fetch_interval_hours ? at_settings.fetch_interval_hours : 3u),
                      at_settings.fetch_board_rev == 3 ? "3" :
-                     at_settings.fetch_board_rev == 6 ? "6" : "remote");
+                     at_settings.fetch_board_rev == 6 ? "6" : "remote",
+                     machine_identity_name());
     size_t put = 0;
     bool ok = n > 0 && n < (int)sizeof buf &&
               storage_write(&f, buf, (size_t)n, &put) && put == (size_t)n &&
@@ -491,9 +527,13 @@ static const char *sdcard_state_token(sdcard_state_t state)
 
 static void cmd_ati(void)
 {
+    char identity[40];
+    machine_identity_format(identity, sizeof identity);
     uart_cmd_puts("MEGA65 Expansion Board Integrated JTAG v0.1\r\n");
     uart_cmd_puts("EXPERIMENTAL -- SUBJECT TO INTERFACE/API CHANGES\r\n");
     uart_cmd_printf("BUILD: %s\r\n", M65_BUILD_MARKER);
+    uart_cmd_printf("MACHINE: %s\r\n", machine_identity_name()[0] ? machine_identity_name() : "(unset)");
+    uart_cmd_printf("IDENTITY: %s\r\n", identity);
     uart_cmd_printf("SDCARD: %s\r\n", sdcard_state_human(sdcard_state()));
     uart_cmd_printf("WIFI: %s\r\n", remote_http_wifi_summary());
     at_ok();
@@ -544,6 +584,7 @@ static void cmd_help(void)
         "+HELP: AT+FETCHNOW[=3|6|remote] fetch mirror manifest now\n"
         "+HELP: AT+FETCHINTERVAL[=hours] show/set auto-update interval; min 3\n"
         "+HELP: AT+FETCHBOARD[=3|6|remote] show/set auto-update board manifest\n"
+        "+HELP: AT+MACHINE[=name]  show/set machine name; saved to SD card\n"
         "+HELP: ATS60?              seconds since last successful auto-fetch\n"
         "+HELP: ATS61?              auto-fetch running flag\n"
         "+HELP: AT&W                save AT settings to SD card\n"
@@ -599,8 +640,14 @@ static void cmd_s_register(char *arg)
 
 static void cmd_version(void)
 {
+    char identity[40];
+    machine_identity_format(identity, sizeof identity);
     uart_cmd_printf("+VERSION: firmware=\"%s\"\r\n", M65_VERSION_STRING);
     uart_cmd_printf("+VERSION: build=%s\r\n", M65_BUILD_MARKER);
+    uart_cmd_printf("+VERSION: identity=%s machine=%s board=%s\r\n",
+                    identity,
+                    machine_identity_name()[0] ? machine_identity_name() : "(unset)",
+                    machine_identity_board_token());
     uart_cmd_printf("+VERSION: source=%s\r\n", uart_cmd_source_name(uart_cmd_last_source()));
     uart_cmd_printf("+VERSION: sd_baud=%lu\r\n", (unsigned long)M65_SD_SPI_BAUD);
     uart_cmd_printf("+VERSION: sdcard=%s\r\n", sdcard_state_token(sdcard_state()));
@@ -739,6 +786,7 @@ static void cmd_fetch_board(char *arg, bool have_value)
         uint8_t board = 0;
         if (parse_fetch_board_or_remote(arg, &board)) {
             at_settings.fetch_board_rev = board;
+            machine_identity_set_board_rev(board);
         } else {
             at_error("FETCHBOARD EXPECTS 3, 6, R3, R6 OR REMOTE");
             return;
@@ -748,6 +796,35 @@ static void cmd_fetch_board(char *arg, bool have_value)
     uart_cmd_printf("OK FB override_board=%s %s\r\n",
                     at_settings.fetch_board_rev ? core_board_label(at_settings.fetch_board_rev) : "remote",
                     remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+}
+
+static void cmd_machine(char *arg, bool have_value)
+{
+    if (have_value) {
+        arg = trim_line(arg);
+        if (!arg[0] || ci_equal(arg, "NONE") || ci_equal(arg, "DEFAULT") || ci_equal(arg, "CLEAR")) {
+            machine_identity_set_name("");
+        } else if (machine_identity_valid_name(arg)) {
+            machine_identity_set_name(arg);
+        } else {
+            at_error("MACHINE NAME: USE 1-24 ASCII LETTERS, DIGITS, DOT, DASH OR UNDERSCORE");
+            return;
+        }
+        if (!at_settings_save()) return;
+    }
+
+    char identity[40];
+    machine_identity_format(identity, sizeof identity);
+    uart_cmd_printf("+MACHINE: identity=%s board=%s name=",
+                    identity,
+                    machine_identity_board_token());
+    uart_quoted(machine_identity_name());
+    uart_cmd_printf(" usb_product=");
+    uart_quoted(machine_identity_usb_product());
+    uart_cmd_printf(" usb_reenumerate_required=%lu\r\n",
+                    (unsigned long)(have_value ? 1u : 0u));
+    at_ok();
+    if (have_value) usb_reconnect_schedule();
 }
 
 static void cmd_fetch_status(void)
@@ -1668,6 +1745,9 @@ static void dispatch_at(char *arg)
         cmd_fetch_interval(param, value != NULL);
     } else if (ci_equal(cmd, "FETCHBOARD")) {
         cmd_fetch_board(param, value != NULL);
+    } else if (ci_equal(cmd, "MACHINE") || ci_equal(cmd, "MACHINENAME") ||
+               ci_equal(cmd, "NAME") || ci_equal(cmd, "IDENTITY")) {
+        cmd_machine(param, value != NULL);
     } else if (ci_equal(cmd, "WRITEGRANT") || ci_equal(cmd, "AUTH")) {
         cmd_authority();
     } else if (ci_equal(cmd, "REMOTE")) {
@@ -1733,6 +1813,7 @@ static void dispatch(char *line)
 
 int main(void)
 {
+    machine_identity_init_defaults();
     stdio_init_all();
     sleep_ms(200);
 
@@ -1760,6 +1841,7 @@ int main(void)
         if (!remote_init_done &&
             absolute_time_diff_us(get_absolute_time(), remote_init_at) <= 0) {
             at_settings_load();
+            if (machine_identity_name()[0]) usb_reconnect_schedule();
             remote_http_init();
             uart_cmd_printf("OK REMOTE %s\n", remote_http_status());
             remote_init_done = true;
@@ -1768,6 +1850,7 @@ int main(void)
         if (remote_init_done) {
             remote_http_autofetch_poll(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev);
         }
+        usb_reconnect_poll();
         tight_loop_contents();
     }
 }
