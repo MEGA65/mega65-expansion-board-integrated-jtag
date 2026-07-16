@@ -13,21 +13,23 @@ are the TE0790 J2/XMOD pin names from the standard XMOD firmware mapping.
 Treat this table as the preferred hardware-SPI-friendly wiring for new boards,
 not a frozen hardware interface. Check `include/config.h` before routing a PCB.
 
-| Pico GPIO | Firmware signal | Direction at Pico | Suggested target/socket connection |
-|---:|---|---|---|
-| GP0 | UART TX | output | J2 **B** / UART TXD output from adapter, to target RX |
-| GP1 | UART RX | input | J2 **A** / UART RXD input to adapter, from target TX |
-| GP2 | SD SCK | output | microSD SCK |
-| GP3 | SD MOSI | output | microSD MOSI / CMD in SPI mode |
-| GP4 | SD MISO | input | microSD MISO / DAT0 in SPI mode |
-| GP5 | SD CS | output | microSD CS |
-| GP6 | JTAG TCK | output | J2 **C** / TCK, through hijack switch |
-| GP7 | JTAG TMS | output | J2 **H** / TMS, through hijack switch |
-| GP8 | JTAG TDI | output | J2 **F** / TDI, through hijack switch |
-| GP9 | JTAG TDO | input | J2 **D** / TDO, through hijack switch if using a 4-bit mux |
-| GP10 | JTAG_HIJACK | output | control input of external JTAG mux/switch |
-| GP11 | WRITE_ENABLE | input | active-low physical write-authority button/jumper to GND |
-| GP12 | spare | input | unused by default |
+| Pico signal | Pico physical pin | Firmware signal | Direction at Pico | Suggested target/socket connection |
+|---|---:|---|---|---|
+| GP0 | 1 | UART TX | output | J2 **B** / UART TXD output from adapter, to target RX |
+| GP1 | 2 | UART RX | input | J2 **A** / UART RXD input to adapter, from target TX |
+| GP2 | 4 | SD SCK | output | microSD SCK |
+| GP3 | 5 | SD MOSI | output | microSD MOSI / CMD in SPI mode |
+| GP4 | 6 | SD MISO | input | microSD MISO / DAT0 in SPI mode |
+| GP5 | 7 | SD CS | output | microSD CS |
+| 3V3(OUT) | 36 | SD VCC | power | microSD VDD / 3.3 V supply |
+| GND | 8 | SD GND | power | microSD VSS / GND |
+| GP6 | 9 | JTAG TCK | output | J2 **C** / TCK, through hijack switch |
+| GP7 | 10 | JTAG TMS | output | J2 **H** / TMS, through hijack switch |
+| GP8 | 11 | JTAG TDI | output | J2 **F** / TDI, through hijack switch |
+| GP9 | 12 | JTAG TDO | input | J2 **D** / TDO, through hijack switch if using a 4-bit mux |
+| GP10 | 14 | JTAG_HIJACK | output | control input of external JTAG mux/switch |
+| GP11 | 15 | WRITE_ENABLE | input | active-low physical write-authority button/jumper to GND |
+| GP12 | 16 | spare | input | unused by default |
 
 This SD-card order matches RP2040 `spi0` pin functions, so it can use hardware
 SPI for the fast path.
@@ -36,21 +38,25 @@ SPI for the fast path.
 
 The more direct first-schematic wiring order was:
 
-| Pico GPIO | Firmware signal in software-SPI mode | Direction at Pico | Target/socket connection |
-|---:|---|---|---|
-| GP2 | SD CS | output | microSD CS |
-| GP3 | SD MOSI | output | microSD MOSI / CMD in SPI mode |
-| GP4 | SD SCK | output | microSD SCK |
-| GP5 | SD MISO | input | microSD MISO / DAT0 in SPI mode |
+| Pico signal | Pico physical pin | Firmware signal in software-SPI mode | Direction at Pico | Target/socket connection |
+|---|---:|---|---|---|
+| GP2 | 4 | SD CS | output | microSD CS |
+| GP3 | 5 | SD MOSI | output | microSD MOSI / CMD in SPI mode |
+| GP4 | 6 | SD SCK | output | microSD SCK |
+| GP5 | 7 | SD MISO | input | microSD MISO / DAT0 in SPI mode |
+| 3V3(OUT) | 36 | SD VCC | power | microSD VDD / 3.3 V supply |
+| GND | 8 | SD GND | power | microSD VSS / GND |
 
 That order is still supported for already-fabricated boards, but it requires
 the firmware's schematic/software SPI transport rather than RP2040 hardware SPI.
 Use `AT+SDMODE=soft` to force it, `AT+SDMODE=hw` to force the hardware-SPI
 layout above, or `AT+SDMODE=auto` to let firmware probe supported layouts.
 
-Also connect Pico GND to J2 pin **1/GND**. Do not power the Pico from arbitrary
-JTAG pins unless you have deliberately designed the power path. The Pico is 3.3 V
-only.
+Also connect Pico GND to J2 pin **1/GND**. Pico GND pin **8** is listed above
+because it is near the SD-card pins, but any Pico GND pin can be used where it
+is more convenient: pins **3**, **8**, **13**, **18**, **23**, **28**, or
+**38**. Do not power the Pico from arbitrary JTAG pins unless you have
+deliberately designed the power path. The Pico is 3.3 V only.
 
 ## Switching
 
