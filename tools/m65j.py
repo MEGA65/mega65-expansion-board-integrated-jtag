@@ -1875,7 +1875,7 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(
         usage="%(prog)s [-h] [-s TTY] [-u URL] [--baud BAUD] [--timeout TIMEOUT] [target-or-command] ...",
-        description="Single client for pico-m65jtag serial, signing, and HTTP/JTAG delivery",
+        description="MEGA65 Expansion Board Integrated JTAG firmware utility client (experimental v0.1)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """\

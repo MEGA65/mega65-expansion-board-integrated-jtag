@@ -1,10 +1,15 @@
-# Signed core file trailer
+# MEGA65 Expansion Board Integrated JTAG Signed Core Trailer
 
-This firmware supports a signed upload/fetch container for `.bit`, `.cor`, and
-`.m65j` files. The signature is a fixed 256-byte trailer appended to the bytes
-sent over HTTP or fetched from a URL. The firmware hashes the payload while it is
-receiving it, buffers the final trailer, verifies the signature, and writes only
-the payload bytes to the final SD-card file.
+**Status:** v0.1 experimental. This signed-file container, trailer layout,
+signature policy, key configuration, HTTP upload behaviour, and host utility
+commands are all still subject to change.
+
+The MEGA65 Expansion Board Integrated JTAG firmware currently supports a signed
+upload/fetch container for `.bit`, `.cor`, and `.m65j` files. The signature is a
+fixed 256-byte trailer appended to the bytes sent over HTTP or fetched from a
+URL. The firmware hashes the payload while it is receiving it, buffers the final
+trailer, verifies the signature, and writes only the payload bytes to the final
+SD-card file.
 
 The trailer is not required to be aligned. It is simply the final 256 bytes of a
 transfer. Because of this, signed HTTP PUT and firmware-side fetches require a

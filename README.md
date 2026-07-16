@@ -1,8 +1,14 @@
-# pico_m65jtag
+# MEGA65 Expansion Board Integrated JTAG Firmware & Utilities
 
-Minimal Pi Pico / RP2040 JTAG core loader for MEGA65-style Xilinx 7-series bitstreams.
+Experimental Pi Pico / RP2040 firmware and host utilities for SD-backed,
+UART/USB, and WiFi-assisted JTAG loading of MEGA65-style Xilinx 7-series
+bitstreams.
 
-This is the non-FPGA version of the tiny loader:
+**Status:** v0.1 experimental. The board wiring, pin assignments, AT/BASIC
+command protocol, HTTP endpoints, SD-card config files, signed-file container,
+and host utility command line are all still subject to change.
+
+Current major pieces:
 
 - 2 Mbps 8N1 command UART on GPIO pins
 - native Pico USB CDC command interface, no extra USB-UART adapter required
@@ -12,7 +18,11 @@ This is the non-FPGA version of the tiny loader:
 - GPIO-controlled JTAG hijack switch
 - CPU bit-banged JTAG first; PIO can come later after bring-up
 
-## Default pins
+## Default Pins
+
+These are the current firmware defaults, not a stable hardware interface.
+Check `include/config.h` and `PINOUT.md` before building hardware or wiring a
+new board.
 
 Edit `include/config.h` for your board. See also `PINOUT.md` for the TE0790/XMOD socket mapping.
 
@@ -39,7 +49,8 @@ A 4-bit bus switch can arbitrate TCK/TMS/TDI/TDO cleanly. The switch should defa
 
 The default SD transport is `AUTO`: the firmware probes the first fabbed
 schematic pinout with bit-banged SPI, then the corrected hardware-SPI pinout.
-Use `D auto`, `D soft`, or `D hw` before mounting SD to force a mode at runtime.
+Use `AT+SDMODE=auto`, `AT+SDMODE=soft`, or `AT+SDMODE=hw` before mounting SD to
+force a mode at runtime.
 
 ## Build
 
@@ -120,7 +131,11 @@ The same line-oriented ASCII protocol is accepted on both:
 
 Replies are currently broadcast to both ports. This is intentional and keeps MEGA65-side and PC-side control simple.
 
-## UART commands
+## UART Commands
+
+The command set is AT-style by default and remains experimental. Command names,
+responses, fields, and error text may change while the firmware and utilities
+are still at v0.1.
 
 ```text
 AT                         modem attention check
@@ -138,10 +153,19 @@ AT+TESTSINK=len            serial receive/discard speed test
 AT+FILEWRITE=file len      write a core file to SD; USB + physical WE required by default
 AT+FETCH=url name          fetch http:// URL into DOWNLOADS/name
 AT+DOWNLOADREAD=name       read DOWNLOADS/name as raw bytes
+AT+AUTOFETCH[=0|1]         show/set mirror auto-update enable
+AT+FETCHSTATUS?            show mirror auto-update/fetch status
+AT+FETCHNOW[=3|6|remote]   fetch mirror manifest now
+AT+FETCHINTERVAL[=hours]   show/set auto-update interval; min 3
 AT+FETCHBOARD=3|6|remote   select autofetch board manifest
+ATS60?                     seconds since last successful auto-fetch
+ATS61?                     auto-fetch running flag
+AT&W                       save AT settings to SD card
+ATZ                        soft reboot Pico and reload saved settings
 AT+WRITEGRANT?             show physical write-authority status
 AT+REMOTE?                 show parsed REMOTE_ENABLE.cfg
 AT+WIFI?                   show live WiFi/HTTP status
+AT+WIFIPROBE               retry CYW43 hardware probe now
 AT+SDCARD?                 show SD card media/mount status
 AT+SDMODE[=auto|hw|soft]   show/set SD transport before mount
 AT+JTAGID?                 read JTAG IDCODE, using hijack
@@ -252,7 +276,7 @@ The guarded file-write command is:
 AT+FILEWRITE=<file.bit|file.cor|file.m65j> <length>
 ```
 
-Release defaults are deliberately conservative:
+Current defaults are deliberately conservative:
 
 ```text
 M65_WRITE_ENABLE_PIN         GP11
@@ -273,7 +297,7 @@ python3 tools/m65j.py /dev/ttyACM0 write local-core.bit remote-core.bit
 
 The upload is written to `remote-core.bit.tmp`, synced, then renamed into place
 after a complete transfer. Raw sector writes are intentionally not part of the
-release protocol.
+current protocol.
 
 ## Signed remote files and downloads
 

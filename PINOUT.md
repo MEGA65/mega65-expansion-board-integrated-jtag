@@ -1,10 +1,17 @@
-# Pico to MEGA65 / TE0790-XMOD socket pinout
+# MEGA65 Expansion Board Integrated JTAG Firmware & Utilities Pinout
 
-This firmware assumes the Pico is pretending to be, or sitting alongside, the
-TE0790/XMOD connection. The target-side socket pin names below are the TE0790
-J2/XMOD pin names from the standard XMOD firmware mapping.
+**Status:** v0.1 experimental. The wiring, pin assignments, SD-card transport
+selection, JTAG hijack arrangement, and UART command/control protocol are all
+still subject to change.
 
-## Pico firmware pins
+This firmware currently assumes the Pico is pretending to be, or sitting
+alongside, the TE0790/XMOD connection. The target-side socket pin names below
+are the TE0790 J2/XMOD pin names from the standard XMOD firmware mapping.
+
+## Pico Firmware Pins
+
+Treat this table as the current firmware default, not a frozen hardware
+interface. Check `include/config.h` before routing a PCB.
 
 | Pico GPIO | Firmware signal | Direction at Pico | Suggested target/socket connection |
 |---:|---|---|---|
