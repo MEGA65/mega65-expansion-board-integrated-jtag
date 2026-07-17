@@ -998,7 +998,7 @@ static void substitution_value(const char *name,
         if (is_dir) snprintf(out, out_len, "-");
         else snprintf(out, out_len, "%lu", (unsigned long)size);
     } else if (ci_equal(name, "PRIMARY_LABEL")) {
-        snprintf(out, out_len, "%s", is_dir ? "Open" : "Warp Core");
+        snprintf(out, out_len, "%s", is_dir ? "Open" : "Launch Core");
     } else if (ci_equal(name, "PRIMARY_URL")) {
         if (is_dir) {
             make_index_url(file_path, board_rev, out, out_len);
