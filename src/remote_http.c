@@ -2,6 +2,7 @@
 #include "config.h"
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,9 @@
 void remote_http_init(void) {}
 void remote_http_boot_check(void) {}
 void remote_http_poll(void) {}
+void remote_http_defer_wifi_recovery(uint32_t quiet_ms) { (void)quiet_ms; }
+void remote_http_set_verbose(uint8_t level) { (void)level; }
+uint8_t remote_http_verbose(void) { return 0; }
 bool remote_http_active(void) { return false; }
 const char *remote_http_status(void) { return "wifi=not-supported"; }
 const char *remote_http_wifi_summary(void) { return "NO HARDWARE"; }
@@ -210,6 +214,7 @@ typedef struct {
     uint32_t body_done;
     signed_file_rx_t signed_rx;
     char err[128];
+    uint32_t last_progress_report;
 } fetch_ctx_t;
 
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len);
@@ -238,9 +243,12 @@ static absolute_time_t wifi_assoc_deadline;
 static absolute_time_t wifi_assoc_retry_at;
 static absolute_time_t wifi_recover_at;
 static bool wifi_recover_scheduled;
+static char wifi_recover_reason[40];
 static absolute_time_t wifi_poll_due;
 static int wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
 static char http_status_buf[128] = "wifi=inactive hardware=not-probed";
+static char last_wifi_log[128];
+static uint8_t remote_verbose = 1;
 static char row_template[M65_HTTP_ROW_TEMPLATE_MAX];
 static absolute_time_t next_autofetch_due;
 static bool autofetch_schedule_valid;
@@ -259,6 +267,36 @@ static char autofetch_channel[24];
 static char autofetch_pending_path[224];
 static char autofetch_pending_sha[65];
 static char autofetch_status_buf[192] = "autofetch=idle";
+
+static void remote_log(uint8_t level, const char *fmt, ...)
+{
+    if (remote_verbose < level) return;
+    char msg[384];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    uart_cmd_printf("%s\r\n", msg);
+}
+
+void remote_http_set_verbose(uint8_t level)
+{
+    if (level > 2u) level = 2u;
+    remote_verbose = level;
+}
+
+uint8_t remote_http_verbose(void)
+{
+    return remote_verbose;
+}
+
+static void remote_log_wifi_change(void)
+{
+    if (remote_verbose == 0) return;
+    if (strcmp(last_wifi_log, http_status_buf) == 0) return;
+    snprintf(last_wifi_log, sizeof last_wifi_log, "%s", http_status_buf);
+    remote_log(1, "+WIFI: %s", http_status_buf);
+}
 
 #define WIFI_HW_PROBE_MAGIC 0x4d365748u
 #define WIFI_HW_STAGE_INIT 1u
@@ -313,16 +351,28 @@ static void wifi_schedule_recover(const char *reason)
     wifi_assoc_state = WIFI_ASSOC_FAILED;
     http_is_active = false;
     wifi_recover_scheduled = true;
+    snprintf(wifi_recover_reason, sizeof wifi_recover_reason, "%s", reason ? reason : "unknown");
     wifi_recover_at = make_timeout_time_ms(M65_WIFI_RETRY_DELAY_MS);
     snprintf(http_status_buf, sizeof http_status_buf,
              "wifi=retry reason=%s in=%lus",
-             reason ? reason : "unknown",
+             wifi_recover_reason,
              (unsigned long)(M65_WIFI_RETRY_DELAY_MS / 1000u));
 }
 
 static void wifi_clear_recover(void)
 {
     wifi_recover_scheduled = false;
+    wifi_recover_reason[0] = 0;
+}
+
+void remote_http_defer_wifi_recovery(uint32_t quiet_ms)
+{
+    if (!wifi_recover_scheduled || wifi_assoc_state != WIFI_ASSOC_FAILED) return;
+    wifi_recover_at = make_timeout_time_ms(quiet_ms ? quiet_ms : M65_WIFI_COMMAND_QUIET_MS);
+    snprintf(http_status_buf, sizeof http_status_buf,
+             "wifi=retry reason=%s in=%lus",
+             wifi_recover_reason[0] ? wifi_recover_reason : "operator-activity",
+             (unsigned long)((quiet_ms ? quiet_ms : M65_WIFI_COMMAND_QUIET_MS) / 1000u));
 }
 
 static const char default_top[] =
@@ -2015,8 +2065,14 @@ static void http_err(void *arg, err_t err)
 static void fetch_set_error(fetch_ctx_t *fc, const char *msg)
 {
     if (!fc) return;
+    bool already_failed = fc->state == FETCH_FAILED;
     snprintf(fc->err, sizeof fc->err, "%s", msg ? msg : "fetch failed");
     fc->state = FETCH_FAILED;
+    if (!already_failed) {
+        remote_log(1, "+FETCH: fail dest=%s reason=%s",
+                   fc->final_path[0] ? fc->final_path : "(unset)",
+                   fc->err);
+    }
 }
 
 static void fetch_close(fetch_ctx_t *fc, bool aborting)
@@ -2080,6 +2136,9 @@ static err_t fetch_connected(void *arg, struct tcp_pcb *pcb, err_t err)
         return ERR_OK;
     }
 
+    remote_log(1, "+FETCH: connected host=%s port=%u path=%s",
+               fc->host, (unsigned)fc->port, fc->path);
+
     char req[512];
     int n = snprintf(req, sizeof req,
                      "GET %s HTTP/1.0\r\n"
@@ -2115,6 +2174,15 @@ static bool fetch_process_body(fetch_ctx_t *fc, const uint8_t *data, size_t len)
         return false;
     }
     fc->body_done += (uint32_t)len;
+    if (remote_verbose >= 2u &&
+        (fc->body_done == fc->content_length ||
+         fc->body_done - fc->last_progress_report >= 65536u)) {
+        fc->last_progress_report = fc->body_done;
+        remote_log(2, "+FETCH: progress dest=%s bytes=%lu/%lu",
+                   fc->final_path,
+                   (unsigned long)fc->body_done,
+                   (unsigned long)fc->content_length);
+    }
     if (fc->body_done == fc->content_length) {
         if (!signed_file_receive_finish(&fc->signed_rx)) {
             fetch_set_error(fc, signed_file_last_error());
@@ -2127,6 +2195,9 @@ static bool fetch_process_body(fetch_ctx_t *fc, const uint8_t *data, size_t len)
             return false;
         }
         fc->state = FETCH_DONE;
+        remote_log(1, "+FETCH: done dest=%s bytes=%lu",
+                   fc->final_path,
+                   (unsigned long)fc->content_length);
     }
     return true;
 }
@@ -2148,6 +2219,10 @@ static bool fetch_parse_headers(fetch_ctx_t *fc, const uint8_t *body, size_t bod
         fetch_set_error(fc, "HTTP response has zero Content-Length");
         return false;
     }
+    remote_log(1, "+FETCH: headers status=%d bytes=%lu dest=%s",
+               status,
+               (unsigned long)fc->content_length,
+               fc->final_path);
 
     const remote_auth_config_t *cfg = fc->cfg ? fc->cfg : &http_cfg;
     storage_delete(fc->tmp_path);
@@ -2293,6 +2368,7 @@ static bool fetch_start(fetch_ctx_t *fc,
         if (err && err_len) snprintf(err, err_len, "expected http://host[:port]/path URL");
         return false;
     }
+    remote_log(1, "+FETCH: start url=%s dest=%s", url, final_path);
 
     ip_addr_t addr;
     err_t dns_err = dns_gethostbyname(fc->host, &addr, fetch_dns_cb, fc);
@@ -2432,6 +2508,7 @@ bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hou
     (void)enabled_override;
     if (!http_is_active) {
         snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=blocked reason=wifi-http-inactive");
+        remote_log(1, "+AUTOFETCH: blocked reason=wifi-http-inactive");
         return false;
     }
     if (autofetch_running || autofetch_state != AUTOFETCH_IDLE) {
@@ -2443,6 +2520,7 @@ bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hou
     http_cfg.fetch_interval_hours = interval_hours;
     autofetch_schedule_valid = false;
     if (!autofetch_start_manifest(board_rev)) {
+        remote_log(1, "+AUTOFETCH: blocked %s", autofetch_status_buf);
         autofetch_schedule_after(900000u);
         return false;
     }
@@ -2608,6 +2686,10 @@ static bool autofetch_scan_manifest(void)
                      autofetch_channel,
                      (unsigned long)autofetch_checked_count,
                      (unsigned long)autofetch_updated_count);
+            remote_log(1, "+AUTOFETCH: done channel=%s checked=%lu updated=%lu",
+                       autofetch_channel,
+                       (unsigned long)autofetch_checked_count,
+                       (unsigned long)autofetch_updated_count);
             return true;
         }
 
@@ -2624,7 +2706,11 @@ static bool autofetch_scan_manifest(void)
 
         autofetch_checked_count++;
         char have[65];
-        if (file_sha256_hex(rel, have) && strcmp(have, sha) == 0) continue;
+        if (file_sha256_hex(rel, have) && strcmp(have, sha) == 0) {
+            remote_log(2, "+AUTOFETCH: unchanged file=%s", rel);
+            continue;
+        }
+        remote_log(1, "+AUTOFETCH: update file=%s", rel);
         if (!autofetch_start_core(rel, sha)) return false;
         return true;
     }
@@ -2652,6 +2738,9 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
                      "autofetch=failed stage=%s reason=\"%s\"",
                      autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core",
                      autofetch_fc.err[0] ? autofetch_fc.err : "fetch failed");
+            remote_log(1, "+AUTOFETCH: failed stage=%s reason=%s",
+                       autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core",
+                       autofetch_fc.err[0] ? autofetch_fc.err : "fetch failed");
             autofetch_cancel("fetch failed", 900000u);
             return;
         }
@@ -2685,6 +2774,7 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
         absolute_time_diff_us(get_absolute_time(), next_autofetch_due) <= 0) {
         http_cfg.fetch_interval_hours = interval_hours;
         if (!autofetch_start_manifest(board_rev)) {
+            remote_log(1, "+AUTOFETCH: blocked %s", autofetch_status_buf);
             autofetch_schedule_after(900000u);
         }
     }
@@ -2959,6 +3049,7 @@ void remote_http_init(void)
 
 void remote_http_poll(void)
 {
+    remote_log_wifi_change();
     if (wifi_probe_pending) {
         wifi_probe_pending = false;
         bool ok = remote_http_probe_wifi_hardware();
@@ -2980,6 +3071,7 @@ void remote_http_poll(void)
         return;
     }
     if (wifi_assoc_state == WIFI_ASSOC_CONNECTING) remote_http_poll_wifi_join();
+    remote_log_wifi_change();
 }
 
 bool remote_http_active(void)

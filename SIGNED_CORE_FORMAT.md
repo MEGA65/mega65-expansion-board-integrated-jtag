@@ -17,7 +17,7 @@ valid `Content-Length`.
 
 ## Policy
 
-`REMOTE_ENABLE.cfg` controls whether signatures are required:
+`mega65-jtag.cfg` controls whether signatures are required:
 
 ```ini
 require_signatures=1
@@ -83,7 +83,7 @@ tools/m65j.py keys
 If the selected private key does not exist, the client prompts to create it with
 OpenSSL and asks for a key name, defaulting to `default`.
 
-Print the selected key's `REMOTE_ENABLE.cfg` entry:
+Print the selected key's `mega65-jtag.cfg` entry:
 
 ```sh
 tools/m65j.py bless --print-trusted-key core.bit

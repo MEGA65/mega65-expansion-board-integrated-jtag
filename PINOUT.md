@@ -94,5 +94,10 @@ pull-up, so open = write protected and short-to-GND = write enabled. The firmwar
 latches write authority for `M65_WRITE_ENABLE_TIMEOUT_MS` after the input is
 asserted, so a momentary button can be used instead of a permanent jumper.
 
+The Pico's onboard BOOTSEL button is separate from the GP11 write-authority
+switch. While this firmware is running, pressing the onboard BOOTSEL button
+reboots the Pico into USB BOOTSEL/UF2 mode when the firmware's periodic poll
+catches it.
+
 Release firmware should leave `M65_WRITE_COMMANDS_USB_ONLY=1`, so the MEGA65-side
 UART cannot write files even during a physical update window.

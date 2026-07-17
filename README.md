@@ -158,13 +158,14 @@ AT+FETCHSTATUS?            show mirror auto-update/fetch status
 AT+FETCHNOW[=3|6|remote]   fetch mirror manifest now
 AT+FETCHINTERVAL[=hours]   show/set auto-update interval; min 3
 AT+FETCHBOARD=3|6|remote   select autofetch board manifest
+AT+VERBOSE[=0|1|2]         show/set WiFi/fetch diagnostic verbosity
 AT+MACHINE[=name]          show/set machine name; saved in AT_SETTINGS.cfg
 ATS60?                     seconds since last successful auto-fetch
 ATS61?                     auto-fetch running flag
 AT&W                       save AT settings to SD card
 ATZ                        soft reboot Pico and reload saved settings
 AT+WRITEGRANT?             show physical write-authority status
-AT+REMOTE?                 show parsed REMOTE_ENABLE.cfg
+AT+REMOTE?                 show parsed mega65-jtag.cfg
 AT+WIFI?                   show live WiFi/HTTP status
 AT+WIFIPROBE               retry CYW43 hardware probe now
 AT+SDCARD?                 show SD card media/mount status
@@ -175,6 +176,10 @@ AT+HIJACK=1|0              manually assert/release JTAG hijack
 AT+MOUNT                   mount/remount SD card
 AT+HELP                    help
 ```
+
+While this firmware is running, pressing the Pico's onboard BOOTSEL button
+reboots it into USB BOOTSEL/UF2 mode when the firmware's periodic poll catches
+it. The external GP11 switch remains the physical write-grant input only.
 
 Example:
 
@@ -306,7 +311,7 @@ Remote HTTP uploads and firmware-side URL fetches can require a signed trailer.
 The format is documented in [SIGNED_CORE_FORMAT.md](SIGNED_CORE_FORMAT.md).
 
 Use `tools/m65j.py keys` to list local public keys and print the
-`trusted_key=` lines to copy into `REMOTE_ENABLE.cfg`. The same client can
+`trusted_key=` lines to copy into `mega65-jtag.cfg`. The same client can
 bless, store, or JTAG-push a core over HTTP:
 
 ```sh
@@ -382,7 +387,7 @@ manifest-listed files and signed manifests to the board SD card over HTTP.
 
 `check` prints `[blessed]`, `[uncursed]`, or `[cursed]` for local files. A
 blessed file has a valid trailer according to the local keys, `--trusted-key`,
-or `--remote-config REMOTE_ENABLE.cfg`; uncursed means no trailer, and cursed
+or `--remote-config mega65-jtag.cfg`; uncursed means no trailer, and cursed
 means a bad or untrusted trailer.
 
 If files.mega65.org requires a logged-in browser session, place the raw Cookie
@@ -398,7 +403,7 @@ filehost_password=secret
 Firmware-side fetch support remains deliberately small:
 `AT+FETCH=<http://url> <name>` fetches one explicit HTTP URL into
 `DOWNLOADS/<name>`. For unattended updates, set `fetch_base_url`,
-`fetch_channel`, `fetch_board=3|6`, and `autofetch=1` in `REMOTE_ENABLE.cfg`.
+`fetch_channel`, `fetch_board=3|6`, and `autofetch=1` in `mega65-jtag.cfg`.
 For channel `stable` and board `6`, the firmware fetches
 `stable-r6.sha256`, verifies the signed manifest first, then fetches only
 changed signed core files listed in it. `AT+FETCHSTATUS?` reports status
@@ -409,6 +414,10 @@ mirror fetch immediately, `AT+AUTOFETCH=0|1` overrides enablement,
 `AT&W`/`ATZ` save/reload those AT settings from `AT_SETTINGS.cfg`. `ATS60?`
 reports seconds since the last successful auto-fetch and `ATS61?` reports the
 running flag.
+
+`AT+VERBOSE=0|1|2` controls unsolicited WiFi/fetch diagnostics. Level 0 is
+quiet, level 1 reports WiFi state changes and fetch start/finish/failure, and
+level 2 also reports fetch progress. `AT&W` saves the selected level.
 
 Useful commands:
 
@@ -421,7 +430,7 @@ AT+FETCHBOARD=3|6|remote           select autofetch board manifest
 AT+MACHINE[=name]                  show/set discovery machine name
 ```
 
-`REMOTE_ENABLE.cfg` controls enforcement:
+`mega65-jtag.cfg` controls enforcement:
 
 ```ini
 require_signatures=1

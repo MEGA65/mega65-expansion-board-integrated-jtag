@@ -22,7 +22,7 @@
 #endif
 
 // WiFi remote delivery is only built for Pico W-class boards when enabled in
-// CMake. Runtime enablement still requires /REMOTE_ENABLE.cfg on the SD card.
+// CMake. Runtime enablement still requires /mega65-jtag.cfg on the SD card.
 #ifndef M65_WIFI_SUPPORTED
 #define M65_WIFI_SUPPORTED   0
 #endif
@@ -81,10 +81,16 @@
 #define M65_WRITE_COMMANDS_USB_ONLY      1
 #define M65_STREAM_COMMANDS_USB_ONLY     1
 
+// The Pico's onboard BOOTSEL button is not a normal GPIO; firmware can still
+// poll it by briefly tri-stating flash CS from RAM. If a poll catches it
+// pressed, the firmware reboots to UF2/BOOTSEL mode.
+#define M65_BOOTSEL_BUTTON_POLL_MS       50u
+
 // Give USB CDC a chance to enumerate before SD-backed settings and WiFi
 // connection attempts can block boot progress.
 #define M65_REMOTE_INIT_DELAY_MS         2000u
 #define M65_WIFI_CONNECT_TIMEOUT_MS      5000u
+#define M65_WIFI_COMMAND_QUIET_MS        15000u
 
 #ifndef M65_LED_PIN
 #ifdef PICO_DEFAULT_LED_PIN
@@ -111,4 +117,4 @@
 #endif
 
 #define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG v0.1"
-#define M65_BUILD_MARKER     "machine-identity-20260716"
+#define M65_BUILD_MARKER     "cfg-fetch-monitor-20260717"

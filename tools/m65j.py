@@ -401,7 +401,7 @@ def print_keys():
             print(f"  {trusted_key_line(path)}")
         except Exception as e:
             print(f"  ERROR: {e}")
-    print("\nTo trust a key, copy its trusted_key= line into REMOTE_ENABLE.cfg on the SD card.")
+    print("\nTo trust a key, copy its trusted_key= line into mega65-jtag.cfg on the SD card.")
     print("For enforcement, also set: require_signatures=1")
     return 0
 
@@ -623,7 +623,7 @@ def check_main(argv):
     ap.add_argument("paths", nargs="+", help="files or directories to inspect")
     ap.add_argument("--trusted-key", action="append", default=[], help="raw trusted key, e.g. p256:04...")
     ap.add_argument("--remote-config", action="append", type=Path, default=[],
-                    help="REMOTE_ENABLE.cfg to read trusted_key lines from")
+                    help="mega65-jtag.cfg to read trusted_key lines from")
     ap.add_argument("--no-local-keys", action="store_true", help="do not use local ~/.m65jtag signing keys")
     ap.add_argument("--no-filename-check", action="store_true", help="do not mark renamed signed files as cursed")
     ap.add_argument("--no-type-check", action="store_true", help="do not compare signed type with filename extension")
@@ -1044,7 +1044,7 @@ def signing_main(argv):
     ap.add_argument("--key", type=Path, help="explicit P-256 EC private key PEM")
     ap.add_argument("--key-name", default=DEFAULT_KEY_NAME, help="named key under ~/.m65jtag/keys, default 'default'")
     ap.add_argument("--yes", action="store_true", help="create the default private key without prompting")
-    ap.add_argument("--keys", action="store_true", help="list local public keys and REMOTE_ENABLE.cfg lines")
+    ap.add_argument("--keys", action="store_true", help="list local public keys and mega65-jtag.cfg lines")
     ap.add_argument("--board", choices=("0", "3", "6"), default="0", help="board ID to bind into the signature")
     ap.add_argument("--type", choices=("auto", "any", "bit", "cor", "m65j"), default="auto")
     ap.add_argument("--name", help="destination filename to sign and use for device uploads")
@@ -1056,7 +1056,7 @@ def signing_main(argv):
     ap.add_argument("--store-only", action="store_true", help="with --device, PUT to /files/<name> instead of /jtag")
     ap.add_argument("--user", help="HTTP Basic auth user")
     ap.add_argument("--password", help="HTTP Basic auth password")
-    ap.add_argument("--print-trusted-key", action="store_true", help="print REMOTE_ENABLE.cfg trusted_key line")
+    ap.add_argument("--print-trusted-key", action="store_true", help="print mega65-jtag.cfg trusted_key line")
     args = ap.parse_args(argv)
 
     if args.keys:
@@ -1456,6 +1456,8 @@ def parse_leading_global_options(argv):
         "url": None,
         "baud": None,
         "timeout": None,
+        "monitor": False,
+        "monitor_for": None,
         "list": False,
     }
     rest = []
@@ -1468,6 +1470,23 @@ def parse_leading_global_options(argv):
 
         if arg in {"-l", "--list-machines"}:
             opts["list"] = True
+            i += 1
+            continue
+
+        if arg in {"-m", "--monitor", "--follow"}:
+            opts["monitor"] = True
+            i += 1
+            continue
+        if arg == "--monitor-for":
+            if i + 1 >= len(argv):
+                raise SystemExit("--monitor-for expects seconds")
+            opts["monitor"] = True
+            opts["monitor_for"] = float(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--monitor-for="):
+            opts["monitor"] = True
+            opts["monitor_for"] = float(arg.split("=", 1)[1])
             i += 1
             continue
 
@@ -1873,7 +1892,7 @@ def read_response_lines(ser, cmd, timeout):
                 "WRITEGRANT", "AUTH", "SDMODE", "JTAGID", "JTAGSTATUS",
                 "XSTATUS", "HIJACK", "MOUNT", "WIFI", "HTTP",
                 "SDCARD", "SDSTATUS", "MACHINE", "MACHINENAME", "NAME",
-                "IDENTITY",
+                "IDENTITY", "VERBOSE", "WIFIVERBOSE", "DEBUG",
             }
         return command[:1].upper() in {"V", "I", "J", "H", "M", "A", "X", "D"}
 
@@ -1891,6 +1910,26 @@ def read_response_lines(ser, cmd, timeout):
         elif time.monotonic() - last > timeout:
             print(f"ERR host timeout waiting for response to {cmd}", file=sys.stderr)
             return False
+
+
+def monitor_serial_lines(ser, duration=None):
+    old_timeout = ser.timeout
+    ser.timeout = 0.2
+    deadline = time.monotonic() + duration if duration is not None else None
+    print("INFO: monitoring serial responses; press Ctrl-C to stop", file=sys.stderr)
+    try:
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            line = ser.readline()
+            if not line:
+                continue
+            text = line.decode("utf-8", "replace").rstrip("\r\n")
+            print(text)
+    except KeyboardInterrupt:
+        print("INFO: monitor stopped", file=sys.stderr)
+    finally:
+        ser.timeout = old_timeout
 
 
 def wait_for_ready(ser, timeout):
@@ -2153,7 +2192,7 @@ def translate_manual_command(parts):
     return " ".join(parts).strip()
 
 
-def send_serial_text_command(ser, cmd, timeout):
+def send_serial_text_command(ser, cmd, timeout, monitor=False, monitor_for=None):
     ser.reset_input_buffer()
     data = (cmd + "\n").encode("utf-8")
     try:
@@ -2164,7 +2203,10 @@ def send_serial_text_command(ser, cmd, timeout):
     if written != len(data):
         print(f"ERR host serial write short: {written}/{len(data)}", file=sys.stderr)
         return 1
-    return 0 if read_response_lines(ser, cmd, timeout) else 1
+    ok = read_response_lines(ser, cmd, timeout)
+    if monitor and ok:
+        monitor_serial_lines(ser, monitor_for)
+    return 0 if ok else 1
 
 
 def at_filename_arg(name):
@@ -2175,7 +2217,7 @@ def at_filename_arg(name):
     return name
 
 
-def run_serial_command(port, command, baud, timeout):
+def run_serial_command(port, command, baud, timeout, monitor=False, monitor_for=None):
     if not command:
         raise SystemExit("missing serial command")
 
@@ -2191,7 +2233,7 @@ def run_serial_command(port, command, baud, timeout):
                 return stream_local_file(ser, local_candidate, timeout)
             if verb in {"push", "jtag", "jtag-push"}:
                 print("NOTE local file not found; using Pico SD-card load command", file=sys.stderr)
-                return send_serial_text_command(ser, f"AT+JTAGLOAD={at_filename_arg(command[1])}", timeout)
+                return send_serial_text_command(ser, f"AT+JTAGLOAD={at_filename_arg(command[1])}", timeout, monitor, monitor_for)
             raise SystemExit(f"local file not found: {command[1]}")
 
         if command[0].lower() in {"sink", "dummy", "rx-test"}:
@@ -2212,7 +2254,7 @@ def run_serial_command(port, command, baud, timeout):
                 return stream_local_file(ser, local_candidate, timeout)
 
         cmd = translate_manual_command(command)
-        return send_serial_text_command(ser, cmd, timeout)
+        return send_serial_text_command(ser, cmd, timeout, monitor, monitor_for)
 
 
 def main(argv=None):
@@ -2223,6 +2265,8 @@ def main(argv=None):
     CLI_WEB_URL = global_opts["url"]
     baud = global_opts["baud"] if global_opts["baud"] is not None else 2_000_000
     timeout = global_opts["timeout"] if global_opts["timeout"] is not None else 5.0
+    monitor = global_opts["monitor"]
+    monitor_for = global_opts["monitor_for"]
 
     if global_opts["list"]:
         return list_available_machines(baud)
@@ -2262,14 +2306,14 @@ def main(argv=None):
     if serial_port:
         if not argv:
             argv = ["ATI"]
-        return run_serial_command(serial_port, argv, baud, timeout)
+        return run_serial_command(serial_port, argv, baud, timeout, monitor, monitor_for)
 
     remote_result = route_remote_command(argv)
     if remote_result is not None:
         return remote_result
 
     ap = argparse.ArgumentParser(
-        usage="%(prog)s [-h] [-s TTY] [-u URL] [--baud BAUD] [--timeout TIMEOUT] [target-or-command] ...",
+        usage="%(prog)s [-h] [-s TTY] [-u URL] [-m] [--baud BAUD] [--timeout TIMEOUT] [target-or-command] ...",
         description="MEGA65 Expansion Board Integrated JTAG firmware utility client (experimental v0.1)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
@@ -2279,6 +2323,8 @@ def main(argv=None):
               m65j.py mymega list
               m65j.py r6:mymega push core.bit --board 6
               m65j.py -s /dev/ttyACM0 ATI
+              m65j.py -m AT+FETCHNOW=6
+              m65j.py --monitor-for 30 AT+WIFI?
               m65j.py -s /dev/ttyACM0 push local.bit
               m65j.py -u http://mega65-jtag.local status
               m65j.py -u http://mega65-jtag.local push core.bit --board 6
@@ -2302,6 +2348,7 @@ def main(argv=None):
 
             Global target options may be placed before the command:
               -l, --list-machines   list USB and local /24 HTTP machines
+              -m, --monitor         keep serial open after command and print later lines
               -s, --device <tty>     serial TTY, e.g. /dev/ttyACM0
               -u, --url <url|name>   board HTTP URL, IP address, or machine name
 
@@ -2321,6 +2368,10 @@ def main(argv=None):
     ap.add_argument("-s", "--device", "--serial", dest="serial_device", help="serial TTY, e.g. /dev/ttyACM0")
     ap.add_argument("-u", "--url", dest="web_url", help="board HTTP URL, IP address, or machine name")
     ap.add_argument("-l", "--list-machines", action="store_true", help="list USB and local /24 HTTP machines")
+    ap.add_argument("-m", "--monitor", "--follow", action="store_true",
+                    help="keep serial open after command and print later unsolicited responses")
+    ap.add_argument("--monitor-for", type=float, default=None,
+                    help="monitor serial responses for this many seconds after the command")
     ap.add_argument("--baud", type=int, default=2_000_000)
     ap.add_argument("--timeout", type=float, default=5.0)
     args = ap.parse_args(argv)
@@ -2328,7 +2379,12 @@ def main(argv=None):
         return list_available_machines(args.baud)
     if not args.command:
         ap.error("missing command")
-    return run_serial_command(args.serial_device or args.port, args.command, args.baud, args.timeout)
+    return run_serial_command(args.serial_device or args.port,
+                              args.command,
+                              args.baud,
+                              args.timeout,
+                              args.monitor or args.monitor_for is not None,
+                              args.monitor_for)
 
 
 if __name__ == "__main__":

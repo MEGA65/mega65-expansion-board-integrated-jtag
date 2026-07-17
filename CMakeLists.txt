@@ -24,6 +24,7 @@ set(M65_SD_MODE "" CACHE STRING "Optional compile-time SD mode override: M65_SD_
 set(FATFS_SD_SPI_PATH "${CMAKE_CURRENT_LIST_DIR}/third_party/no-OS-FatFS-SD-SPI-RPi-Pico" CACHE PATH "Path to no-OS-FatFS-SD-SPI-RPi-Pico repository")
 
 add_executable(pico_m65jtag
+    src/bootsel_button.c
     src/main.c
     src/uart_cmd.c
     src/jtag_gpio.c

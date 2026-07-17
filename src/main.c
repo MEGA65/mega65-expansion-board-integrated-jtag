@@ -11,6 +11,7 @@
 #include "config.h"
 #include "uart_cmd.h"
 #include "storage.h"
+#include "bootsel_button.h"
 #include "core_file.h"
 #include "core_filter.h"
 #include "jtag_gpio.h"
@@ -27,6 +28,9 @@
 #endif
 #ifndef M65_WRITE_ENABLE_TIMEOUT_MS
 #define M65_WRITE_ENABLE_TIMEOUT_MS 120000u
+#endif
+#ifndef M65_WIFI_COMMAND_QUIET_MS
+#define M65_WIFI_COMMAND_QUIET_MS 15000u
 #endif
 #ifndef M65_WRITE_COMMANDS_USB_ONLY
 #define M65_WRITE_COMMANDS_USB_ONLY 1
@@ -50,15 +54,17 @@ static bool usb_reconnect_pending = false;
 static absolute_time_t usb_reconnect_at;
 
 typedef struct {
-    int autofetch; // -1 = use REMOTE_ENABLE.cfg default, 0 = off, 1 = on
+    int autofetch; // -1 = use mega65-jtag.cfg default, 0 = off, 1 = on
     uint32_t fetch_interval_hours;
-    uint8_t fetch_board_rev; // 0 = use REMOTE_ENABLE.cfg default
+    uint8_t fetch_board_rev; // 0 = use mega65-jtag.cfg default
+    uint8_t verbose; // 0 = quiet, 1 = normal diagnostics, 2 = progress
 } at_settings_t;
 
 static at_settings_t at_settings = {
     .autofetch = -1,
     .fetch_interval_hours = 0,
     .fetch_board_rev = 0,
+    .verbose = 1,
 };
 
 static void progress_cb(uint32_t done, uint32_t total, void *ctx)
@@ -347,6 +353,7 @@ static bool at_command_preserves_autofetch(const char *arg)
 
     if (ci_equal(tmp, "FETCHSTATUS") || ci_equal(tmp, "AUTOFETCHSTATUS") || ci_equal(tmp, "AFSTATUS")) return true;
     if (ci_equal(tmp, "FETCHNOW") || ci_equal(tmp, "AUTOFETCHNOW") || ci_equal(tmp, "AFNOW")) return true;
+    if (ci_equal(tmp, "VERBOSE") || ci_equal(tmp, "WIFIVERBOSE") || ci_equal(tmp, "DEBUG")) return true;
     if (query_only &&
         (ci_equal(tmp, "AUTOFETCH") || ci_equal(tmp, "FETCHINTERVAL") || ci_equal(tmp, "FETCHBOARD"))) {
         return true;
@@ -359,6 +366,8 @@ static void at_settings_reset_defaults(void)
     at_settings.autofetch = -1;
     at_settings.fetch_interval_hours = 0;
     at_settings.fetch_board_rev = 0;
+    at_settings.verbose = 1;
+    remote_http_set_verbose(at_settings.verbose);
     machine_identity_set_name("");
     machine_identity_set_board_rev(0);
     remote_http_autofetch_reset_schedule();
@@ -416,10 +425,15 @@ static void at_settings_load(void)
                 if (machine_identity_valid_name(value)) {
                     machine_identity_set_name(value);
                 }
+            } else if (ci_equal(key, "verbose") || ci_equal(key, "wifi_verbose")) {
+                char *end = NULL;
+                unsigned long v = strtoul(value, &end, 10);
+                if (!*end && v <= 2u) at_settings.verbose = (uint8_t)v;
             }
         }
         line = strtok_r(NULL, "\n", &save);
     }
+    remote_http_set_verbose(at_settings.verbose);
     machine_identity_set_board_rev(at_settings.fetch_board_rev);
     remote_http_autofetch_reset_schedule();
 }
@@ -432,16 +446,18 @@ static bool at_settings_save(void)
         uart_cmd_printf("ERROR: AT&W open failed: %s\r\n", storage_last_error());
         return false;
     }
-    char buf[160];
+    char buf[192];
     int n = snprintf(buf, sizeof buf,
                      "autofetch=%s\n"
                      "fetch_interval_hours=%lu\n"
                      "fetch_board=%s\n"
+                     "verbose=%u\n"
                      "machine_name=%s\n",
                      at_settings.autofetch < 0 ? "remote" : (at_settings.autofetch ? "1" : "0"),
                      (unsigned long)(at_settings.fetch_interval_hours ? at_settings.fetch_interval_hours : 3u),
                      at_settings.fetch_board_rev == 3 ? "3" :
                      at_settings.fetch_board_rev == 6 ? "6" : "remote",
+                     (unsigned)at_settings.verbose,
                      machine_identity_name());
     size_t put = 0;
     bool ok = n > 0 && n < (int)sizeof buf &&
@@ -584,13 +600,14 @@ static void cmd_help(void)
         "+HELP: AT+FETCHNOW[=3|6|remote] fetch mirror manifest now\n"
         "+HELP: AT+FETCHINTERVAL[=hours] show/set auto-update interval; min 3\n"
         "+HELP: AT+FETCHBOARD[=3|6|remote] show/set auto-update board manifest\n"
+        "+HELP: AT+VERBOSE[=0|1|2] show/set WiFi/fetch diagnostic verbosity\n"
         "+HELP: AT+MACHINE[=name]  show/set machine name; saved to SD card\n"
         "+HELP: ATS60?              seconds since last successful auto-fetch\n"
         "+HELP: ATS61?              auto-fetch running flag\n"
         "+HELP: AT&W                save AT settings to SD card\n"
         "+HELP: ATZ                 soft reboot Pico and reload saved settings\n"
         "+HELP: AT+WRITEGRANT?      show write-authority status\n"
-        "+HELP: AT+REMOTE?          show parsed REMOTE_ENABLE.cfg\n"
+        "+HELP: AT+REMOTE?          show parsed mega65-jtag.cfg\n"
         "+HELP: AT+WIFI?            show live WiFi/HTTP status\n"
         "+HELP: AT+WIFIPROBE        retry CYW43 hardware probe now\n"
         "+HELP: AT+SDCARD?          show SD card media/mount status\n"
@@ -657,6 +674,23 @@ static void cmd_version(void)
                     (unsigned long)M65_WRITE_ENABLE_TIMEOUT_MS,
                     (unsigned long)M65_WRITE_COMMANDS_USB_ONLY,
                     (unsigned long)M65_STREAM_COMMANDS_USB_ONLY);
+    uart_cmd_printf("+VERSION: verbose=%u\r\n", (unsigned)at_settings.verbose);
+    at_ok();
+}
+
+static void cmd_verbose(char *arg, bool have_value)
+{
+    if (have_value) {
+        char *end = NULL;
+        unsigned long level = strtoul(arg, &end, 10);
+        if (*end || level > 2u) {
+            at_error("VERBOSE EXPECTS 0, 1 OR 2");
+            return;
+        }
+        at_settings.verbose = (uint8_t)level;
+        remote_http_set_verbose(at_settings.verbose);
+    }
+    uart_cmd_printf("+VERBOSE: level=%u\r\n", (unsigned)at_settings.verbose);
     at_ok();
 }
 
@@ -1563,7 +1597,6 @@ static void cmd_write_file(char *arg)
 static void cmd_fetch(char *arg)
 {
     if (!ensure_mount()) return;
-    if (!require_write_authority("F")) return;
 
     char *rest = NULL;
     char *url = parse_filename_arg(arg, &rest);
@@ -1745,6 +1778,8 @@ static void dispatch_at(char *arg)
         cmd_fetch_interval(param, value != NULL);
     } else if (ci_equal(cmd, "FETCHBOARD")) {
         cmd_fetch_board(param, value != NULL);
+    } else if (ci_equal(cmd, "VERBOSE") || ci_equal(cmd, "WIFIVERBOSE") || ci_equal(cmd, "DEBUG")) {
+        cmd_verbose(param, value != NULL);
     } else if (ci_equal(cmd, "MACHINE") || ci_equal(cmd, "MACHINENAME") ||
                ci_equal(cmd, "NAME") || ci_equal(cmd, "IDENTITY")) {
         cmd_machine(param, value != NULL);
@@ -1779,6 +1814,7 @@ static void dispatch(char *line)
 {
     char *s = trim_line(line);
     if (!s[0]) return;
+    remote_http_defer_wifi_recovery(M65_WIFI_COMMAND_QUIET_MS);
 
     if (command_mode == CMD_MODE_BASIC) {
         dispatch_basic(s);
@@ -1834,6 +1870,7 @@ int main(void)
 
     char line[256];
     for (;;) {
+        bootsel_button_poll();
         if (uart_cmd_read_line(line, sizeof line)) {
             dispatch(line);
             continue;

@@ -6,7 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define REMOTE_ENABLE_PATH "REMOTE_ENABLE.cfg"
+#define REMOTE_CONFIG_PATH "mega65-jtag.cfg"
+#define REMOTE_CONFIG_LEGACY_PATH "REMOTE_ENABLE.cfg"
 #define REMOTE_CFG_MAX_BYTES 4096u
 
 static char cfg_buf[REMOTE_CFG_MAX_BYTES + 1u];
@@ -359,15 +360,21 @@ bool remote_auth_load(remote_auth_config_t *cfg, char *err, size_t err_len)
     if (err && err_len) err[0] = 0;
 
     storage_file_t f = {0};
-    if (!storage_open(&f, REMOTE_ENABLE_PATH)) {
-        if (err && err_len) snprintf(err, err_len, "%s not found", REMOTE_ENABLE_PATH);
-        return false;
+    const char *path = REMOTE_CONFIG_PATH;
+    if (!storage_open(&f, path)) {
+        path = REMOTE_CONFIG_LEGACY_PATH;
+        if (!storage_open(&f, path)) {
+            if (err && err_len) {
+                snprintf(err, err_len, "%s not found", REMOTE_CONFIG_PATH);
+            }
+            return false;
+        }
     }
 
     uint32_t size = storage_size(&f);
     if (size > REMOTE_CFG_MAX_BYTES) {
         storage_close(&f);
-        if (err && err_len) snprintf(err, err_len, "%s too large", REMOTE_ENABLE_PATH);
+        if (err && err_len) snprintf(err, err_len, "%s too large", path);
         return false;
     }
 

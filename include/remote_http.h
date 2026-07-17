@@ -7,6 +7,9 @@
 void remote_http_init(void);
 void remote_http_boot_check(void);
 void remote_http_poll(void);
+void remote_http_defer_wifi_recovery(uint32_t quiet_ms);
+void remote_http_set_verbose(uint8_t level);
+uint8_t remote_http_verbose(void);
 bool remote_http_active(void);
 const char *remote_http_status(void);
 const char *remote_http_wifi_summary(void);

@@ -65,4 +65,3 @@ void write_gate_init(void)
 #endif
     write_auth_until_us = 0;
 }
-
