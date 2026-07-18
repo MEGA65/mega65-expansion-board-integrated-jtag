@@ -25,7 +25,9 @@
 #endif
 
 static FATFS fs;
-static FIL active_file;
+#define STORAGE_FILE_SLOTS 4u
+static FIL file_pool[STORAGE_FILE_SLOTS];
+static bool file_pool_used[STORAGE_FILE_SLOTS];
 static char last_err[128];
 static bool mounted;
 
@@ -51,6 +53,31 @@ static void reset_sd_driver_state(void)
 const char *storage_last_error(void)
 {
     return last_err[0] ? last_err : "no storage error";
+}
+
+static FIL *alloc_file(void)
+{
+    for (size_t i = 0; i < STORAGE_FILE_SLOTS; ++i) {
+        if (!file_pool_used[i]) {
+            file_pool_used[i] = true;
+            memset(&file_pool[i], 0, sizeof file_pool[i]);
+            return &file_pool[i];
+        }
+    }
+    snprintf(last_err, sizeof(last_err), "no FatFs file slots");
+    return NULL;
+}
+
+static void free_file(FIL *f)
+{
+    if (!f) return;
+    for (size_t i = 0; i < STORAGE_FILE_SLOTS; ++i) {
+        if (f == &file_pool[i]) {
+            file_pool_used[i] = false;
+            memset(&file_pool[i], 0, sizeof file_pool[i]);
+            return;
+        }
+    }
 }
 
 bool storage_mount(void)
@@ -82,6 +109,13 @@ bool storage_mount(void)
 
 void storage_unmount(void)
 {
+    for (size_t i = 0; i < STORAGE_FILE_SLOTS; ++i) {
+        if (file_pool_used[i]) {
+            f_close(&file_pool[i]);
+            file_pool_used[i] = false;
+            memset(&file_pool[i], 0, sizeof file_pool[i]);
+        }
+    }
     f_unmount("");
     mounted = false;
 }
@@ -94,9 +128,15 @@ bool storage_is_mounted(void)
 bool storage_open(storage_file_t *f, const char *path)
 {
     if (!f || !path) return false;
-    FRESULT fr = f_open(&active_file, path, FA_READ);
-    if (fr != FR_OK) { set_err("f_open", fr); return false; }
-    f->impl = &active_file;
+    FIL *slot = alloc_file();
+    if (!slot) return false;
+    FRESULT fr = f_open(slot, path, FA_READ);
+    if (fr != FR_OK) {
+        free_file(slot);
+        set_err("f_open", fr);
+        return false;
+    }
+    f->impl = slot;
     return true;
 }
 
@@ -105,9 +145,15 @@ bool storage_open_write(storage_file_t *f, const char *path, bool truncate)
     if (!f || !path) return false;
     BYTE mode = FA_WRITE | FA_CREATE_ALWAYS;
     if (!truncate) mode = FA_WRITE | FA_OPEN_ALWAYS;
-    FRESULT fr = f_open(&active_file, path, mode);
-    if (fr != FR_OK) { set_err("f_open_write", fr); return false; }
-    f->impl = &active_file;
+    FIL *slot = alloc_file();
+    if (!slot) return false;
+    FRESULT fr = f_open(slot, path, mode);
+    if (fr != FR_OK) {
+        free_file(slot);
+        set_err("f_open_write", fr);
+        return false;
+    }
+    f->impl = slot;
     return true;
 }
 
@@ -162,7 +208,9 @@ uint32_t storage_size(storage_file_t *f)
 void storage_close(storage_file_t *f)
 {
     if (f && f->impl) {
-        f_close((FIL *)f->impl);
+        FIL *slot = (FIL *)f->impl;
+        f_close(slot);
+        free_file(slot);
         f->impl = NULL;
     }
 }
@@ -179,6 +227,23 @@ static bool has_core_ext(const char *name)
     return (e1 == 'b' && e2 == 'i' && e3 == 't' && e4 == 0) ||
            (e1 == 'c' && e2 == 'o' && e3 == 'r' && e4 == 0) ||
            (e1 == 'm' && e2 == '6' && e3 == '5' && e4 == 'j' && e5 == 0);
+}
+
+static bool has_partial_core_ext(const char *name)
+{
+    size_t n = strlen(name ? name : "");
+    static const char suffix[] = ".partial";
+    size_t sn = sizeof suffix - 1u;
+    if (n <= sn) return false;
+    const char *tail = name + n - sn;
+    for (size_t i = 0; i < sn; i++) {
+        if (tolower((unsigned char)tail[i]) != suffix[i]) return false;
+    }
+    char base[256];
+    if (n - sn >= sizeof base) return false;
+    memcpy(base, name, n - sn);
+    base[n - sn] = 0;
+    return has_core_ext(base);
 }
 
 bool storage_delete(const char *path)
@@ -218,7 +283,7 @@ bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx)
         if (fr != FR_OK) { set_err("f_readdir", fr); f_closedir(&dir); return false; }
         if (fi.fname[0] == 0) break;
         bool is_dir = (fi.fattrib & AM_DIR) != 0;
-        if (is_dir || has_core_ext(fi.fname)) {
+        if (is_dir || has_core_ext(fi.fname) || has_partial_core_ext(fi.fname)) {
             cb(fi.fname, (uint32_t)fi.fsize, is_dir, ctx);
         }
     }

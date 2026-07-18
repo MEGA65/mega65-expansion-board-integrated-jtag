@@ -3,6 +3,7 @@
 
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,39 @@
 #endif
 #ifndef M65_WIFI_RETRY_DELAY_MS
 #define M65_WIFI_RETRY_DELAY_MS 60000u
+#endif
+#ifndef M65_WIFI_FIRST_RETRY_DELAY_MS
+#define M65_WIFI_FIRST_RETRY_DELAY_MS 5000u
+#endif
+#ifndef M65_WIFI_PROBE_FAST_ATTEMPTS
+#define M65_WIFI_PROBE_FAST_ATTEMPTS 4u
+#endif
+#ifndef M65_WIFI_PROBE_FAST_RETRY_MS
+#define M65_WIFI_PROBE_FAST_RETRY_MS 1000u
+#endif
+#ifndef M65_WIFI_NOIP_TIMEOUT_MS
+#define M65_WIFI_NOIP_TIMEOUT_MS 10000u
+#endif
+#ifndef M65_FETCH_CONNECT_TIMEOUT_MS
+#define M65_FETCH_CONNECT_TIMEOUT_MS 10000u
+#endif
+#ifndef M65_FETCH_IDLE_TIMEOUT_MS
+#define M65_FETCH_IDLE_TIMEOUT_MS 60000u
+#endif
+#ifndef M65_FETCH_IDLE_DIAG_MS
+#define M65_FETCH_IDLE_DIAG_MS 3000u
+#endif
+#ifndef M65_FETCH_ACK_NUDGE_MS
+#define M65_FETCH_ACK_NUDGE_MS 1000u
+#endif
+#ifndef M65_AUTOFETCH_FILE_RETRIES
+#define M65_AUTOFETCH_FILE_RETRIES 10u
+#endif
+#ifndef M65_FILE_HASH_PROGRESS_MS
+#define M65_FILE_HASH_PROGRESS_MS 1000u
+#endif
+#ifndef M65_FILE_HASH_PROGRESS_BYTES
+#define M65_FILE_HASH_PROGRESS_BYTES 262144u
 #endif
 #ifndef M65_WIFI_HW_PROBE_WATCHDOG_MS
 #define M65_WIFI_HW_PROBE_WATCHDOG_MS 10000u
@@ -48,6 +82,15 @@
 #endif
 #ifndef M65_HTTP_INDEX_MAX_ROWS
 #define M65_HTTP_INDEX_MAX_ROWS 100u
+#endif
+#ifndef M65_HTTP_BUSY_TEMPLATE_MAX
+#define M65_HTTP_BUSY_TEMPLATE_MAX 8192u
+#endif
+#ifndef M65_HTTP_BUSY_PAGE_MAX
+#define M65_HTTP_BUSY_PAGE_MAX 8192u
+#endif
+#ifndef M65_HTTP_FAVICON_MAX
+#define M65_HTTP_FAVICON_MAX 4096u
 #endif
 
 #if !M65_WIFI_SUPPORTED
@@ -102,9 +145,11 @@ bool remote_http_autofetch_running(void) { return false; }
 #include "hardware/watchdog.h"
 #include "lwip/dhcp.h"
 #include "lwip/dns.h"
+#include "lwip/ip_addr.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
+#include "lwip/priv/tcp_priv.h"
 #include "lwip/tcp.h"
 
 typedef enum {
@@ -182,6 +227,7 @@ typedef enum {
     AUTOFETCH_IDLE = 0,
     AUTOFETCH_MANIFEST,
     AUTOFETCH_SCAN,
+    AUTOFETCH_VERIFY,
     AUTOFETCH_CORE,
 } autofetch_state_t;
 
@@ -197,6 +243,7 @@ typedef struct {
     fetch_state_t state;
     const remote_auth_config_t *cfg;
     absolute_time_t deadline;
+    absolute_time_t connect_deadline;
     bool raw_to_buffer;
     bool check_write_grant;
     char host[128];
@@ -210,17 +257,25 @@ typedef struct {
     size_t raw_len;
     size_t header_len;
     uint16_t port;
+    uint16_t local_port;
     uint32_t content_length;
     uint32_t body_done;
     signed_file_rx_t signed_rx;
     char err[128];
+    absolute_time_t body_started_at;
+    absolute_time_t last_rx_at;
+    absolute_time_t last_idle_diag_at;
+    absolute_time_t last_ack_nudge_at;
+    absolute_time_t last_progress_at;
     uint32_t last_progress_report;
+    uint32_t last_progress_bytes;
 } fetch_ctx_t;
 
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len);
 static int find_header_end(const char *buf, size_t len, size_t *end_len);
 static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms);
 static bool autofetch_start_manifest(uint8_t board_rev);
+static void close_http_listener(void);
 static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len);
 static err_t http_poll_cb(void *arg, struct tcp_pcb *pcb);
 static void html_escape(const char *in, char *out, size_t out_len);
@@ -233,6 +288,7 @@ static bool cyw43_is_ready;
 static bool wifi_hardware_blocked;
 static bool wifi_hardware_known_present;
 static bool wifi_probe_pending;
+static bool wifi_probe_retry_scheduled;
 static bool remote_init_after_probe_pending;
 static uint32_t wifi_hardware_fault_stage;
 static uint32_t wifi_probe_attempts;
@@ -241,9 +297,13 @@ static char wifi_diag_buf[320];
 static wifi_assoc_state_t wifi_assoc_state = WIFI_ASSOC_OFF;
 static absolute_time_t wifi_assoc_deadline;
 static absolute_time_t wifi_assoc_retry_at;
+static absolute_time_t wifi_noip_since;
 static absolute_time_t wifi_recover_at;
+static absolute_time_t wifi_probe_retry_at;
+static bool wifi_noip_timer_active;
 static bool wifi_recover_scheduled;
 static char wifi_recover_reason[40];
+static bool wifi_recover_first_retry_used;
 static absolute_time_t wifi_poll_due;
 static int wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
 static char http_status_buf[128] = "wifi=inactive hardware=not-probed";
@@ -261,12 +321,25 @@ static remote_auth_config_t autofetch_sig_cfg;
 static uint32_t autofetch_manifest_offset;
 static uint32_t autofetch_updated_count;
 static uint32_t autofetch_checked_count;
+static uint32_t autofetch_manifest_total_count;
+static uint32_t autofetch_fetch_retry_count;
 static char autofetch_manifest_path[48];
 static char autofetch_base_url[192];
 static char autofetch_channel[24];
 static char autofetch_pending_path[224];
 static char autofetch_pending_sha[65];
-static char autofetch_status_buf[192] = "autofetch=idle";
+static char autofetch_status_buf[320] = "autofetch=idle";
+static bool autofetch_hash_active;
+static uint32_t autofetch_hash_done;
+static uint32_t autofetch_hash_size;
+static absolute_time_t autofetch_hash_started_at;
+static char autofetch_hash_stage[24];
+static char autofetch_hash_path[224];
+static char busy_template[M65_HTTP_BUSY_TEMPLATE_MAX];
+static bool busy_template_loaded;
+static uint8_t favicon_cache[M65_HTTP_FAVICON_MAX];
+static size_t favicon_cache_len;
+static bool favicon_cache_loaded;
 
 static void remote_log(uint8_t level, const char *fmt, ...)
 {
@@ -276,7 +349,8 @@ static void remote_log(uint8_t level, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(msg, sizeof msg, fmt, ap);
     va_end(ap);
-    uart_cmd_printf("%s\r\n", msg);
+    uart_cmd_log_puts_best_effort(msg);
+    uart_cmd_log_puts_best_effort("\r\n");
 }
 
 void remote_http_set_verbose(uint8_t level)
@@ -318,7 +392,15 @@ static void wifi_hw_probe_marker_clear(void)
     if (watchdog_hw->scratch[0] == WIFI_HW_PROBE_MAGIC) {
         watchdog_hw->scratch[0] = 0;
         watchdog_hw->scratch[1] = 0;
+        watchdog_hw->scratch[2] = 0;
     }
+}
+
+static uint32_t future_seconds(absolute_time_t when)
+{
+    int64_t us = absolute_time_diff_us(get_absolute_time(), when);
+    if (us <= 0) return 0u;
+    return (uint32_t)((us + 999999ll) / 1000000ll);
 }
 
 static void wifi_hw_status_blocked(void)
@@ -338,25 +420,59 @@ static void wifi_hw_status_blocked(void)
     }
 }
 
+static bool wifi_probe_can_retry(void)
+{
+    return wifi_probe_attempts < M65_WIFI_PROBE_FAST_ATTEMPTS;
+}
+
+static uint32_t wifi_probe_retry_seconds(void)
+{
+    if (!wifi_probe_retry_scheduled) return 0u;
+    return future_seconds(wifi_probe_retry_at);
+}
+
+static void wifi_schedule_probe_retry(const char *reason, uint32_t stage)
+{
+    wifi_hardware_blocked = false;
+    wifi_hardware_fault_stage = stage;
+    wifi_probe_pending = false;
+    wifi_probe_retry_scheduled = true;
+    wifi_probe_retry_at = make_timeout_time_ms(M65_WIFI_PROBE_FAST_RETRY_MS);
+    snprintf(http_status_buf, sizeof http_status_buf,
+             "wifi=probe-retry reason=%s stage=%s attempts=%lu in=%lus",
+             reason ? reason : "probe-failed",
+             wifi_hw_stage_name(stage),
+             (unsigned long)wifi_probe_attempts,
+             (unsigned long)(M65_WIFI_PROBE_FAST_RETRY_MS / 1000u));
+}
+
 static uint32_t wifi_recover_seconds(void)
 {
     if (!wifi_recover_scheduled) return 0u;
-    int64_t us = absolute_time_diff_us(get_absolute_time(), wifi_recover_at);
-    if (us <= 0) return 0u;
-    return (uint32_t)((us + 999999ll) / 1000000ll);
+    return future_seconds(wifi_recover_at);
+}
+
+static void wifi_schedule_recover_after(const char *reason, uint32_t delay_ms)
+{
+    wifi_assoc_state = WIFI_ASSOC_FAILED;
+    http_is_active = false;
+    wifi_noip_timer_active = false;
+    close_http_listener();
+    wifi_recover_scheduled = true;
+    snprintf(wifi_recover_reason, sizeof wifi_recover_reason, "%s", reason ? reason : "unknown");
+    if (delay_ms == 0) delay_ms = M65_WIFI_FIRST_RETRY_DELAY_MS;
+    wifi_recover_at = make_timeout_time_ms(delay_ms);
+    snprintf(http_status_buf, sizeof http_status_buf,
+             "wifi=retry reason=%s in=%lus",
+             wifi_recover_reason,
+             (unsigned long)(delay_ms / 1000u));
 }
 
 static void wifi_schedule_recover(const char *reason)
 {
-    wifi_assoc_state = WIFI_ASSOC_FAILED;
-    http_is_active = false;
-    wifi_recover_scheduled = true;
-    snprintf(wifi_recover_reason, sizeof wifi_recover_reason, "%s", reason ? reason : "unknown");
-    wifi_recover_at = make_timeout_time_ms(M65_WIFI_RETRY_DELAY_MS);
-    snprintf(http_status_buf, sizeof http_status_buf,
-             "wifi=retry reason=%s in=%lus",
-             wifi_recover_reason,
-             (unsigned long)(M65_WIFI_RETRY_DELAY_MS / 1000u));
+    uint32_t delay_ms = wifi_recover_first_retry_used ? M65_WIFI_RETRY_DELAY_MS : M65_WIFI_FIRST_RETRY_DELAY_MS;
+    wifi_recover_first_retry_used = true;
+    wifi_schedule_recover_after(reason, delay_ms);
 }
 
 static void wifi_clear_recover(void)
@@ -388,6 +504,7 @@ static const char default_top[] =
     ".boards a,.boards span{padding:7px 10px}table{border-collapse:collapse;width:100%;background:#10161f}"
     "th,td{border-bottom:1px solid #263140;padding:10px 12px;text-align:left;vertical-align:top}"
     "th{background:#1b2531;color:#fff}.start{display:inline-block;margin-right:10px;padding:5px 9px;background:#1e7a46;color:#fff;text-decoration:none}"
+    "tr[data-kind=PARTIAL] td{background:#151821;color:#96a3b2}tr[data-kind=PARTIAL] .start{background:#5e6671;cursor:default}"
     ".core-name{font-weight:700}.meta{font-size:13px;color:#9fb0c3;margin-top:4px}.meta:empty{display:none}"
     "a{color:#63b3ff}.delete{color:#ff7b7b;background:none;border:0;padding:0;font:inherit;text-decoration:underline;cursor:pointer}"
     "</style></head><body>"
@@ -405,6 +522,35 @@ static const char default_bottom[] =
     "function launchCoreLink(){return true;}"
     "function deleteCore(){alert('Delete requires the WWW interface files on the SD card.');}"
     "</script></main></body></html>\n";
+static const char default_busy[] =
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<meta http-equiv=\"refresh\" content=\"5\">"
+    "<title>MEGA65 JTAG busy</title>"
+    "<style>"
+    "body{margin:0;background:#090c11;color:#e8edf3;font-family:Arial,sans-serif}"
+    "main{width:min(760px,calc(100vw - 32px));margin:48px auto}"
+    ".panel{padding:28px;background:#10161f;border:1px solid #273142;border-left:6px solid #ffd34d}"
+    "h1{margin:0 0 10px;font-size:28px}.status{color:#9fb0c3;word-break:break-word}"
+    ".bar{height:36px;margin:22px 0;overflow:hidden;background:#1c1114;border:2px solid #ffd34d}"
+    ".fill{height:100%;width:{FETCH_PERCENT}%;background:repeating-linear-gradient(135deg,#ffd34d 0,#ffd34d 16px,#d51c1c 16px,#d51c1c 32px);animation:move .45s linear infinite}"
+    ".grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.cell{padding:10px;background:#141b25;border:1px solid #273142}"
+    "button{margin-top:22px;padding:11px 16px;background:#a43838;color:#fff;border:0;font-weight:700;cursor:pointer}"
+    "@keyframes move{from{background-position:0 0}to{background-position:64px 0}}"
+    "@media(max-width:620px){.grid{grid-template-columns:1fr}}"
+    "</style></head><body><main><section class=\"panel\">"
+    "<h1>Fetching cores</h1><div class=\"status\">{FETCH_STATUS}</div>"
+    "<div class=\"bar\"><div class=\"fill\"></div></div>"
+    "<div class=\"grid\">"
+    "<div class=\"cell\"><strong>Stage</strong><br>{FETCH_STAGE}</div>"
+    "<div class=\"cell\"><strong>File</strong><br>{FETCH_FILE}</div>"
+    "<div class=\"cell\"><strong>Manifest</strong><br>{FETCH_CHECKED}/{FETCH_TOTAL} checked</div>"
+    "<div class=\"cell\"><strong>Updated</strong><br>{FETCH_UPDATED}</div>"
+    "<div class=\"cell\"><strong>Current file</strong><br>{FETCH_BYTES}/{FETCH_TOTAL_BYTES} bytes</div>"
+    "<div class=\"cell\"><strong>Average rate</strong><br>{FETCH_RATE_KIBPS} KiB/s</div>"
+    "</div>"
+    "<form method=\"get\" action=\"/fetch/stop\"><button type=\"submit\">Stop fetch</button></form>"
+    "</section></main></body></html>\n";
 
 static bool has_core_ext(const char *name)
 {
@@ -485,10 +631,45 @@ static bool path_has_ext(const char *path, const char *ext)
     return dot && ext_equal_ci(dot, ext);
 }
 
+static bool path_has_suffix_ci(const char *path, const char *suffix)
+{
+    size_t n = strlen(path ? path : "");
+    size_t sn = strlen(suffix ? suffix : "");
+    if (n < sn) return false;
+    const char *tail = path + n - sn;
+    return ext_equal_ci(tail, suffix);
+}
+
+static bool strip_partial_suffix(const char *path, char *out, size_t out_len)
+{
+    static const char suffix[] = ".partial";
+    if (!path_has_suffix_ci(path, suffix)) return false;
+    size_t n = strlen(path);
+    size_t base_len = n - (sizeof suffix - 1u);
+    if (base_len == 0 || base_len >= out_len) return false;
+    memcpy(out, path, base_len);
+    out[base_len] = 0;
+    return true;
+}
+
+static bool is_partial_core_path(const char *path)
+{
+    char base[256];
+    if (!strip_partial_suffix(path, base, sizeof base)) return false;
+    return has_core_ext(base);
+}
+
 static void format_core_label_html(const char *path, const char *file_name, bool is_dir, char *out, size_t out_len)
 {
     if (!out_len) return;
     out[0] = 0;
+    if (!is_dir && is_partial_core_path(path)) {
+        char base[256];
+        if (strip_partial_suffix(file_name ? file_name : "", base, sizeof base)) {
+            html_escape(base, out, out_len);
+            return;
+        }
+    }
     if (!is_dir && path_has_ext(path, ".cor")) {
         core_file_t cf;
         if (core_open(&cf, path)) {
@@ -507,6 +688,11 @@ static void format_core_meta_html(const char *path, const char *file_name, char 
 {
     if (!out_len) return;
     out[0] = 0;
+    if (is_partial_core_path(path)) {
+        (void)file_name;
+        snprintf(out, out_len, "Download in progress");
+        return;
+    }
     if (!path_has_ext(path, ".cor")) return;
 
     core_file_t cf;
@@ -822,7 +1008,25 @@ static void bytes32_to_hex(const uint8_t in[32], char out[65])
     out[64] = 0;
 }
 
-static bool file_sha256_hex(const char *path, char out[65])
+static void autofetch_hash_status_update(const char *stage,
+                                         const char *path,
+                                         uint32_t done,
+                                         uint32_t size)
+{
+    unsigned long percent = size ? (unsigned long)(((uint64_t)done * 100u) / size) : 0ul;
+    snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+             "autofetch=running stage=%s-hash file=%s bytes=%lu/%lu percent=%lu checked=%lu total=%lu updated=%lu",
+             stage ? stage : "file",
+             path ? path : "(unset)",
+             (unsigned long)done,
+             (unsigned long)size,
+             percent,
+             (unsigned long)autofetch_checked_count,
+             (unsigned long)autofetch_manifest_total_count,
+             (unsigned long)autofetch_updated_count);
+}
+
+static bool file_sha256_hex(const char *path, char out[65], const char *autofetch_stage)
 {
     storage_file_t f = {0};
     if (!storage_open(&f, path)) return false;
@@ -838,6 +1042,23 @@ static bool file_sha256_hex(const char *path, char out[65])
     uint8_t buf[M65_HTTP_IO_CHUNK];
     uint32_t done = 0;
     uint32_t size = storage_size(&f);
+    absolute_time_t start = get_absolute_time();
+    absolute_time_t last_report = start;
+    uint32_t last_report_done = 0;
+    bool report = autofetch_stage && autofetch_stage[0];
+    if (report) {
+        autofetch_hash_active = true;
+        autofetch_hash_done = 0;
+        autofetch_hash_size = size;
+        autofetch_hash_started_at = start;
+        snprintf(autofetch_hash_stage, sizeof autofetch_hash_stage, "%s-hash", autofetch_stage);
+        snprintf(autofetch_hash_path, sizeof autofetch_hash_path, "%s", path);
+        autofetch_hash_status_update(autofetch_stage, path, 0, size);
+        remote_log(1, "+AUTOFETCH: verifying hash of file start stage=%s file=%s bytes=%lu",
+                   autofetch_stage,
+                   path,
+                   (unsigned long)size);
+    }
     bool ok = true;
     while (done < size) {
         size_t want = size - done;
@@ -852,6 +1073,30 @@ static bool file_sha256_hex(const char *path, char out[65])
             break;
         }
         done += (uint32_t)got;
+        if (report) {
+            autofetch_hash_done = done;
+            cyw43_arch_poll();
+            absolute_time_t now = get_absolute_time();
+            bool time_due = absolute_time_diff_us(last_report, now) >= (int64_t)M65_FILE_HASH_PROGRESS_MS * 1000ll;
+            bool bytes_due = done - last_report_done >= M65_FILE_HASH_PROGRESS_BYTES;
+            if (done == size || time_due || bytes_due) {
+                int64_t us = absolute_time_diff_us(start, now);
+                if (us <= 0) us = 1;
+                unsigned long percent = size ? (unsigned long)(((uint64_t)done * 100u) / size) : 0ul;
+                unsigned long avg_KiBps = (unsigned long)(((uint64_t)done * 1000000u) / ((uint64_t)us * 1024u));
+                autofetch_hash_status_update(autofetch_stage, path, done, size);
+                remote_log(remote_verbose >= 2u ? 2u : 1u,
+                           "+AUTOFETCH: verifying hash of file progress stage=%s file=%s bytes=%lu/%lu percent=%lu avg_KiBps=%lu",
+                           autofetch_stage,
+                           path,
+                           (unsigned long)done,
+                           (unsigned long)size,
+                           percent,
+                           avg_KiBps);
+                last_report = now;
+                last_report_done = done;
+            }
+        }
     }
     storage_close(&f);
 
@@ -862,6 +1107,21 @@ static bool file_sha256_hex(const char *path, char out[65])
         ok = false;
     }
     mbedtls_sha256_free(&sha);
+    if (report) {
+        int64_t us = absolute_time_diff_us(start, get_absolute_time());
+        if (us < 0) us = 0;
+        remote_log(1, "+AUTOFETCH: verifying hash of file %s stage=%s file=%s bytes=%lu time_ms=%lu",
+                   ok ? "done" : "failed",
+                   autofetch_stage,
+                   path,
+                   (unsigned long)done,
+                   (unsigned long)(us / 1000ll));
+        autofetch_hash_active = false;
+        autofetch_hash_done = 0;
+        autofetch_hash_size = 0;
+        autofetch_hash_stage[0] = 0;
+        autofetch_hash_path[0] = 0;
+    }
     return ok;
 }
 
@@ -995,6 +1255,100 @@ static bool load_template(const char *path, char *buf, size_t buflen, const char
     return false;
 }
 
+static bool load_binary_asset(const char *path, uint8_t *buf, size_t buflen, size_t *size_out)
+{
+    if (size_out) *size_out = 0;
+    if (!path || !buf || buflen == 0) return false;
+
+    storage_file_t f = {0};
+    if (!storage_open(&f, path)) return false;
+    uint32_t size = storage_size(&f);
+    if (size == 0 || size > buflen) {
+        storage_close(&f);
+        return false;
+    }
+    size_t got = 0;
+    bool ok = storage_read(&f, buf, size, &got) && got == size;
+    storage_close(&f);
+    if (!ok) return false;
+    if (size_out) *size_out = (size_t)size;
+    return true;
+}
+
+static void load_cached_web_assets(void)
+{
+    busy_template_loaded = load_template("WWW/fetch_busy.html",
+                                         busy_template,
+                                         sizeof busy_template,
+                                         default_busy);
+    favicon_cache_loaded = load_binary_asset("WWW/favicon-32x32.png",
+                                             favicon_cache,
+                                             sizeof favicon_cache,
+                                             &favicon_cache_len);
+}
+
+static const char *autofetch_stage_name(void)
+{
+    if (autofetch_hash_active && autofetch_hash_stage[0]) return autofetch_hash_stage;
+    switch (autofetch_state) {
+    case AUTOFETCH_MANIFEST: return "manifest";
+    case AUTOFETCH_SCAN: return "scan";
+    case AUTOFETCH_VERIFY: return "verify";
+    case AUTOFETCH_CORE: return "core";
+    default: return "idle";
+    }
+}
+
+static const char *autofetch_current_file(void)
+{
+    if (autofetch_hash_active && autofetch_hash_path[0]) return autofetch_hash_path;
+    if (autofetch_state == AUTOFETCH_MANIFEST) return autofetch_manifest_path;
+    if (autofetch_state == AUTOFETCH_CORE || autofetch_state == AUTOFETCH_VERIFY) return autofetch_pending_path;
+    return autofetch_manifest_path[0] ? autofetch_manifest_path : "(none)";
+}
+
+static uint32_t autofetch_current_bytes(void)
+{
+    if (autofetch_hash_active) return autofetch_hash_done;
+    if (autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE) {
+        return autofetch_fc.body_done;
+    }
+    return 0;
+}
+
+static uint32_t autofetch_current_total_bytes(void)
+{
+    if (autofetch_hash_active) return autofetch_hash_size;
+    if ((autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE) &&
+        autofetch_fc.content_length) {
+        return autofetch_fc.content_length;
+    }
+    return 0;
+}
+
+static uint32_t autofetch_current_percent(void)
+{
+    uint32_t total = autofetch_current_total_bytes();
+    if (!total) return (autofetch_running || autofetch_state != AUTOFETCH_IDLE) ? 0u : 100u;
+    return (uint32_t)(((uint64_t)autofetch_current_bytes() * 100u) / total);
+}
+
+static uint32_t autofetch_current_rate_kibps(void)
+{
+    if (autofetch_hash_active && autofetch_hash_size) {
+        int64_t us = absolute_time_diff_us(autofetch_hash_started_at, get_absolute_time());
+        if (us <= 0) return 0;
+        return (uint32_t)(((uint64_t)autofetch_hash_done * 1000000u) / ((uint64_t)us * 1024u));
+    }
+    if (!(autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE) ||
+        !autofetch_fc.content_length) {
+        return 0;
+    }
+    int64_t us = absolute_time_diff_us(autofetch_fc.body_started_at, get_absolute_time());
+    if (us <= 0) return 0;
+    return (uint32_t)(((uint64_t)autofetch_fc.body_done * 1000000u) / ((uint64_t)us * 1024u));
+}
+
 static void substitution_value(const char *name,
                                const char *file_name,
                                const char *file_path,
@@ -1018,6 +1372,34 @@ static void substitution_value(const char *name,
         snprintf(out, out_len, "%lu", (unsigned long)write_gate_remaining_ms());
     } else if (ci_equal(name, "WRITE_GRANT_REQUIRED")) {
         snprintf(out, out_len, "%s", http_cfg.require_write_grant ? "required" : "not required");
+    } else if (ci_equal(name, "FETCH_STATUS")) {
+        html_escape(autofetch_status_buf[0] ? autofetch_status_buf : "autofetch=idle", out, out_len);
+    } else if (ci_equal(name, "FETCH_STAGE")) {
+        snprintf(out, out_len, "%s", autofetch_stage_name());
+    } else if (ci_equal(name, "FETCH_FILE")) {
+        html_escape(autofetch_current_file(), out, out_len);
+    } else if (ci_equal(name, "FETCH_CHANNEL")) {
+        html_escape(autofetch_channel, out, out_len);
+    } else if (ci_equal(name, "FETCH_CHECKED")) {
+        snprintf(out, out_len, "%lu", (unsigned long)autofetch_checked_count);
+    } else if (ci_equal(name, "FETCH_TOTAL")) {
+        snprintf(out, out_len, "%lu", (unsigned long)autofetch_manifest_total_count);
+    } else if (ci_equal(name, "FETCH_UPDATED")) {
+        snprintf(out, out_len, "%lu", (unsigned long)autofetch_updated_count);
+    } else if (ci_equal(name, "FETCH_BYTES")) {
+        snprintf(out, out_len, "%lu", (unsigned long)autofetch_current_bytes());
+    } else if (ci_equal(name, "FETCH_TOTAL_BYTES")) {
+        snprintf(out, out_len, "%lu", (unsigned long)autofetch_current_total_bytes());
+    } else if (ci_equal(name, "FETCH_PERCENT")) {
+        snprintf(out, out_len, "%lu", (unsigned long)autofetch_current_percent());
+    } else if (ci_equal(name, "FETCH_RATE_KIBPS") || ci_equal(name, "FETCH_AVG_KIBPS")) {
+        snprintf(out, out_len, "%lu", (unsigned long)autofetch_current_rate_kibps());
+    } else if (ci_equal(name, "FETCH_RETRY")) {
+        snprintf(out, out_len, "%lu", (unsigned long)autofetch_fetch_retry_count);
+    } else if (ci_equal(name, "FETCH_RETRIES")) {
+        snprintf(out, out_len, "%lu", (unsigned long)M65_AUTOFETCH_FILE_RETRIES);
+    } else if (ci_equal(name, "FETCH_REFRESH_SECONDS")) {
+        snprintf(out, out_len, "5");
     } else if (ci_equal(name, "BOARD_REV")) {
         snprintf(out, out_len, "%lu", (unsigned long)board_rev);
     } else if (ci_equal(name, "BOARD_LABEL")) {
@@ -1043,15 +1425,17 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "FILENAME_JS")) {
         js_string_escape(file_name ? file_name : "", out, out_len);
     } else if (ci_equal(name, "TYPE")) {
-        snprintf(out, out_len, "%s", is_dir ? "DIR" : "CORE");
+        snprintf(out, out_len, "%s", is_dir ? "DIR" : (is_partial_core_path(file_path) ? "PARTIAL" : "CORE"));
     } else if (ci_equal(name, "SIZE")) {
         if (is_dir) snprintf(out, out_len, "-");
         else snprintf(out, out_len, "%lu", (unsigned long)size);
     } else if (ci_equal(name, "PRIMARY_LABEL")) {
-        snprintf(out, out_len, "%s", is_dir ? "Open" : "Launch Core");
+        snprintf(out, out_len, "%s", is_dir ? "Open" : (is_partial_core_path(file_path) ? "Downloading" : "Launch Core"));
     } else if (ci_equal(name, "PRIMARY_URL")) {
         if (is_dir) {
             make_index_url(file_path, board_rev, out, out_len);
+        } else if (is_partial_core_path(file_path)) {
+            snprintf(out, out_len, "#");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
             if (board_rev == 3 || board_rev == 6) {
@@ -1063,6 +1447,8 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "FILE_URL")) {
         if (is_dir) {
             make_index_url(file_path, board_rev, out, out_len);
+        } else if (is_partial_core_path(file_path)) {
+            snprintf(out, out_len, "#");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
             snprintf(out, out_len, "/files/%s", encoded);
@@ -1070,6 +1456,8 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "JTAG_URL")) {
         if (is_dir) {
             make_index_url(file_path, board_rev, out, out_len);
+        } else if (is_partial_core_path(file_path)) {
+            snprintf(out, out_len, "#");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
             if (board_rev == 3 || board_rev == 6) {
@@ -1079,14 +1467,14 @@ static void substitution_value(const char *name,
             }
         }
     } else if (ci_equal(name, "DELETE_URL")) {
-        if (is_dir) {
+        if (is_dir || is_partial_core_path(file_path)) {
             snprintf(out, out_len, "#");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
             snprintf(out, out_len, "/delete?file=%s", encoded);
         }
     } else if (ci_equal(name, "ACTIONS")) {
-        if (is_dir) {
+        if (is_dir || is_partial_core_path(file_path)) {
             snprintf(out, out_len, "");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
@@ -1248,7 +1636,8 @@ static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
     char full_path[256];
     if (!make_child_path(il->dir_path, name, full_path, sizeof full_path)) return;
 
-    if (!is_dir && (il->board_rev == 3 || il->board_rev == 6)) {
+    bool is_partial = !is_dir && is_partial_core_path(full_path);
+    if (!is_dir && !is_partial && (il->board_rev == 3 || il->board_rev == 6)) {
         core_file_t cf;
         if (!core_open(&cf, full_path)) return;
         bool match = core_matches_board(&cf, full_path, il->board_rev);
@@ -1315,15 +1704,14 @@ static bool tcp_write_copy(http_conn_t *c, const void *data, size_t len)
     return true;
 }
 
-static err_t send_response(http_conn_t *c,
-                           int code,
-                           const char *reason,
-                           const char *content_type,
-                           const char *body)
+static err_t send_response_bytes(http_conn_t *c,
+                                 int code,
+                                 const char *reason,
+                                 const char *content_type,
+                                 const void *body,
+                                 size_t body_len)
 {
-    if (!body) body = "";
     char header[256];
-    size_t body_len = strlen(body);
     snprintf(header, sizeof header,
              "HTTP/1.0 %d %s\r\n"
              "Connection: close\r\n"
@@ -1334,8 +1722,18 @@ static err_t send_response(http_conn_t *c,
              code, reason, content_type ? content_type : "text/plain",
              (unsigned long)body_len);
     if (!tcp_write_copy(c, header, strlen(header))) return http_close(c);
-    if (!tcp_write_copy(c, body, body_len)) return http_close(c);
+    if (body_len && body && !tcp_write_copy(c, body, body_len)) return http_close(c);
     return http_close(c);
+}
+
+static err_t send_response(http_conn_t *c,
+                           int code,
+                           const char *reason,
+                           const char *content_type,
+                           const char *body)
+{
+    if (!body) body = "";
+    return send_response_bytes(c, code, reason, content_type, body, strlen(body));
 }
 
 static err_t send_error(http_conn_t *c, int code, const char *reason, const char *msg)
@@ -1352,6 +1750,45 @@ static err_t send_identity(http_conn_t *c)
     machine_identity_format(identity, sizeof identity);
     snprintf(body, sizeof body, "%s\n", identity);
     return send_response(c, 200, "OK", "text/plain", body);
+}
+
+static err_t send_cached_favicon(http_conn_t *c)
+{
+    if (!favicon_cache_loaded || favicon_cache_len == 0) {
+        return send_error(c, 404, "Not Found", "favicon is not cached");
+    }
+    return send_response_bytes(c, 200, "OK", "image/png", favicon_cache, favicon_cache_len);
+}
+
+static bool is_favicon_request(const char *path)
+{
+    return ci_equal(path, "/favicon.ico") || ci_equal(path, "/WWW/favicon-32x32.png");
+}
+
+static bool autofetch_web_busy(void)
+{
+    return autofetch_running || autofetch_state != AUTOFETCH_IDLE;
+}
+
+static err_t send_busy_page(http_conn_t *c)
+{
+    char *page_buf = (char *)malloc(M65_HTTP_BUSY_PAGE_MAX);
+    if (!page_buf) {
+        return send_error(c, 503, "Service Unavailable", "busy fetching cores");
+    }
+    page_builder_t pb = { .buf = page_buf, .cap = M65_HTTP_BUSY_PAGE_MAX };
+    page_buf[0] = 0;
+    append_substituted(&pb,
+                       busy_template_loaded ? busy_template : default_busy,
+                       NULL,
+                       NULL,
+                       "/",
+                       0,
+                       false,
+                       0);
+    err_t ret = send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
+    free(page_buf);
+    return ret;
 }
 
 static bool request_wants_html(const http_conn_t *c)
@@ -1678,7 +2115,7 @@ static err_t begin_put_file(http_conn_t *c, const char *path)
     if (c->content_length == 0) return send_error(c, 411, "Length Required", "Content-Length must be non-zero");
 
     snprintf(c->path, sizeof c->path, "%s", path);
-    if (snprintf(c->tmp_path, sizeof c->tmp_path, "%s.tmp", path) >= (int)sizeof c->tmp_path) {
+    if (snprintf(c->tmp_path, sizeof c->tmp_path, "%s.partial", path) >= (int)sizeof c->tmp_path) {
         return send_error(c, 400, "Bad Request", "path too long");
     }
     storage_delete(c->tmp_path);
@@ -1711,7 +2148,7 @@ static err_t begin_put_jtag(http_conn_t *c)
         if (!make_download_path(spool_name, c->path, sizeof c->path)) {
             return send_error(c, 400, "Bad Request", "unsafe DOWNLOADS filename");
         }
-        if (snprintf(c->tmp_path, sizeof c->tmp_path, "%s.tmp", c->path) >= (int)sizeof c->tmp_path) {
+        if (snprintf(c->tmp_path, sizeof c->tmp_path, "%s.partial", c->path) >= (int)sizeof c->tmp_path) {
             return send_error(c, 400, "Bad Request", "path too long");
         }
         if (!storage_mkdir("DOWNLOADS")) {
@@ -1789,10 +2226,44 @@ static err_t write_jtag_body(http_conn_t *c, const uint8_t *data, size_t len)
     return ERR_OK;
 }
 
+static bool finish_signed_receive_logged(signed_file_rx_t *rx,
+                                         const char *prefix,
+                                         const char *path,
+                                         bool update_autofetch_status)
+{
+    if (!rx) return false;
+    const char *file = path && path[0] ? path : rx->final_path;
+    const char *action = (rx->require_signature || rx->candidate_signature) ?
+                         "verifying hash and signature of file" :
+                         "finalising received file";
+    if (update_autofetch_status) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                 "autofetch=running stage=signature file=%s action=\"%s\" checked=%lu total=%lu updated=%lu",
+                 file,
+                 action,
+                 (unsigned long)autofetch_checked_count,
+                 (unsigned long)autofetch_manifest_total_count,
+                 (unsigned long)autofetch_updated_count);
+    }
+
+    absolute_time_t start = get_absolute_time();
+    remote_log(1, "%s %s start file=%s", prefix ? prefix : "+FILE:", action, file);
+    bool ok = signed_file_receive_finish(rx);
+    int64_t us = absolute_time_diff_us(start, get_absolute_time());
+    if (us < 0) us = 0;
+    remote_log(1, "%s %s %s file=%s time_ms=%lu",
+               prefix ? prefix : "+FILE:",
+               action,
+               ok ? "done" : "failed",
+               file,
+               (unsigned long)(us / 1000ll));
+    return ok;
+}
+
 static err_t finish_put(http_conn_t *c)
 {
     if (c->put_op == HTTP_PUT_FILE) {
-        if (!signed_file_receive_finish(&c->signed_rx)) {
+        if (!finish_signed_receive_logged(&c->signed_rx, "+HTTP:", c->path, false)) {
             signed_file_receive_abort(&c->signed_rx);
             return send_error(c, 400, "Bad Request", signed_file_last_error());
         }
@@ -1806,7 +2277,7 @@ static err_t finish_put(http_conn_t *c)
     }
     if (c->put_op == HTTP_PUT_JTAG) {
         if (c->jtag_spool) {
-            if (!signed_file_receive_finish(&c->signed_rx)) {
+            if (!finish_signed_receive_logged(&c->signed_rx, "+HTTP:", c->path, false)) {
                 signed_file_receive_abort(&c->signed_rx);
                 return send_error(c, 400, "Bad Request", signed_file_last_error());
             }
@@ -1903,6 +2374,28 @@ static err_t parse_headers(http_conn_t *c)
     c->content_length = 0;
     const char *cl = header_value(c->header, "Content-Length");
     if (cl) c->content_length = (uint32_t)strtoul(cl, NULL, 10);
+
+    if (ci_equal(c->method, "GET") && is_favicon_request(target_path)) {
+        if (favicon_cache_loaded) return send_cached_favicon(c);
+        if (ci_equal(target_path, "/WWW/favicon-32x32.png") && !autofetch_web_busy()) {
+            return start_www_download(c, "favicon-32x32.png");
+        }
+        return send_error(c, 404, "Not Found", "favicon is not cached");
+    }
+
+    if ((ci_equal(c->method, "GET") || ci_equal(c->method, "PUT")) &&
+        ci_equal(target_path, "/fetch/stop")) {
+        autofetch_cancel("web stop", 900000u);
+        return send_redirect(c, "/index.html");
+    }
+
+    if (autofetch_web_busy() && ci_equal(c->method, "GET") &&
+        (request_wants_html(c) || ci_equal(target_path, "/") || ci_equal(target_path, "/index.html"))) {
+        return send_busy_page(c);
+    }
+    if (autofetch_web_busy()) {
+        return send_error(c, 423, "Locked", "busy fetching cores");
+    }
 
     if (ci_equal(c->method, "GET")) {
         if (ci_equal(target_path, "/") || ci_equal(target_path, "/index.html")) {
@@ -2075,6 +2568,113 @@ static void fetch_set_error(fetch_ctx_t *fc, const char *msg)
     }
 }
 
+static void fetch_report_progress(fetch_ctx_t *fc)
+{
+    if (!fc || fc->content_length == 0) return;
+
+    const uint32_t done = fc->body_done;
+    const uint32_t total = fc->content_length;
+    const absolute_time_t now = get_absolute_time();
+    int64_t inst_us = absolute_time_diff_us(fc->last_progress_at, now);
+    int64_t avg_us = absolute_time_diff_us(fc->body_started_at, now);
+    if (inst_us <= 0) inst_us = 1;
+    if (avg_us <= 0) avg_us = 1;
+    const uint32_t delta = done - fc->last_progress_bytes;
+    const unsigned long percent = (unsigned long)(((uint64_t)done * 100u) / total);
+    const unsigned long rate_KiBps = (unsigned long)(((uint64_t)delta * 1000000u) / ((uint64_t)inst_us * 1024u));
+    const unsigned long avg_KiBps = (unsigned long)(((uint64_t)done * 1000000u) / ((uint64_t)avg_us * 1024u));
+
+    if (fc == &autofetch_fc &&
+        (autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE)) {
+        const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core";
+        const char *file = autofetch_state == AUTOFETCH_MANIFEST ? autofetch_manifest_path : autofetch_pending_path;
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                 "autofetch=running stage=%s file=%s bytes=%lu/%lu percent=%lu rate_KiBps=%lu avg_KiBps=%lu checked=%lu total=%lu updated=%lu",
+                 stage,
+                 file[0] ? file : fc->final_path,
+                 (unsigned long)done,
+                 (unsigned long)total,
+                 percent,
+                 rate_KiBps,
+                 avg_KiBps,
+                 (unsigned long)autofetch_checked_count,
+                 (unsigned long)autofetch_manifest_total_count,
+                 (unsigned long)autofetch_updated_count);
+    }
+
+    if (remote_verbose == 0) return;
+    uint32_t threshold = remote_verbose >= 2u ? 65536u : 262144u;
+    uint8_t level = remote_verbose >= 2u ? 2u : 1u;
+    if (done != total && done - fc->last_progress_report < threshold) return;
+
+    fc->last_progress_report = done;
+    fc->last_progress_at = now;
+    fc->last_progress_bytes = done;
+    remote_log(level, "+FETCH: progress dest=%s bytes=%lu/%lu percent=%lu rate_KiBps=%lu avg_KiBps=%lu",
+               fc->final_path,
+               (unsigned long)done,
+               (unsigned long)total,
+               percent,
+               rate_KiBps,
+               avg_KiBps);
+}
+
+static void fetch_idle_diagnostics(fetch_ctx_t *fc, absolute_time_t now)
+{
+    if (!fc || !fc->pcb || fc->state != FETCH_RECV_BODY) return;
+    int64_t idle_us = absolute_time_diff_us(fc->last_rx_at, now);
+    if (idle_us < 0) idle_us = 0;
+
+    if (idle_us >= (int64_t)M65_FETCH_ACK_NUDGE_MS * 1000ll &&
+        absolute_time_diff_us(fc->last_ack_nudge_at, now) >= (int64_t)M65_FETCH_ACK_NUDGE_MS * 1000ll) {
+        err_t ack_err = tcp_send_empty_ack(fc->pcb);
+        fc->last_ack_nudge_at = now;
+        if (remote_verbose >= 2u) {
+            remote_log(2, "+FETCHACK: dest=%s idle_ms=%lu rc=%d ack=%lu wnd=%lu flags=%04x",
+                       fc->final_path,
+                       (unsigned long)(idle_us / 1000ll),
+                       (int)ack_err,
+                       (unsigned long)fc->pcb->rcv_nxt,
+                       (unsigned long)fc->pcb->rcv_wnd,
+                       (unsigned)fc->pcb->flags);
+        }
+    }
+
+    if (remote_verbose < 2u) return;
+    if (idle_us < (int64_t)M65_FETCH_IDLE_DIAG_MS * 1000ll ||
+        absolute_time_diff_us(fc->last_idle_diag_at, now) < (int64_t)M65_FETCH_IDLE_DIAG_MS * 1000ll) {
+        return;
+    }
+    fc->last_idle_diag_at = now;
+#if TCP_QUEUE_OOSEQ
+    unsigned long ooseq = fc->pcb->ooseq ? 1ul : 0ul;
+#else
+    unsigned long ooseq = 0;
+#endif
+    remote_log(2,
+               "+FETCHIDLE: dest=%s idle_ms=%lu bytes=%lu/%lu rcv_nxt=%lu rcv_wnd=%lu rcv_ann_wnd=%lu rcv_ann_edge=%lu state=%u flags=%04x rtime=%d rto=%d nrtx=%u dupacks=%u lastack=%lu snd_nxt=%lu snd_wnd=%lu unsent=%lu unacked=%lu ooseq=%lu",
+               fc->final_path,
+               (unsigned long)(idle_us / 1000ll),
+               (unsigned long)fc->body_done,
+               (unsigned long)fc->content_length,
+               (unsigned long)fc->pcb->rcv_nxt,
+               (unsigned long)fc->pcb->rcv_wnd,
+               (unsigned long)fc->pcb->rcv_ann_wnd,
+               (unsigned long)fc->pcb->rcv_ann_right_edge,
+               (unsigned)fc->pcb->state,
+               (unsigned)fc->pcb->flags,
+               (int)fc->pcb->rtime,
+               (int)fc->pcb->rto,
+               (unsigned)fc->pcb->nrtx,
+               (unsigned)fc->pcb->dupacks,
+               (unsigned long)fc->pcb->lastack,
+               (unsigned long)fc->pcb->snd_nxt,
+               (unsigned long)fc->pcb->snd_wnd,
+               (unsigned long)(fc->pcb->unsent ? 1u : 0u),
+               (unsigned long)(fc->pcb->unacked ? 1u : 0u),
+               ooseq);
+}
+
 static void fetch_close(fetch_ctx_t *fc, bool aborting)
 {
     if (!fc || !fc->pcb) return;
@@ -2090,6 +2690,35 @@ static void fetch_close(fetch_ctx_t *fc, bool aborting)
     } else if (tcp_close(pcb) != ERR_OK) {
         tcp_abort(pcb);
     }
+}
+
+static uint16_t fetch_random_local_port(void)
+{
+    static uint32_t state;
+    if (state == 0) {
+        state = time_us_32() ^ 0xa65e7101u ^ ((uint32_t)wifi_probe_attempts << 16);
+        if (state == 0) state = 0x13579bdfu;
+    }
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    state += 0x9e3779b9u + time_us_32();
+    return (uint16_t)(49152u + (state % (65535u - 49152u)));
+}
+
+static bool fetch_bind_random_local_port(fetch_ctx_t *fc)
+{
+    if (!fc || !fc->pcb) return false;
+    for (unsigned i = 0; i < 8u; ++i) {
+        uint16_t port = fetch_random_local_port();
+        err_t err = tcp_bind(fc->pcb, IP_ANY_TYPE, port);
+        if (err == ERR_OK) {
+            fc->local_port = port;
+            return true;
+        }
+        if (err != ERR_USE) break;
+    }
+    return false;
 }
 
 static bool parse_http_url(const char *url, char *host, size_t host_len, uint16_t *port, char *path, size_t path_len)
@@ -2136,8 +2765,8 @@ static err_t fetch_connected(void *arg, struct tcp_pcb *pcb, err_t err)
         return ERR_OK;
     }
 
-    remote_log(1, "+FETCH: connected host=%s port=%u path=%s",
-               fc->host, (unsigned)fc->port, fc->path);
+    remote_log(1, "+FETCH: connected host=%s port=%u local_port=%u path=%s",
+               fc->host, (unsigned)fc->port, (unsigned)fc->local_port, fc->path);
 
     char req[512];
     int n = snprintf(req, sizeof req,
@@ -2174,17 +2803,10 @@ static bool fetch_process_body(fetch_ctx_t *fc, const uint8_t *data, size_t len)
         return false;
     }
     fc->body_done += (uint32_t)len;
-    if (remote_verbose >= 2u &&
-        (fc->body_done == fc->content_length ||
-         fc->body_done - fc->last_progress_report >= 65536u)) {
-        fc->last_progress_report = fc->body_done;
-        remote_log(2, "+FETCH: progress dest=%s bytes=%lu/%lu",
-                   fc->final_path,
-                   (unsigned long)fc->body_done,
-                   (unsigned long)fc->content_length);
-    }
+    fc->last_rx_at = get_absolute_time();
+    fetch_report_progress(fc);
     if (fc->body_done == fc->content_length) {
-        if (!signed_file_receive_finish(&fc->signed_rx)) {
+        if (!finish_signed_receive_logged(&fc->signed_rx, "+FETCH:", fc->final_path, fc == &autofetch_fc)) {
             fetch_set_error(fc, signed_file_last_error());
             return false;
         }
@@ -2223,6 +2845,13 @@ static bool fetch_parse_headers(fetch_ctx_t *fc, const uint8_t *body, size_t bod
                status,
                (unsigned long)fc->content_length,
                fc->final_path);
+    fc->body_started_at = get_absolute_time();
+    fc->last_rx_at = fc->body_started_at;
+    fc->last_idle_diag_at = fc->body_started_at;
+    fc->last_ack_nudge_at = fc->body_started_at;
+    fc->last_progress_at = fc->body_started_at;
+    fc->last_progress_report = 0;
+    fc->last_progress_bytes = 0;
 
     const remote_auth_config_t *cfg = fc->cfg ? fc->cfg : &http_cfg;
     storage_delete(fc->tmp_path);
@@ -2302,6 +2931,7 @@ static void fetch_err(void *arg, err_t err)
     (void)err;
     fetch_ctx_t *fc = (fetch_ctx_t *)arg;
     if (!fc) return;
+    fc->pcb = NULL;
     if (fc->state != FETCH_DONE) fetch_set_error(fc, "TCP connection aborted");
 }
 
@@ -2319,6 +2949,20 @@ static void fetch_dns_cb(const char *name, const ip_addr_t *ipaddr, void *arg)
         fetch_set_error(fc, "cannot allocate TCP PCB");
         return;
     }
+    char ip_text[24] = "?";
+    if (IP_IS_V4(ipaddr)) {
+        uint32_t ip = lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(ipaddr)));
+        remote_auth_format_ipv4(ip, ip_text, sizeof ip_text);
+    }
+    remote_log(1, "+FETCH: resolved host=%s ip=%s port=%u",
+               fc->host,
+               ip_text,
+               (unsigned)fc->port);
+    if (!fetch_bind_random_local_port(fc)) {
+        fetch_set_error(fc, "cannot bind TCP source port");
+        fetch_close(fc, true);
+        return;
+    }
     tcp_arg(fc->pcb, fc);
     tcp_recv(fc->pcb, fetch_recv);
     tcp_err(fc->pcb, fetch_err);
@@ -2328,6 +2972,10 @@ static void fetch_dns_cb(const char *name, const ip_addr_t *ipaddr, void *arg)
         fetch_close(fc, true);
     } else {
         fc->state = FETCH_CONNECTING;
+        remote_log(1, "+FETCH: connecting ip=%s port=%u local_port=%u",
+                   ip_text,
+                   (unsigned)fc->port,
+                   (unsigned)fc->local_port);
     }
 }
 
@@ -2359,8 +3007,9 @@ static bool fetch_start(fetch_ctx_t *fc,
     fc->cfg = cfg ? cfg : &http_cfg;
     fc->check_write_grant = check_write_grant;
     fc->deadline = make_timeout_time_ms(timeout_ms ? timeout_ms : 60000u);
+    fc->connect_deadline = make_timeout_time_ms(M65_FETCH_CONNECT_TIMEOUT_MS);
     snprintf(fc->final_path, sizeof fc->final_path, "%s", final_path);
-    if (snprintf(fc->tmp_path, sizeof fc->tmp_path, "%s.tmp", fc->final_path) >= (int)sizeof fc->tmp_path) {
+    if (snprintf(fc->tmp_path, sizeof fc->tmp_path, "%s.partial", fc->final_path) >= (int)sizeof fc->tmp_path) {
         if (err && err_len) snprintf(err, err_len, "destination filename too long");
         return false;
     }
@@ -2378,6 +3027,10 @@ static bool fetch_start(fetch_ctx_t *fc,
         if (err && err_len) snprintf(err, err_len, "DNS lookup failed");
         return false;
     }
+    if (fc->state == FETCH_FAILED) {
+        if (err && err_len) snprintf(err, err_len, "%s", fc->err[0] ? fc->err : "fetch start failed");
+        return false;
+    }
     return true;
 }
 
@@ -2385,7 +3038,24 @@ static bool fetch_poll(fetch_ctx_t *fc)
 {
     if (!fc) return false;
     if (fc->state == FETCH_DONE || fc->state == FETCH_FAILED) return true;
-    if (absolute_time_diff_us(get_absolute_time(), fc->deadline) <= 0) {
+    absolute_time_t now = get_absolute_time();
+    if (fc->state == FETCH_CONNECTING &&
+        absolute_time_diff_us(now, fc->connect_deadline) <= 0) {
+        fetch_set_error(fc, "TCP connect timed out");
+        fetch_close(fc, true);
+        storage_delete(fc->tmp_path);
+        return true;
+    }
+    fetch_idle_diagnostics(fc, now);
+    if (fc->state == FETCH_RECV_BODY && fc->body_done < fc->content_length &&
+        absolute_time_diff_us(fc->last_rx_at, now) >= (int64_t)M65_FETCH_IDLE_TIMEOUT_MS * 1000ll) {
+        fetch_set_error(fc, "TCP receive idle timed out");
+        signed_file_receive_abort(&fc->signed_rx);
+        fetch_close(fc, true);
+        storage_delete(fc->tmp_path);
+        return true;
+    }
+    if (absolute_time_diff_us(now, fc->deadline) <= 0) {
         fetch_set_error(fc, "fetch timed out");
         signed_file_receive_abort(&fc->signed_rx);
         fetch_close(fc, true);
@@ -2477,6 +3147,52 @@ void remote_http_autofetch_reset_schedule(void)
     autofetch_schedule_after(30000u);
 }
 
+typedef struct {
+    const char *dir;
+    uint32_t deleted;
+} partial_cleanup_ctx_t;
+
+static void delete_partial_tree(const char *dir, uint32_t *deleted);
+
+static void delete_partial_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+{
+    (void)size;
+    partial_cleanup_ctx_t *pc = (partial_cleanup_ctx_t *)ctx;
+    if (!pc || !name || !name[0]) return;
+
+    char path[256];
+    if (!make_child_path(pc->dir, name, path, sizeof path)) return;
+    if (is_dir) {
+        if (!ci_equal(name, "WWW")) delete_partial_tree(path, &pc->deleted);
+        return;
+    }
+    if (is_partial_core_path(path) && storage_delete(path)) pc->deleted++;
+}
+
+static void delete_partial_tree(const char *dir, uint32_t *deleted)
+{
+    partial_cleanup_ctx_t ctx = {
+        .dir = (dir && dir[0]) ? dir : "/",
+        .deleted = deleted ? *deleted : 0,
+    };
+    storage_list_cores(ctx.dir, delete_partial_cb, &ctx);
+    if (deleted) *deleted = ctx.deleted;
+}
+
+static void delete_stale_partials_for_fetch(void)
+{
+    uint32_t deleted = 0;
+    absolute_time_t start = get_absolute_time();
+    remote_log(2, "+AUTOFETCH: partial-cleanup start");
+    delete_partial_tree("/", &deleted);
+    int64_t us = absolute_time_diff_us(start, get_absolute_time());
+    if (us < 0) us = 0;
+    remote_log(2, "+AUTOFETCH: partial-cleanup done deleted=%lu time_ms=%lu",
+               (unsigned long)deleted,
+               (unsigned long)(us / 1000ll));
+    if (deleted) remote_log(1, "+AUTOFETCH: deleted stale partials=%lu", (unsigned long)deleted);
+}
+
 static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms)
 {
     bool had_status = autofetch_status_buf[0] != 0 &&
@@ -2519,8 +3235,9 @@ bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hou
     uint8_t board_rev = effective_fetch_board(board_rev_override);
     http_cfg.fetch_interval_hours = interval_hours;
     autofetch_schedule_valid = false;
+    delete_stale_partials_for_fetch();
     if (!autofetch_start_manifest(board_rev)) {
-        remote_log(1, "+AUTOFETCH: blocked %s", autofetch_status_buf);
+        remote_log(1, "+AUTOFETCH: not-started %s", autofetch_status_buf);
         autofetch_schedule_after(900000u);
         return false;
     }
@@ -2593,6 +3310,25 @@ static bool parse_manifest_entry(char *line, char sha[65], char rel[224], bool *
     return true;
 }
 
+static uint32_t count_manifest_entries(void)
+{
+    uint32_t offset = 0;
+    uint32_t total = 0;
+    char line[320];
+    for (;;) {
+        bool eof = false;
+        if (!read_manifest_line(&offset, line, sizeof line, &eof)) return total;
+        if (eof) return total;
+
+        char sha[65];
+        char rel[224];
+        bool skip = true;
+        char err[80];
+        if (!parse_manifest_entry(line, sha, rel, &skip, err, sizeof err)) return total;
+        if (!skip) total++;
+    }
+}
+
 static bool autofetch_start_manifest(uint8_t board_rev)
 {
     char channel[sizeof autofetch_channel];
@@ -2634,6 +3370,8 @@ static bool autofetch_start_manifest(uint8_t board_rev)
     autofetch_manifest_offset = 0;
     autofetch_checked_count = 0;
     autofetch_updated_count = 0;
+    autofetch_manifest_total_count = 0;
+    autofetch_fetch_retry_count = 0;
     autofetch_running = true;
     autofetch_state = AUTOFETCH_MANIFEST;
     snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
@@ -2658,11 +3396,81 @@ static bool autofetch_start_core(const char *rel, const char *sha)
     snprintf(autofetch_pending_sha, sizeof autofetch_pending_sha, "%s", sha);
     autofetch_state = AUTOFETCH_CORE;
     snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-             "autofetch=running stage=core file=%s checked=%lu updated=%lu",
+             "autofetch=running stage=core file=%s checked=%lu total=%lu updated=%lu",
              rel,
              (unsigned long)autofetch_checked_count,
+             (unsigned long)autofetch_manifest_total_count,
              (unsigned long)autofetch_updated_count);
     return true;
+}
+
+static bool autofetch_retry_current_fetch(const char *reason)
+{
+    autofetch_fetch_retry_count++;
+    if (autofetch_fetch_retry_count >= M65_AUTOFETCH_FILE_RETRIES) return false;
+    const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core";
+    remote_log(1, "+AUTOFETCH: retry stage=%s failure=%lu/%lu reason=%s",
+               stage,
+               (unsigned long)autofetch_fetch_retry_count,
+               (unsigned long)M65_AUTOFETCH_FILE_RETRIES,
+               reason ? reason : "fetch failed");
+
+    if (autofetch_state == AUTOFETCH_MANIFEST) {
+        char url[320];
+        if (!join_url_path(autofetch_base_url, autofetch_manifest_path, url, sizeof url)) {
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=failed stage=manifest reason=manifest-url-too-long");
+            return false;
+        }
+        char err[96];
+        if (!fetch_start(&autofetch_fc, url, autofetch_manifest_path, &autofetch_sig_cfg, false, 120000u, err, sizeof err)) {
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                     "autofetch=failed stage=manifest reason=\"%s\"", err);
+            return false;
+        }
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                 "autofetch=running stage=manifest-retry failure=%lu channel=%s",
+                 (unsigned long)autofetch_fetch_retry_count,
+                 autofetch_channel);
+        return true;
+    }
+
+    if (autofetch_state == AUTOFETCH_CORE) {
+        char rel[sizeof autofetch_pending_path];
+        char sha[sizeof autofetch_pending_sha];
+        snprintf(rel, sizeof rel, "%s", autofetch_pending_path);
+        snprintf(sha, sizeof sha, "%s", autofetch_pending_sha);
+        if (!autofetch_start_core(rel, sha)) return false;
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                 "autofetch=running stage=core-retry file=%s failure=%lu checked=%lu total=%lu updated=%lu",
+                 rel,
+                 (unsigned long)autofetch_fetch_retry_count,
+                 (unsigned long)autofetch_checked_count,
+                 (unsigned long)autofetch_manifest_total_count,
+                 (unsigned long)autofetch_updated_count);
+        return true;
+    }
+
+    return false;
+}
+
+static void autofetch_skip_current_core(const char *reason)
+{
+    remote_log(1, "+AUTOFETCH: skip file=%s failures=%lu reason=%s",
+               autofetch_pending_path[0] ? autofetch_pending_path : "(unset)",
+               (unsigned long)autofetch_fetch_retry_count,
+               reason ? reason : "fetch failed");
+    snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+             "autofetch=running stage=scan skipped=%s failures=%lu reason=\"%s\" checked=%lu total=%lu updated=%lu",
+             autofetch_pending_path[0] ? autofetch_pending_path : "(unset)",
+             (unsigned long)autofetch_fetch_retry_count,
+             reason ? reason : "fetch failed",
+             (unsigned long)autofetch_checked_count,
+             (unsigned long)autofetch_manifest_total_count,
+             (unsigned long)autofetch_updated_count);
+    autofetch_fetch_retry_count = 0;
+    autofetch_pending_path[0] = 0;
+    autofetch_pending_sha[0] = 0;
+    autofetch_state = AUTOFETCH_SCAN;
 }
 
 static bool autofetch_scan_manifest(void)
@@ -2682,13 +3490,15 @@ static bool autofetch_scan_manifest(void)
             autofetch_state = AUTOFETCH_IDLE;
             autofetch_schedule_after(interval_ms_for_hours(http_cfg.fetch_interval_hours));
             snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                     "autofetch=idle last=success channel=%s checked=%lu updated=%lu",
+                     "autofetch=idle last=success channel=%s checked=%lu total=%lu updated=%lu",
                      autofetch_channel,
                      (unsigned long)autofetch_checked_count,
+                     (unsigned long)autofetch_manifest_total_count,
                      (unsigned long)autofetch_updated_count);
-            remote_log(1, "+AUTOFETCH: done channel=%s checked=%lu updated=%lu",
+            remote_log(1, "+AUTOFETCH: done channel=%s checked=%lu total=%lu updated=%lu",
                        autofetch_channel,
                        (unsigned long)autofetch_checked_count,
+                       (unsigned long)autofetch_manifest_total_count,
                        (unsigned long)autofetch_updated_count);
             return true;
         }
@@ -2705,12 +3515,23 @@ static bool autofetch_scan_manifest(void)
         if (skip) continue;
 
         autofetch_checked_count++;
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                 "autofetch=running stage=scan file=%s checked=%lu total=%lu updated=%lu",
+                 rel,
+                 (unsigned long)autofetch_checked_count,
+                 (unsigned long)autofetch_manifest_total_count,
+                 (unsigned long)autofetch_updated_count);
+        remote_log(1, "+AUTOFETCH: check file=%s checked=%lu/%lu",
+                   rel,
+                   (unsigned long)autofetch_checked_count,
+                   (unsigned long)autofetch_manifest_total_count);
         char have[65];
-        if (file_sha256_hex(rel, have) && strcmp(have, sha) == 0) {
-            remote_log(2, "+AUTOFETCH: unchanged file=%s", rel);
-            continue;
+        if (file_sha256_hex(rel, have, "scan") && strcmp(have, sha) == 0) {
+            remote_log(1, "+AUTOFETCH: unchanged file=%s", rel);
+            return true;
         }
         remote_log(1, "+AUTOFETCH: update file=%s", rel);
+        autofetch_fetch_retry_count = 0;
         if (!autofetch_start_core(rel, sha)) return false;
         return true;
     }
@@ -2722,36 +3543,52 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
 
     uint32_t interval_hours = effective_fetch_interval(interval_hours_override);
     uint8_t board_rev = effective_fetch_board(board_rev_override);
-    if (!effective_autofetch_enabled(enabled_override)) {
-        if (autofetch_running) autofetch_cancel("disabled", 0);
-        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=disabled interval_hours=%lu board=R%u",
-                 (unsigned long)interval_hours, (unsigned)board_rev);
-        return;
-    }
-
-    if (!autofetch_schedule_valid) autofetch_schedule_after(30000u);
 
     if (autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE) {
         fetch_poll(&autofetch_fc);
         if (autofetch_fc.state == FETCH_FAILED) {
+            const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core";
+            const char *reason = autofetch_fc.err[0] ? autofetch_fc.err : "fetch failed";
+            storage_delete(autofetch_fc.tmp_path);
+            if (autofetch_retry_current_fetch(reason)) return;
+            if (autofetch_state == AUTOFETCH_CORE) {
+                autofetch_skip_current_core(reason);
+                return;
+            }
             snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
                      "autofetch=failed stage=%s reason=\"%s\"",
-                     autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core",
-                     autofetch_fc.err[0] ? autofetch_fc.err : "fetch failed");
+                     stage,
+                     reason);
             remote_log(1, "+AUTOFETCH: failed stage=%s reason=%s",
-                       autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core",
-                       autofetch_fc.err[0] ? autofetch_fc.err : "fetch failed");
+                       stage,
+                       reason);
             autofetch_cancel("fetch failed", 900000u);
             return;
         }
         if (autofetch_fc.state != FETCH_DONE) return;
 
         if (autofetch_state == AUTOFETCH_MANIFEST) {
+            autofetch_manifest_total_count = count_manifest_entries();
             autofetch_state = AUTOFETCH_SCAN;
-            snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=running stage=scan channel=%s", autofetch_channel);
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                     "autofetch=running stage=scan channel=%s total=%lu",
+                     autofetch_channel,
+                     (unsigned long)autofetch_manifest_total_count);
+            remote_log(1, "+AUTOFETCH: manifest channel=%s total=%lu",
+                       autofetch_channel,
+                       (unsigned long)autofetch_manifest_total_count);
         } else {
             char have[65];
-            if (!file_sha256_hex(autofetch_pending_path, have) || strcmp(have, autofetch_pending_sha) != 0) {
+            autofetch_state = AUTOFETCH_VERIFY;
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                     "autofetch=running stage=verify file=%s checked=%lu total=%lu updated=%lu",
+                     autofetch_pending_path,
+                     (unsigned long)autofetch_checked_count,
+                     (unsigned long)autofetch_manifest_total_count,
+                     (unsigned long)autofetch_updated_count);
+            remote_log(1, "+AUTOFETCH: verify file=%s", autofetch_pending_path);
+            if (!file_sha256_hex(autofetch_pending_path, have, "verify") ||
+                strcmp(have, autofetch_pending_sha) != 0) {
                 storage_delete(autofetch_pending_path);
                 snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
                          "autofetch=failed stage=verify file=%s", autofetch_pending_path);
@@ -2759,6 +3596,9 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
                 return;
             }
             autofetch_updated_count++;
+            remote_log(1, "+AUTOFETCH: verified file=%s updated=%lu",
+                       autofetch_pending_path,
+                       (unsigned long)autofetch_updated_count);
             autofetch_state = AUTOFETCH_SCAN;
         }
     }
@@ -2766,15 +3606,32 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
     if (autofetch_state == AUTOFETCH_SCAN) {
         if (!autofetch_scan_manifest()) {
             autofetch_cancel("manifest scan failed", 900000u);
+        } else if (autofetch_state == AUTOFETCH_IDLE && !autofetch_running) {
+            remote_log(2, "+AUTOFETCH: returned-to-main-loop state=idle checked=%lu total=%lu updated=%lu",
+                       (unsigned long)autofetch_checked_count,
+                       (unsigned long)autofetch_manifest_total_count,
+                       (unsigned long)autofetch_updated_count);
         }
         return;
     }
 
+    if (!effective_autofetch_enabled(enabled_override)) {
+        if (!autofetch_running && autofetch_state == AUTOFETCH_IDLE) {
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                     "autofetch=disabled interval_hours=%lu board=R%u",
+                     (unsigned long)interval_hours, (unsigned)board_rev);
+        }
+        return;
+    }
+
+    if (!autofetch_schedule_valid) autofetch_schedule_after(30000u);
+
     if (autofetch_state == AUTOFETCH_IDLE &&
         absolute_time_diff_us(get_absolute_time(), next_autofetch_due) <= 0) {
         http_cfg.fetch_interval_hours = interval_hours;
+        delete_stale_partials_for_fetch();
         if (!autofetch_start_manifest(board_rev)) {
-            remote_log(1, "+AUTOFETCH: blocked %s", autofetch_status_buf);
+            remote_log(1, "+AUTOFETCH: not-started %s", autofetch_status_buf);
             autofetch_schedule_after(900000u);
         }
     }
@@ -2814,7 +3671,6 @@ static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
     (void)arg;
     if (err != ERR_OK || !newpcb) return ERR_VAL;
-    autofetch_cancel("web request", 900000u);
     if (http_conn.in_use) {
         tcp_abort(newpcb);
         return ERR_ABRT;
@@ -2834,8 +3690,16 @@ static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     return ERR_OK;
 }
 
+static void close_http_listener(void)
+{
+    if (!listen_pcb) return;
+    tcp_accept(listen_pcb, NULL);
+    if (tcp_close(listen_pcb) == ERR_OK) listen_pcb = NULL;
+}
+
 static bool listen_http(uint16_t port)
 {
+    close_http_listener();
     listen_pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
     if (!listen_pcb) return false;
     err_t err = tcp_bind(listen_pcb, IP_ANY_TYPE, port);
@@ -2869,24 +3733,37 @@ static bool remote_http_probe_wifi_hardware(void)
         return false;
     }
     if (cyw43_is_ready) return true;
+    if (wifi_probe_retry_scheduled) {
+        snprintf(http_status_buf, sizeof http_status_buf,
+                 "wifi=probe-retry stage=%s attempts=%lu in=%lus",
+                 wifi_hw_stage_name(wifi_hardware_fault_stage),
+                 (unsigned long)wifi_probe_attempts,
+                 (unsigned long)wifi_probe_retry_seconds());
+        return false;
+    }
 
     ++wifi_probe_attempts;
     wifi_init_rc = -9999;
     snprintf(http_status_buf, sizeof http_status_buf, "wifi=probing hardware=cyw43");
     watchdog_hw->scratch[0] = WIFI_HW_PROBE_MAGIC;
     watchdog_hw->scratch[1] = WIFI_HW_STAGE_INIT;
+    watchdog_hw->scratch[2] = wifi_probe_attempts;
     watchdog_enable(M65_WIFI_HW_PROBE_WATCHDOG_MS, false);
 
     wifi_init_rc = cyw43_arch_init();
     if (wifi_init_rc != 0) {
         watchdog_disable();
         wifi_hw_probe_marker_clear();
-        wifi_hardware_blocked = true;
         wifi_hardware_fault_stage = WIFI_HW_STAGE_INIT;
-        snprintf(http_status_buf, sizeof http_status_buf,
-                 "wifi=disabled hardware=cyw43-init-failed init_rc=%d attempts=%lu",
-                 wifi_init_rc,
-                 (unsigned long)wifi_probe_attempts);
+        if (wifi_probe_can_retry()) {
+            wifi_schedule_probe_retry("init-failed", WIFI_HW_STAGE_INIT);
+        } else {
+            wifi_hardware_blocked = true;
+            snprintf(http_status_buf, sizeof http_status_buf,
+                     "wifi=disabled hardware=cyw43-init-failed init_rc=%d attempts=%lu",
+                     wifi_init_rc,
+                     (unsigned long)wifi_probe_attempts);
+        }
         return false;
     }
 
@@ -2894,6 +3771,7 @@ static bool remote_http_probe_wifi_hardware(void)
     wifi_hw_probe_marker_clear();
     cyw43_is_ready = true;
     wifi_hardware_known_present = true;
+    wifi_probe_retry_scheduled = false;
     wifi_poll_due = get_absolute_time();
     snprintf(http_status_buf, sizeof http_status_buf, "wifi=inactive hardware=cyw43");
     return true;
@@ -2902,13 +3780,17 @@ static bool remote_http_probe_wifi_hardware(void)
 void remote_http_boot_check(void)
 {
     if (watchdog_caused_reboot() && watchdog_hw->scratch[0] == WIFI_HW_PROBE_MAGIC) {
-        wifi_hardware_blocked = true;
         wifi_hardware_fault_stage = watchdog_hw->scratch[1];
-        wifi_probe_attempts = 1;
+        wifi_probe_attempts = watchdog_hw->scratch[2] ? watchdog_hw->scratch[2] : 1u;
         if (wifi_hardware_fault_stage != WIFI_HW_STAGE_INIT) {
             wifi_hardware_known_present = true;
         }
-        wifi_hw_status_blocked();
+        if (wifi_probe_can_retry()) {
+            wifi_schedule_probe_retry("driver-timeout", wifi_hardware_fault_stage);
+        } else {
+            wifi_hardware_blocked = true;
+            wifi_hw_status_blocked();
+        }
     }
     wifi_hw_probe_marker_clear();
 }
@@ -2941,19 +3823,35 @@ static void remote_http_finish_wifi_join(void)
     snprintf(http_status_buf, sizeof http_status_buf, "wifi=up ip=%s port=%u", ip_text, (unsigned)http_cfg.http_port);
     http_is_active = true;
     wifi_assoc_state = WIFI_ASSOC_HTTP_ACTIVE;
+    wifi_noip_timer_active = false;
     wifi_clear_recover();
+    wifi_recover_first_retry_used = false;
 }
 
 static void remote_http_poll_wifi_join(void)
 {
+    absolute_time_t now = get_absolute_time();
     int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
     if (status == CYW43_LINK_UP) {
         remote_http_finish_wifi_join();
         return;
     }
 
+    if (status == CYW43_LINK_NOIP) {
+        if (!wifi_noip_timer_active) {
+            wifi_noip_timer_active = true;
+            wifi_noip_since = now;
+            wifi_assoc_deadline = make_timeout_time_ms(M65_WIFI_NOIP_TIMEOUT_MS + 1000u);
+        } else if (absolute_time_diff_us(wifi_noip_since, now) >= (int64_t)M65_WIFI_NOIP_TIMEOUT_MS * 1000ll) {
+            wifi_schedule_recover("dhcp-timeout");
+            return;
+        }
+    } else {
+        wifi_noip_timer_active = false;
+    }
+
     if (status == CYW43_LINK_NONET) {
-        if (absolute_time_diff_us(get_absolute_time(), wifi_assoc_retry_at) <= 0) {
+        if (absolute_time_diff_us(now, wifi_assoc_retry_at) <= 0) {
             int rc = cyw43_arch_wifi_connect_async(http_cfg.wifi_ssid,
                                                    http_cfg.wifi_psk[0] ? http_cfg.wifi_psk : NULL,
                                                    CYW43_AUTH_WPA2_AES_PSK);
@@ -2969,7 +3867,7 @@ static void remote_http_poll_wifi_join(void)
         return;
     }
 
-    if (absolute_time_diff_us(get_absolute_time(), wifi_assoc_deadline) <= 0) {
+    if (absolute_time_diff_us(now, wifi_assoc_deadline) <= 0) {
         wifi_schedule_recover("connect-timeout");
         return;
     }
@@ -2991,6 +3889,15 @@ void remote_http_init(void)
     if (!cyw43_is_ready) {
         if (wifi_hardware_blocked) {
             wifi_hw_status_blocked();
+            return;
+        }
+        if (wifi_probe_retry_scheduled) {
+            remote_init_after_probe_pending = true;
+            snprintf(http_status_buf, sizeof http_status_buf,
+                     "wifi=probe-retry stage=%s attempts=%lu in=%lus remote=init",
+                     wifi_hw_stage_name(wifi_hardware_fault_stage),
+                     (unsigned long)wifi_probe_attempts,
+                     (unsigned long)wifi_probe_retry_seconds());
             return;
         }
         wifi_probe_pending = true;
@@ -3017,6 +3924,7 @@ void remote_http_init(void)
         snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 http=0");
         return;
     }
+    load_cached_web_assets();
     if (!http_cfg.wifi_ssid[0]) {
         snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 ssid=missing");
         return;
@@ -3024,6 +3932,7 @@ void remote_http_init(void)
 
     watchdog_hw->scratch[0] = WIFI_HW_PROBE_MAGIC;
     watchdog_hw->scratch[1] = WIFI_HW_STAGE_STA;
+    watchdog_hw->scratch[2] = wifi_probe_attempts;
     watchdog_enable(M65_WIFI_HW_PROBE_WATCHDOG_MS, false);
 
     cyw43_arch_enable_sta_mode();
@@ -3042,6 +3951,7 @@ void remote_http_init(void)
 
     wifi_assoc_deadline = make_timeout_time_ms(M65_WIFI_CONNECT_TIMEOUT_MS);
     wifi_assoc_retry_at = make_timeout_time_ms(1000u);
+    wifi_noip_timer_active = false;
     wifi_assoc_state = WIFI_ASSOC_CONNECTING;
     wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
     snprintf(http_status_buf, sizeof http_status_buf, "wifi=connecting status=start ssid=%s", http_cfg.wifi_ssid);
@@ -3050,6 +3960,11 @@ void remote_http_init(void)
 void remote_http_poll(void)
 {
     remote_log_wifi_change();
+    absolute_time_t now = get_absolute_time();
+    if (wifi_probe_retry_scheduled && absolute_time_diff_us(now, wifi_probe_retry_at) <= 0) {
+        wifi_probe_retry_scheduled = false;
+        wifi_probe_pending = true;
+    }
     if (wifi_probe_pending) {
         wifi_probe_pending = false;
         bool ok = remote_http_probe_wifi_hardware();
@@ -3059,7 +3974,6 @@ void remote_http_poll(void)
         }
     }
     if (!cyw43_is_ready) return;
-    absolute_time_t now = get_absolute_time();
     if (absolute_time_diff_us(now, wifi_poll_due) > 0) return;
     wifi_poll_due = delayed_by_us(now, M65_WIFI_POLL_INTERVAL_US);
     cyw43_arch_poll();
@@ -3094,16 +4008,20 @@ const char *remote_http_wifi_summary(void)
 const char *remote_http_wifi_diag(void)
 {
     snprintf(wifi_diag_buf, sizeof wifi_diag_buf,
-             "supported=1 board=%s ready=%lu blocked=%lu known_present=%lu pending=%lu remote_after_probe=%lu attempts=%lu init_rc=%d fault_stage=%s retry=%lu retry_seconds=%lu status=\"%s\"",
+             "supported=1 board=%s ready=%lu blocked=%lu known_present=%lu pending=%lu probe_retry=%lu probe_retry_seconds=%lu remote_after_probe=%lu attempts=%lu init_rc=%d fault_stage=%s assoc=%u noip=%lu retry=%lu retry_seconds=%lu status=\"%s\"",
              M65_PICO_BOARD_NAME,
              (unsigned long)(cyw43_is_ready ? 1u : 0u),
              (unsigned long)(wifi_hardware_blocked ? 1u : 0u),
              (unsigned long)(wifi_hardware_known_present ? 1u : 0u),
              (unsigned long)(wifi_probe_pending ? 1u : 0u),
+             (unsigned long)(wifi_probe_retry_scheduled ? 1u : 0u),
+             (unsigned long)wifi_probe_retry_seconds(),
              (unsigned long)(remote_init_after_probe_pending ? 1u : 0u),
              (unsigned long)wifi_probe_attempts,
              wifi_init_rc,
              wifi_hw_stage_name(wifi_hardware_fault_stage),
+             (unsigned)wifi_assoc_state,
+             (unsigned long)(wifi_noip_timer_active ? 1u : 0u),
              (unsigned long)(wifi_recover_scheduled ? 1u : 0u),
              (unsigned long)wifi_recover_seconds(),
              http_status_buf);
@@ -3117,6 +4035,9 @@ bool remote_http_wifi_probe_now(void)
     }
     wifi_hardware_blocked = false;
     wifi_hardware_fault_stage = 0;
+    wifi_probe_attempts = 0;
+    wifi_init_rc = -9999;
+    wifi_probe_retry_scheduled = false;
     wifi_probe_pending = true;
     snprintf(http_status_buf, sizeof http_status_buf, "wifi=probe-pending hardware=cyw43 manual=1");
     return true;

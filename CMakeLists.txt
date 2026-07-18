@@ -51,6 +51,8 @@ target_compile_definitions(pico_m65jtag PRIVATE
     USBD_PRODUCT="MEGA65 Expansion Board Integrated JTAG"
     USBD_DESC_STR_MAX=64
     PICO_STDIO_USB_USE_DEFAULT_DESCRIPTORS=0
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=10000
+    PICO_STDIO_DEADLOCK_TIMEOUT_MS=10
 )
 if(M65_SD_MODE)
     target_compile_definitions(pico_m65jtag PRIVATE M65_SD_MODE=${M65_SD_MODE})

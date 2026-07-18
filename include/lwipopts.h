@@ -42,4 +42,9 @@
 #define TCP_SND_BUF                     (8 * TCP_MSS)
 #define TCP_SND_QUEUELEN                ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
 
+// Default lwIP initial RTO is 3000ms, which makes brief WiFi loss look like a
+// hang during core downloads. Keep the normal backoff behaviour, but start
+// retransmission sooner on our local-control LAN use case.
+#define LWIP_TCP_RTO_TIME               1000
+
 #endif

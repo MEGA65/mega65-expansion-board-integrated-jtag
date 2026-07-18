@@ -89,7 +89,16 @@
 // Give USB CDC a chance to enumerate before SD-backed settings and WiFi
 // connection attempts can block boot progress.
 #define M65_REMOTE_INIT_DELAY_MS         2000u
-#define M65_WIFI_CONNECT_TIMEOUT_MS      5000u
+#define M65_WIFI_CONNECT_TIMEOUT_MS      10000u
+#define M65_WIFI_FIRST_RETRY_DELAY_MS    5000u
+#define M65_WIFI_PROBE_FAST_ATTEMPTS     4u
+#define M65_WIFI_PROBE_FAST_RETRY_MS     1000u
+#define M65_WIFI_NOIP_TIMEOUT_MS         10000u
+#define M65_FETCH_CONNECT_TIMEOUT_MS     10000u
+#define M65_FETCH_IDLE_TIMEOUT_MS        60000u
+#define M65_FETCH_IDLE_DIAG_MS           3000u
+#define M65_FETCH_ACK_NUDGE_MS           1000u
+#define M65_AUTOFETCH_FILE_RETRIES       10u
 #define M65_WIFI_COMMAND_QUIET_MS        15000u
 
 #ifndef M65_LED_PIN
@@ -117,4 +126,4 @@
 #endif
 
 #define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG v0.1"
-#define M65_BUILD_MARKER     "cfg-fetch-monitor-20260717"
+#define M65_BUILD_MARKER     "autofetch-keeps-wifi-20260718"

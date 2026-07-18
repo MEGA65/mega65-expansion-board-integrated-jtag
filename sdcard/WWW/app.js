@@ -107,6 +107,9 @@
   }
 
   function launchCoreLink(link) {
+    var row = link;
+    while (row && row.tagName && row.tagName.toLowerCase() !== 'tr') row = row.parentNode;
+    if (row && row.getAttribute && row.getAttribute('data-kind') === 'PARTIAL') return false;
     var target = launchTarget(link);
     if (target.path !== '/jtag') return true;
     launchCore(target.request);
@@ -195,6 +198,7 @@
     if (!rows.length) return;
     if (selectedIndex < 0 || selectedIndex >= rows.length) setSelectedIndex(0);
     rows = visibleRows();
+    if (rows[selectedIndex].getAttribute && rows[selectedIndex].getAttribute('data-kind') === 'PARTIAL') return;
     var link = rows[selectedIndex].querySelector('a.start');
     if (!link) return;
     var target = launchTarget(link);

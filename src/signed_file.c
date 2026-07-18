@@ -105,15 +105,27 @@ static bool sha256_once(const uint8_t *data, size_t len, uint8_t out[32])
     return sha256_finish(&ctx, out);
 }
 
-static bool file_write_at(const char *path, uint32_t offset, const uint8_t *data, size_t len)
+static bool receive_payload_write(signed_file_rx_t *rx, const uint8_t *data, size_t len)
 {
-    storage_file_t f = {0};
-    if (!storage_open_write(&f, path, false)) return false;
-    bool ok = storage_seek(&f, offset);
     size_t put = 0;
-    if (ok && len) ok = storage_write(&f, data, len, &put) && put == len;
-    if (ok) ok = storage_sync(&f);
-    storage_close(&f);
+    if (!rx || !rx->out_open || !rx->out_file.impl) {
+        set_err("output file is not open");
+        return false;
+    }
+    if (len && (!storage_write(&rx->out_file, data, len, &put) || put != len)) {
+        snprintf(last_err, sizeof last_err, "write failed: %s", storage_last_error());
+        return false;
+    }
+    return true;
+}
+
+static bool receive_payload_sync_close(signed_file_rx_t *rx)
+{
+    if (!rx || !rx->out_open) return true;
+    bool ok = storage_sync(&rx->out_file);
+    if (!ok) snprintf(last_err, sizeof last_err, "sync failed: %s", storage_last_error());
+    storage_close(&rx->out_file);
+    rx->out_open = false;
     return ok;
 }
 
@@ -302,6 +314,13 @@ bool signed_file_receive_begin(signed_file_rx_t *rx,
         return false;
     }
 
+    if (!storage_open_write(&rx->out_file, rx->tmp_path, true)) {
+        if (candidate) mbedtls_sha256_free(&rx->sha);
+        snprintf(last_err, sizeof last_err, "open output failed: %s", storage_last_error());
+        return false;
+    }
+    rx->out_open = true;
+
     last_err[0] = 0;
     return true;
 }
@@ -331,9 +350,8 @@ bool signed_file_receive_write(signed_file_rx_t *rx, const uint8_t *data, size_t
         size_t want = payload_limit - rx->done;
         if (want > len) want = len;
         if (want) {
-            if (!file_write_at(rx->tmp_path, rx->payload_done, data, want)) {
+            if (!receive_payload_write(rx, data, want)) {
                 rx->rejected = true;
-                snprintf(last_err, sizeof last_err, "write failed: %s", storage_last_error());
                 return false;
             }
             if (rx->candidate_signature && !sha256_update(&rx->sha, data, want)) {
@@ -359,6 +377,7 @@ bool signed_file_receive_finish(signed_file_rx_t *rx)
     }
 
     if (!rx->candidate_signature) {
+        if (!receive_payload_sync_close(rx)) return false;
         last_err[0] = 0;
         return true;
     }
@@ -367,12 +386,13 @@ bool signed_file_receive_finish(signed_file_rx_t *rx)
                     memcmp(rx->block, sig_magic, sizeof sig_magic) == 0;
 
     if (!rx->saw_magic && !rx->require_signature) {
-        if (!file_write_at(rx->tmp_path, rx->payload_done, rx->block, rx->block_done)) {
-            snprintf(last_err, sizeof last_err, "write failed: %s", storage_last_error());
+        if (!receive_payload_write(rx, rx->block, rx->block_done)) {
             mbedtls_sha256_free(&rx->sha);
             return false;
         }
         mbedtls_sha256_free(&rx->sha);
+        rx->candidate_signature = false;
+        if (!receive_payload_sync_close(rx)) return false;
         last_err[0] = 0;
         return true;
     }
@@ -382,10 +402,13 @@ bool signed_file_receive_finish(signed_file_rx_t *rx)
         set_err("SHA-256 finish failed");
         return false;
     }
+    rx->candidate_signature = false;
     if (!verify_block(rx->cfg, rx->file_type, rx->final_path, rx->block_offset, payload_hash, rx->block)) {
+        receive_payload_sync_close(rx);
         return false;
     }
 
+    if (!receive_payload_sync_close(rx)) return false;
     last_err[0] = 0;
     return true;
 }
@@ -393,6 +416,10 @@ bool signed_file_receive_finish(signed_file_rx_t *rx)
 void signed_file_receive_abort(signed_file_rx_t *rx)
 {
     if (!rx) return;
+    if (rx->out_open) {
+        storage_close(&rx->out_file);
+        rx->out_open = false;
+    }
     if (rx->candidate_signature) {
         mbedtls_sha256_free(&rx->sha);
         rx->candidate_signature = false;

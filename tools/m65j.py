@@ -2194,6 +2194,10 @@ def translate_manual_command(parts):
 
 def send_serial_text_command(ser, cmd, timeout, monitor=False, monitor_for=None):
     ser.reset_input_buffer()
+    time.sleep(0.05)
+    while ser.in_waiting:
+        ser.read(ser.in_waiting)
+        time.sleep(0.02)
     data = (cmd + "\n").encode("utf-8")
     try:
         written = ser.write(data)

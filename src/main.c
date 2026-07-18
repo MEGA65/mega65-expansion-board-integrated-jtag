@@ -52,6 +52,7 @@ typedef enum {
 static command_mode_t command_mode = CMD_MODE_AT;
 static bool usb_reconnect_pending = false;
 static absolute_time_t usb_reconnect_at;
+static bool is_partial_core_path(const char *path);
 
 typedef struct {
     int autofetch; // -1 = use mega65-jtag.cfg default, 0 = off, 1 = on
@@ -117,7 +118,10 @@ static bool ensure_mount_quiet(void)
 static void list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
 {
     (void)ctx;
-    uart_cmd_printf("%s %lu %s\n", is_dir ? "DIR" : "CORE", (unsigned long)size, name);
+    uart_cmd_printf("%s %lu %s\n",
+                    is_dir ? "DIR" : (is_partial_core_path(name) ? "PARTIAL" : "CORE"),
+                    (unsigned long)size,
+                    name);
 }
 
 static void uart_quoted(const char *s)
@@ -244,11 +248,36 @@ static bool has_core_ext(const char *name)
            (e1 == 'm' && e2 == '6' && e3 == '5' && e4 == 'j' && e5 == 0);
 }
 
+static bool has_suffix_ci(const char *name, const char *suffix)
+{
+    size_t n = strlen(name ? name : "");
+    size_t sn = strlen(suffix ? suffix : "");
+    if (n < sn) return false;
+    const char *tail = name + n - sn;
+    for (size_t i = 0; i < sn; i++) {
+        if (tolower((unsigned char)tail[i]) != tolower((unsigned char)suffix[i])) return false;
+    }
+    return true;
+}
+
+static bool is_partial_core_path(const char *path)
+{
+    static const char suffix[] = ".partial";
+    if (!has_suffix_ci(path, suffix)) return false;
+    size_t n = strlen(path);
+    size_t base_len = n - (sizeof suffix - 1u);
+    if (base_len == 0 || base_len >= 256u) return false;
+    char base[256];
+    memcpy(base, path, base_len);
+    base[base_len] = 0;
+    return has_core_ext(base);
+}
+
 static bool safe_core_write_path(const char *path)
 {
     if (!path || !path[0]) return false;
     size_t n = strlen(path);
-    if (n > 220) return false; // leaves room for .tmp and FatFs path buffer
+    if (n > 220) return false; // leaves room for .partial and FatFs path buffer
     if (strstr(path, "..")) return false;
     if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
     return has_core_ext(path);
@@ -621,6 +650,7 @@ static void cmd_help(void)
 
 static void cmd_atw(void)
 {
+    if (!require_write_authority("AT&W")) return;
     if (at_settings_save()) at_ok();
 }
 
@@ -784,6 +814,7 @@ static void cmd_wifi_probe(void)
 static void cmd_autofetch(char *arg, bool have_value)
 {
     if (have_value) {
+        if (!require_write_authority("AF")) return;
         bool b = false;
         if (!parse_bool_value(arg, &b)) {
             at_error("AUTOFETCH EXPECTS 0 OR 1");
@@ -800,6 +831,7 @@ static void cmd_autofetch(char *arg, bool have_value)
 static void cmd_fetch_interval(char *arg, bool have_value)
 {
     if (have_value) {
+        if (!require_write_authority("FI")) return;
         char *end = NULL;
         unsigned long hours = strtoul(arg, &end, 10);
         if (*end || hours < 3u || hours > 8760u) {
@@ -817,6 +849,7 @@ static void cmd_fetch_interval(char *arg, bool have_value)
 static void cmd_fetch_board(char *arg, bool have_value)
 {
     if (have_value) {
+        if (!require_write_authority("FB")) return;
         uint8_t board = 0;
         if (parse_fetch_board_or_remote(arg, &board)) {
             at_settings.fetch_board_rev = board;
@@ -835,6 +868,7 @@ static void cmd_fetch_board(char *arg, bool have_value)
 static void cmd_machine(char *arg, bool have_value)
 {
     if (have_value) {
+        if (!require_write_authority("MACHINE")) return;
         arg = trim_line(arg);
         if (!arg[0] || ci_equal(arg, "NONE") || ci_equal(arg, "DEFAULT") || ci_equal(arg, "CLEAR")) {
             machine_identity_set_name("");
@@ -948,6 +982,12 @@ static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *c
         uart_cmd_printf("+COREDIR: size=%lu path=", (unsigned long)size);
         uart_quoted(path);
         uart_cmd_puts("\n");
+        return;
+    }
+    if (is_partial_core_path(path)) {
+        uart_cmd_printf("+COREPARTIAL: size=%lu path=", (unsigned long)size);
+        uart_quoted(path);
+        uart_cmd_puts(" status=\"download in progress\"\n");
         return;
     }
 
@@ -1133,11 +1173,11 @@ static void cmd_sink_stream(char *arg)
 
     int64_t us = absolute_time_diff_us(start, get_absolute_time());
     if (us <= 0) us = 1;
-    uint32_t kb_s = (uint32_t)(((uint64_t)payload_length * 1000000ull) / ((uint64_t)us * 1024ull));
-    uart_cmd_printf("OK N DONE bytes=%lu time_us=%lld rate_kBps=%lu\n",
+    uint32_t kib_s = (uint32_t)(((uint64_t)payload_length * 1000000ull) / ((uint64_t)us * 1024ull));
+    uart_cmd_printf("OK N DONE bytes=%lu time_us=%lld rate_KiBps=%lu\n",
                     (unsigned long)payload_length,
                     (long long)us,
-                    (unsigned long)kb_s);
+                    (unsigned long)kib_s);
 }
 
 static void cmd_stream_program(char *arg)
@@ -1277,11 +1317,11 @@ static void cmd_test_read(char *arg)
 
     int64_t us = absolute_time_diff_us(start, get_absolute_time());
     if (us <= 0) us = 1;
-    uint32_t kb_s = (uint32_t)(((uint64_t)cf.payload_length * 1000000ull) / ((uint64_t)us * 1024ull));
-    uart_cmd_printf("OK T DONE bytes=%lu time_us=%lld rate_kBps=%lu\n",
+    uint32_t kib_s = (uint32_t)(((uint64_t)cf.payload_length * 1000000ull) / ((uint64_t)us * 1024ull));
+    uart_cmd_printf("OK T DONE bytes=%lu time_us=%lld rate_KiBps=%lu\n",
                     (unsigned long)cf.payload_length,
                     (long long)us,
-                    (unsigned long)kb_s);
+                    (unsigned long)kib_s);
 
     core_close(&cf);
 }
@@ -1344,6 +1384,7 @@ typedef struct {
 static void basic_list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
 {
     basic_list_ctx_t *bl = (basic_list_ctx_t *)ctx;
+    if (!is_dir && is_partial_core_path(name)) return;
     if (!is_dir && bl && (bl->board_rev == 3 || bl->board_rev == 6)) {
         core_file_t cf;
         if (!core_open(&cf, name)) return;
@@ -1507,7 +1548,7 @@ static void cmd_write_file(char *arg)
     }
 
     char tmp_path[256];
-    if (snprintf(tmp_path, sizeof tmp_path, "%s.tmp", name) >= (int)sizeof tmp_path) {
+    if (snprintf(tmp_path, sizeof tmp_path, "%s.partial", name) >= (int)sizeof tmp_path) {
         uart_cmd_puts("ERR W path too long\n");
         return;
     }
@@ -1585,12 +1626,12 @@ static void cmd_write_file(char *arg)
 
     int64_t us = absolute_time_diff_us(start, get_absolute_time());
     if (us <= 0) us = 1;
-    uint32_t kb_s = (uint32_t)(((uint64_t)length * 1000000ull) / ((uint64_t)us * 1024ull));
-    uart_cmd_printf("OK W DONE path=%s bytes=%lu time_us=%lld rate_kBps=%lu remaining_ms=%lu\n",
+    uint32_t kib_s = (uint32_t)(((uint64_t)length * 1000000ull) / ((uint64_t)us * 1024ull));
+    uart_cmd_printf("OK W DONE path=%s bytes=%lu time_us=%lld rate_KiBps=%lu remaining_ms=%lu\n",
                     name,
                     (unsigned long)length,
                     (long long)us,
-                    (unsigned long)kb_s,
+                    (unsigned long)kib_s,
                     (unsigned long)write_gate_remaining_ms());
 }
 

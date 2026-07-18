@@ -96,6 +96,20 @@ tr.entry-row.selected td {
   box-shadow: inset 4px 0 0 #ffd34d;
 }
 
+tr.entry-row[data-kind="PARTIAL"] td {
+  background: #151821;
+  color: #96a3b2;
+}
+
+tr.entry-row[data-kind="PARTIAL"] .start {
+  background: #5e6671;
+  cursor: default;
+}
+
+tr.entry-row[data-kind="PARTIAL"] .core-name {
+  color: #b9c3cf;
+}
+
 a {
   color: #63b3ff;
 }

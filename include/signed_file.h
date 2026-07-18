@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "remote_auth.h"
+#include "storage.h"
 
 #include "mbedtls/sha256.h"
 
@@ -33,6 +34,8 @@ typedef struct {
     uint8_t block[M65_SIG_BLOCK_SIZE];
     uint32_t block_done;
     mbedtls_sha256_context sha;
+    storage_file_t out_file;
+    bool out_open;
 } signed_file_rx_t;
 
 const char *signed_file_last_error(void);

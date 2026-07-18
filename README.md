@@ -301,7 +301,7 @@ and upload with:
 python3 tools/m65j.py /dev/ttyACM0 write local-core.bit remote-core.bit
 ```
 
-The upload is written to `remote-core.bit.tmp`, synced, then renamed into place
+The upload is written to `remote-core.bit.partial`, synced, then renamed into place
 after a complete transfer. Raw sector writes are intentionally not part of the
 current protocol.
 
@@ -413,11 +413,22 @@ mirror fetch immediately, `AT+AUTOFETCH=0|1` overrides enablement,
 `AT+FETCHBOARD=3|6|remote` selects the board-specific manifest, and
 `AT&W`/`ATZ` save/reload those AT settings from `AT_SETTINGS.cfg`. `ATS60?`
 reports seconds since the last successful auto-fetch and `ATS61?` reports the
-running flag.
+running flag. Changing autofetch settings or saving AT settings requires the
+physical write grant; triggering `AT+FETCHNOW` or scheduled autofetch from an
+already configured, trusted mirror does not.
 
 `AT+VERBOSE=0|1|2` controls unsolicited WiFi/fetch diagnostics. Level 0 is
 quiet, level 1 reports WiFi state changes and fetch start/finish/failure, and
-level 2 also reports fetch progress. `AT&W` saves the selected level.
+level 2 also reports fetch progress and manifest scan checks. `AT&W` saves the
+selected level.
+
+While an autofetch is running, browser requests return a cached busy page
+instead of interrupting the transfer. The page is loaded from
+`WWW/fetch_busy.html` during HTTP startup and can use `{FETCH_*}` substitutions
+for the current file, manifest count, byte count, rate, and status. The stop
+button targets `GET /fetch/stop`, which explicitly cancels the fetch. The
+firmware also caches `WWW/favicon-32x32.png` and serves it from `/favicon.ico`
+without touching the SD card during a fetch.
 
 Useful commands:
 

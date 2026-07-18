@@ -173,6 +173,34 @@ void uart_cmd_printf(const char *fmt, ...)
     uart_cmd_puts(tmp);
 }
 
+void uart_cmd_log_puts_best_effort(const char *s)
+{
+    if (!s) return;
+    size_t len = strlen(s);
+
+    for (size_t i = 0; i < len && uart_is_writable(M65_UART_ID); i++) {
+        uart_putc_raw(M65_UART_ID, s[i]);
+    }
+
+#if M65_ENABLE_USB_CDC
+    // Background status lines must never pin the main loop behind a CDC flush.
+    // The Pico SDK path has bounded timeouts, and we deliberately do not
+    // fflush() here. Dropped/truncated progress chatter is better than a wedged
+    // network stack or command parser.
+    stdio_put_string(s, (int)len, false, false);
+#endif
+}
+
+void uart_cmd_log_printf_best_effort(const char *fmt, ...)
+{
+    char tmp[384];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    uart_cmd_log_puts_best_effort(tmp);
+}
+
 uart_cmd_source_t uart_cmd_last_source(void)
 {
     return last_cmd_source;
