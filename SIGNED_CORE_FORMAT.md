@@ -5,11 +5,14 @@ signature policy, key configuration, HTTP upload behaviour, and host utility
 commands are all still subject to change.
 
 The MEGA65 Expansion Board Integrated JTAG firmware currently supports a signed
-upload/fetch container for `.bit`, `.cor`, and `.m65j` files. The signature is a
-fixed 256-byte trailer appended to the bytes sent over HTTP or fetched from a
-URL. The firmware hashes the payload while it is receiving it, buffers the final
-trailer, verifies the signature, and writes only the payload bytes to the final
-SD-card file.
+upload/fetch container for `.bit`, `.cor`, `.m65j`, firmware, and WWW theme
+files. The signature is a fixed 256-byte trailer appended to the bytes sent over
+HTTP or fetched from a URL. The firmware hashes the payload while it is
+receiving it, buffers the final trailer, and verifies the signature.
+
+For core files and manifests, only the payload bytes are written to the final
+SD-card file. For firmware and theme packages, the complete signed transfer is
+kept on SD so the package can be re-verified immediately before update/install.
 
 The trailer is not required to be aligned. It is simply the final 256 bytes of a
 transfer. Because of this, signed HTTP PUT and firmware-side fetches require a
@@ -43,7 +46,7 @@ All integers are little-endian.
 | 34 | 2 | Header length, currently `256` |
 | 36 | 4 | Flags, currently `0` |
 | 40 | 4 | Payload length in bytes, excluding this trailer |
-| 44 | 1 | File type: `0=any`, `1=bit`, `2=cor`, `3=m65j` |
+| 44 | 1 | File type: `0=any`, `1=bit`, `2=cor`, `3=m65j`, `4=firmware`, `5=theme` |
 | 45 | 1 | Board ID: `0=any`, `3=R3`, `6=R6` |
 | 46 | 1 | Hash algorithm: `1=SHA-256` |
 | 47 | 1 | Signature algorithm: `1=ECDSA-P256-SHA256` |
@@ -66,8 +69,8 @@ both check against `game.bit`.
   TLS implementation for it.
 - The trailer is algorithm-labelled so a later version can add Ed25519 without
   changing the receive flow.
-- The payload stored on SD is the original file content without the 256-byte
-  trailer.
+- Core and manifest payloads stored on SD omit the 256-byte trailer. Firmware
+  and theme packages retain the trailer for installation-time verification.
 - Direct stream-to-JTAG cannot safely verify until the trailer has arrived. When
   signatures are required, `PUT /jtag` therefore spools to `DOWNLOADS/`, verifies
   the trailer, and only then programs the verified core file.
@@ -78,17 +81,27 @@ Autofetch requires the channel manifest itself to be signed, regardless of the
 general `require_signatures` setting. The signed transfer is stored on SD as the
 manifest payload after the 256-byte trailer has been verified and stripped.
 
-Manifest lines use v2 format:
+Manifest lines use v3 typed format:
 
 ```text
-<payload-sha256> <transfer-sha256>  <relative-filename>
+core <payload-sha256> <transfer-sha256>  <relative-filename>
+firmware <payload-sha256> <transfer-sha256>  mega65-integrated-jtag-firmware.uf2 version=... build=...
+theme <payload-sha256> <transfer-sha256>  mega65-jtag-theme.m65jtheme name=... version=...
 ```
 
-`payload-sha256` hashes the final SD-card file after the signature trailer has
-been removed. `transfer-sha256` hashes the exact HTTP object, including its
-signature trailer. The firmware rejects old one-hash manifests, unsigned
-manifests, bad signatures, transfer hash mismatches, payload hash mismatches,
-and manifest entries outside normal core file paths.
+For `core` rows, `payload-sha256` hashes the final SD-card file after the
+signature trailer has been removed. For `firmware` and `theme` rows, the final
+SD-card package keeps the trailer, so unchanged checks use `transfer-sha256`.
+`transfer-sha256` always hashes the exact HTTP object, including its signature
+trailer. The firmware rejects old one-hash manifests, unsigned manifests, bad
+signatures, transfer hash mismatches, stored-file hash mismatches, and manifest
+entries outside the allowed typed paths.
+
+Firmware rows always download to `DOWNLOADS/mega65-integrated-jtag-firmware.uf2`.
+Theme rows always download to `DOWNLOADS/mega65-jtag-theme.m65jtheme`. The
+source URL path is freely named in the mirror, but the on-device destination is
+fixed to prevent a mirror from overwriting config, manifests, or arbitrary web
+assets.
 
 ## Host signing utility
 

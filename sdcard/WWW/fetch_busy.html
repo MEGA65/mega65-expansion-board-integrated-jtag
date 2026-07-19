@@ -165,15 +165,15 @@
   <main>
     <section class="panel">
       <h1>Fetching cores</h1>
-      <div class="subhead">MEGA65 JTAG is updating the SD card</div>
+      <div class="subhead">{FETCH_ACTION}</div>
       <div class="status">{FETCH_STATUS}</div>
       <div class="bar"><div class="fill"></div></div>
       <div class="grid">
         <div class="cell"><strong>Stage</strong>{FETCH_STAGE}</div>
         <div class="cell"><strong>File</strong>{FETCH_FILE}</div>
         <div class="cell"><strong>Manifest</strong>{FETCH_CHECKED}/{FETCH_TOTAL} checked</div>
-        <div class="cell"><strong>Updated</strong>{FETCH_UPDATED} files</div>
-        <div class="cell"><strong>Current file</strong>{FETCH_BYTES}/{FETCH_TOTAL_BYTES} bytes</div>
+        <div class="cell"><strong>Updates</strong>{FETCH_NEEDED} needed / {FETCH_UPDATED} completed</div>
+        <div class="cell"><strong>{FETCH_PROGRESS_LABEL}</strong>{FETCH_BYTES}/{FETCH_TOTAL_BYTES} bytes</div>
         <div class="cell"><strong>Average rate</strong>{FETCH_RATE_KIBPS} KiB/s</div>
       </div>
       <form method="get" action="/fetch/stop">

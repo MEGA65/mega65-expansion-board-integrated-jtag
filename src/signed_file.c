@@ -253,6 +253,8 @@ const char *signed_file_type_name(m65_signed_file_type_t type)
     case M65_SIGNED_FILE_BIT: return "bit";
     case M65_SIGNED_FILE_COR: return "cor";
     case M65_SIGNED_FILE_M65J: return "m65j";
+    case M65_SIGNED_FILE_FIRMWARE: return "firmware";
+    case M65_SIGNED_FILE_THEME: return "theme";
     default: return "any";
     }
 }
@@ -274,6 +276,10 @@ m65_signed_file_type_t signed_file_type_from_path(const char *path)
     if (ext_equal_ci(dot, ".bit")) return M65_SIGNED_FILE_BIT;
     if (ext_equal_ci(dot, ".cor")) return M65_SIGNED_FILE_COR;
     if (ext_equal_ci(dot, ".m65j")) return M65_SIGNED_FILE_M65J;
+    if (ext_equal_ci(dot, ".uf2") || ext_equal_ci(dot, ".m65fw") || ext_equal_ci(dot, ".bin")) {
+        return M65_SIGNED_FILE_FIRMWARE;
+    }
+    if (ext_equal_ci(dot, ".m65jtheme") || ext_equal_ci(dot, ".tar")) return M65_SIGNED_FILE_THEME;
     return M65_SIGNED_FILE_ANY;
 }
 
@@ -293,8 +299,10 @@ bool signed_file_receive_begin(signed_file_rx_t *rx,
     snprintf(rx->tmp_path, sizeof rx->tmp_path, "%s", tmp_path);
     rx->cfg = cfg;
     rx->total_length = total_length;
-    rx->require_signature = cfg->require_signatures;
     rx->file_type = file_type;
+    rx->preserve_transfer = file_type == M65_SIGNED_FILE_FIRMWARE ||
+                            file_type == M65_SIGNED_FILE_THEME;
+    rx->require_signature = cfg->require_signatures || rx->preserve_transfer;
 
     bool candidate = total_length > M65_SIG_BLOCK_SIZE;
     rx->candidate_signature = candidate;
@@ -408,6 +416,10 @@ bool signed_file_receive_finish(signed_file_rx_t *rx)
         return false;
     }
 
+    if (rx->preserve_transfer &&
+        !receive_payload_write(rx, rx->block, M65_SIG_BLOCK_SIZE)) {
+        return false;
+    }
     if (!receive_payload_sync_close(rx)) return false;
     last_err[0] = 0;
     return true;
@@ -429,4 +441,81 @@ void signed_file_receive_abort(signed_file_rx_t *rx)
         rx->tmp_path[0] = 0;
     }
     rx->rejected = true;
+}
+
+bool signed_file_verify_stored(const remote_auth_config_t *cfg,
+                               const char *path,
+                               m65_signed_file_type_t file_type,
+                               bool require_signature)
+{
+    if (!cfg || !path || !path[0]) {
+        set_err("invalid signed file verification parameters");
+        return false;
+    }
+
+    storage_file_t f = {0};
+    if (!storage_open(&f, path)) {
+        snprintf(last_err, sizeof last_err, "open failed: %s", storage_last_error());
+        return false;
+    }
+
+    uint32_t size = storage_size(&f);
+    if (size <= M65_SIG_BLOCK_SIZE) {
+        storage_close(&f);
+        set_err("signed file is too short");
+        return false;
+    }
+    uint32_t payload_len = size - M65_SIG_BLOCK_SIZE;
+
+    mbedtls_sha256_context sha;
+    if (!sha256_starts(&sha)) {
+        storage_close(&f);
+        set_err("cannot initialise SHA-256");
+        return false;
+    }
+
+    uint8_t buf[1024];
+    uint32_t done = 0;
+    bool ok = true;
+    while (done < payload_len) {
+        size_t want = payload_len - done;
+        if (want > sizeof buf) want = sizeof buf;
+        size_t got = 0;
+        if (!storage_read(&f, buf, want, &got) || got != want) {
+            snprintf(last_err, sizeof last_err, "read failed: %s", storage_last_error());
+            ok = false;
+            break;
+        }
+        if (!sha256_update(&sha, buf, got)) {
+            set_err("SHA-256 update failed");
+            ok = false;
+            break;
+        }
+        done += (uint32_t)got;
+    }
+
+    uint8_t block[M65_SIG_BLOCK_SIZE];
+    if (ok) {
+        size_t got = 0;
+        if (!storage_read(&f, block, sizeof block, &got) || got != sizeof block) {
+            snprintf(last_err, sizeof last_err, "signature block read failed: %s", storage_last_error());
+            ok = false;
+        }
+    }
+    storage_close(&f);
+
+    uint8_t payload_hash[32];
+    if (ok) {
+        ok = sha256_finish(&sha, payload_hash);
+        if (!ok) set_err("SHA-256 finish failed");
+    } else {
+        mbedtls_sha256_free(&sha);
+    }
+    if (!ok) return false;
+
+    if (memcmp(block + SIG_OFF_MAGIC, sig_magic, sizeof sig_magic) != 0) {
+        set_err(require_signature ? "signature block magic missing" : "signature block magic missing");
+        return !require_signature;
+    }
+    return verify_block(cfg, file_type, path, payload_len, payload_hash, block);
 }

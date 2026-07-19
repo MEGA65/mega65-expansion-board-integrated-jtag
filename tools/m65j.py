@@ -16,6 +16,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 
 
@@ -33,7 +34,7 @@ DEFAULT_KEY = Path.home() / ".m65jtag-core-signing.pem"
 KEY_DIR = Path.home() / ".m65jtag" / "keys"
 DEFAULT_KEY_NAME = "default"
 CONFIG_FILES = (Path(".m65j.config"), Path.home() / ".m65j.config")
-SIGNED_SCAN_EXTS = (".bit", ".cor", ".core", ".m65j", ".sha256")
+SIGNED_SCAN_EXTS = (".bit", ".cor", ".core", ".m65j", ".sha256", ".uf2", ".m65fw", ".bin", ".m65jtheme", ".tar")
 M65J_USB_MANUFACTURER = "MEGA65"
 M65J_USB_PRODUCT = "MEGA65 Expansion Board Integrated JTAG"
 M65J_ATI_PREFIX = "MEGA65 Expansion Board Integrated JTAG"
@@ -45,6 +46,255 @@ P256_SPKI_PREFIX = bytes.fromhex(
 
 CLI_SERIAL_DEVICE = None
 CLI_WEB_URL = None
+
+
+# m65j.py is intentionally self-contained.  The mirror/populate implementation
+# is embedded here so users can copy this one file without also copying helper
+# modules.
+_EMBEDDED_DOWNLOAD_ALTCORES_B64 = (
+    "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"
+    "+g8="
+)
+_ALTCORE_NS = None
+
+
+def embedded_altcore_bless_core(path, board, args):
+    board_id = "6" if board == "r6" else "3" if board == "r3" else "0"
+    cmd = [
+        "--bless",
+        "--board",
+        board_id,
+        "--name",
+        Path(path).name,
+        "-o",
+        str(path),
+    ]
+    if getattr(args, "key", None):
+        cmd.extend(["--key", str(args.key)])
+    if getattr(args, "key_name", None):
+        cmd.extend(["--key-name", str(args.key_name)])
+    if getattr(args, "yes", False):
+        cmd.append("--yes")
+    if getattr(args, "blank_filename", False):
+        cmd.append("--blank-filename")
+    cmd.append(str(path))
+    rc = signing_main(cmd)
+    return "blessed" if rc == 0 else f"bless failed: exit {rc}"
+
+
+def embedded_altcore_main(argv):
+    global _ALTCORE_NS
+    if _ALTCORE_NS is None:
+        import types
+
+        source = zlib.decompress(base64.b64decode(_EMBEDDED_DOWNLOAD_ALTCORES_B64)).decode("utf-8")
+        module_name = "m65j_embedded_download_altcores"
+        module = types.ModuleType(module_name)
+        module.__file__ = __file__
+        sys.modules[module_name] = module
+        ns = module.__dict__
+        exec(compile(source, "<m65j-embedded-download-altcores>", "exec"), ns)
+        ns["bless_core"] = embedded_altcore_bless_core
+        _ALTCORE_NS = ns
+    return _ALTCORE_NS["main"](argv)
 
 
 def load_serial_module():
@@ -414,6 +664,10 @@ def file_type_for(path):
         return 2
     if ext == ".m65j":
         return 3
+    if ext in {".uf2", ".m65fw", ".bin"}:
+        return 4
+    if ext in {".m65jtheme", ".tar"}:
+        return 5
     return 0
 
 
@@ -1046,7 +1300,7 @@ def signing_main(argv):
     ap.add_argument("--yes", action="store_true", help="create the default private key without prompting")
     ap.add_argument("--keys", action="store_true", help="list local public keys and mega65-jtag.cfg lines")
     ap.add_argument("--board", choices=("0", "3", "6"), default="0", help="board ID to bind into the signature")
-    ap.add_argument("--type", choices=("auto", "any", "bit", "cor", "m65j"), default="auto")
+    ap.add_argument("--type", choices=("auto", "any", "bit", "cor", "m65j", "firmware", "theme"), default="auto")
     ap.add_argument("--name", help="destination filename to sign and use for device uploads")
     ap.add_argument("--blank-filename", action="store_true", help="leave filename blank so firmware does not check it")
     ap.add_argument("--bless", action="store_true", help="write a signed local file instead of pushing by default")
@@ -1068,7 +1322,7 @@ def signing_main(argv):
 
     name = args.name or args.input.name
     signed_filename = "" if args.blank_filename else name
-    type_map = {"any": 0, "bit": 1, "cor": 2, "m65j": 3}
+    type_map = {"any": 0, "bit": 1, "cor": 2, "m65j": 3, "firmware": 4, "theme": 5}
     ftype = file_type_for(args.input) if args.type == "auto" else type_map[args.type]
     existing_name = blessed_filename(payload)
 
@@ -1111,9 +1365,7 @@ def signing_main(argv):
 
 
 def latest_main(argv):
-    import download_altcores
-
-    return download_altcores.main(argv)
+    return embedded_altcore_main(argv)
 
 
 def normalize_board_for_mirror(board):
@@ -1205,6 +1457,14 @@ def add_mirror_options(ap, populate=False):
     ap.add_argument("--hash-file", default=None, help="hash-list filename; default is <release-type>-rX.sha256")
     ap.add_argument("--no-hash-file", action="store_true", help="do not write a release hash list")
     ap.add_argument("--preserve-filenames", action="store_true", help="use archive member filenames instead of canonical names")
+    ap.add_argument("--firmware", help="firmware UF2/bin package to publish under the fixed OTA filename")
+    ap.add_argument("--firmware-version", default="", help="firmware version label for the mirror manifest")
+    ap.add_argument("--firmware-build", default="", help="firmware build marker for the mirror manifest")
+    ap.add_argument("--theme", help="uncompressed tar theme package to publish under the fixed theme filename")
+    ap.add_argument("--theme-name", default="theme", help="theme display name for the mirror manifest")
+    ap.add_argument("--theme-version", default="", help="theme version label for the mirror manifest")
+    ap.add_argument("--extra-core", action="append", default=[],
+                    help="local .bit/.cor/.core/.m65j file or directory to include in the mirror; repeatable")
     ap.add_argument("--quiet", action="store_true", help="suppress mirror progress chatter")
     ap.add_argument("--detail-workers", type=int, default=8, help="parallel filehost JSON detail fetches; 1 disables")
     if populate:
@@ -1225,12 +1485,17 @@ def downloader_args_from(ns, output, release_type, source_urls, bless):
         "--cache", ns.cache,
         "--channel", release_type,
     ]
-    for attr in ("cookie", "cookie_file", "manifest", "key", "key_name", "hash_file", "detail_workers"):
+    for attr in (
+        "cookie", "cookie_file", "manifest", "key", "key_name", "hash_file", "detail_workers",
+        "firmware", "firmware_version", "firmware_build", "theme", "theme_name", "theme_version",
+    ):
         value = getattr(ns, attr, None)
         if value is not None and value != "":
             args.extend([f"--{attr.replace('_', '-')}", str(value)])
     for url in [*getattr(ns, "option_source_url", []), *source_urls]:
         args.extend(["--source-url", url])
+    for extra in getattr(ns, "extra_core", []) or []:
+        args.extend(["--extra-core", str(extra)])
     if ns.keep_zips:
         args.append("--keep-zips")
     if ns.overwrite:
@@ -1255,8 +1520,6 @@ def downloader_args_from(ns, output, release_type, source_urls, bless):
 
 
 def mirror_main(argv):
-    import download_altcores
-
     ap = argparse.ArgumentParser(
         prog="m65j.py mirror",
         description="Build a local canonical MEGA65 core mirror for a release channel.",
@@ -1274,6 +1537,7 @@ def mirror_main(argv):
               m65j.py mirror --board all mirror https://files.mega65.org
               m65j.py mirror --board r6 stable mirror https://files.mega65.org
               m65j.py mirror --board r6 stable sdcard/cores --overwrite --bless --yes
+              m65j.py mirror --board all stable mirror --extra-core extra_cores
             """
         ),
     )
@@ -1283,7 +1547,7 @@ def mirror_main(argv):
     ns = ap.parse_args(argv)
     release_type, output, source_urls = resolve_mirror_positionals(ap, ns.items)
     args = downloader_args_from(ns, output, release_type, source_urls, ns.bless)
-    return download_altcores.main(args)
+    return embedded_altcore_main(args)
 
 
 def read_hash_manifest(path):
@@ -1295,25 +1559,32 @@ def read_hash_manifest(path):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split(None, 2)
-        if len(parts) != 3 or len(parts[0]) != 64 or len(parts[1]) != 64:
+        parts = line.split()
+        kind = "core"
+        if len(parts) >= 4 and parts[0].lower() in {"core", "firmware", "fw", "theme", "www-theme"}:
+            kind = "firmware" if parts[0].lower() == "fw" else ("theme" if parts[0].lower() == "www-theme" else parts[0].lower())
+            payload_sha = parts[1].lower()
+            transfer_sha = parts[2].lower()
+            rel = parts[3].strip()
+        elif len(parts) >= 3:
+            payload_sha = parts[0].lower()
+            transfer_sha = parts[1].lower()
+            rel = parts[2].strip()
+        else:
             raise SystemExit(f"bad hash manifest line {line_no}: {raw}")
-        payload_sha = parts[0].lower()
-        transfer_sha = parts[1].lower()
-        rel = parts[2].strip()
+        if len(payload_sha) != 64 or len(transfer_sha) != 64:
+            raise SystemExit(f"bad hash manifest line {line_no}: {raw}")
         if any(c not in "0123456789abcdef" for c in payload_sha):
             raise SystemExit(f"bad payload SHA-256 on manifest line {line_no}")
         if transfer_sha and any(c not in "0123456789abcdef" for c in transfer_sha):
             raise SystemExit(f"bad transfer SHA-256 on manifest line {line_no}")
         if not rel or rel.startswith("/") or ".." in rel or "\\" in rel or ":" in rel:
             raise SystemExit(f"unsafe manifest filename on line {line_no}: {rel}")
-        rows.append((payload_sha, transfer_sha, rel))
+        rows.append((kind, payload_sha, transfer_sha, rel))
     return rows
 
 
 def populate_main(argv):
-    import download_altcores
-
     ap = argparse.ArgumentParser(
         prog="m65j.py populate",
         description="Mirror a release channel and upload the resulting files to the board SD card over HTTP.",
@@ -1336,7 +1607,7 @@ def populate_main(argv):
     try:
         bless = not ns.no_bless
         args = downloader_args_from(ns, out_dir, ns.release_type, ns.source_urls, bless)
-        rc = download_altcores.main(args)
+        rc = embedded_altcore_main(args)
         if rc != 0:
             return rc
 
@@ -1357,7 +1628,10 @@ def populate_main(argv):
                 hash_path = out_dir / hash_path
             hash_paths.append((board, hash_path))
             rows = read_hash_manifest(hash_path)
-            for _payload_sha, _transfer_sha, rel in rows:
+            for kind, _payload_sha, _transfer_sha, rel in rows:
+                if kind != "core":
+                    print(f"SKIP populate artifact row kind={kind} file={rel}; device-side fetch handles this", file=sys.stderr)
+                    continue
                 local = out_dir / rel
                 if not local.exists():
                     raise SystemExit(f"manifest entry is missing locally: {local}")
@@ -1416,7 +1690,8 @@ def known_top_level_command(value):
         "CORELS", "I", "T", "P", "LOAD", "PROGRAM", "JTAGLOAD", "S", "N",
         "W", "F", "R", "A", "D", "J", "X", "H", "M", "STATUS", "VERSION",
         "VER", "IDENTIFY", "ABOUT", "WIFI", "HTTP", "SDCARD", "SDSTATUS",
-        "DOWNLOADSTATUS", "DLSTATUS",
+        "DOWNLOADSTATUS", "DLSTATUS", "FWSTATUS", "FIRMWARESTATUS",
+        "THEMESTATUS", "WEBTHEMESTATUS",
         "MACHINE", "MACHINENAME", "IDENTITY",
     }:
         return True
@@ -1430,7 +1705,8 @@ def known_top_level_command(value):
         "push", "jtag", "jtag-push", "store", "store-file", "http-store",
         "put", "http-put", "signing", "stream", "push-local", "program-local",
         "write", "upload", "install-file", "sink", "dummy", "rx-test",
-        "machine", "machines",
+        "machine", "machines", "fwstatus", "firmwarestatus", "themestatus",
+        "webthemestatus",
     }
 
 
@@ -1591,7 +1867,8 @@ def serial_command_candidate(argv):
         "CORELS", "I", "T", "P", "LOAD", "PROGRAM", "JTAGLOAD", "S", "N",
         "W", "F", "R", "A", "D", "J", "X", "H", "M", "STATUS", "VERSION",
         "VER", "IDENTIFY", "ABOUT", "WIFI", "HTTP", "SDCARD", "SDSTATUS",
-        "DOWNLOADSTATUS", "DLSTATUS",
+        "DOWNLOADSTATUS", "DLSTATUS", "FWSTATUS", "FIRMWARESTATUS",
+        "THEMESTATUS", "WEBTHEMESTATUS",
         "MACHINE", "MACHINENAME", "IDENTITY",
     }:
         return True
@@ -1614,6 +1891,7 @@ def serial_preferred_even_with_web_config(argv):
         "CORELS", "I", "T", "P", "S", "N", "W", "F", "R", "A", "D",
         "J", "X", "H", "M", "VERSION", "VER", "IDENTIFY", "ABOUT",
         "WIFI", "HTTP", "SDCARD", "SDSTATUS", "DOWNLOADSTATUS", "DLSTATUS",
+        "FWSTATUS", "FIRMWARESTATUS", "THEMESTATUS", "WEBTHEMESTATUS",
         "MACHINE", "MACHINENAME", "IDENTITY",
     }:
         return True
@@ -1899,6 +2177,7 @@ def read_response_lines(ser, cmd, timeout):
                 "WRITEGRANT", "AUTH", "SDMODE", "JTAGID", "JTAGSTATUS",
                 "XSTATUS", "HIJACK", "MOUNT", "WIFI", "HTTP",
                 "SDCARD", "SDSTATUS", "DOWNLOADSTATUS", "DLSTATUS",
+                "FWSTATUS", "FIRMWARESTATUS", "THEMESTATUS", "WEBTHEMESTATUS",
                 "MACHINE", "MACHINENAME", "NAME",
                 "IDENTITY", "VERBOSE", "WIFIVERBOSE", "DEBUG",
             }
@@ -2160,6 +2439,14 @@ def translate_manual_command(parts):
         return "AT+SDCARD?"
     if upper in {"DOWNLOADSTATUS", "DLSTATUS"}:
         return "AT+DOWNLOADSTATUS?"
+    if upper in {"FWSTATUS", "FIRMWARESTATUS"}:
+        return "AT+FWSTATUS?"
+    if upper in {"FWUPDATE", "FIRMWAREUPDATE"}:
+        return "AT+FWUPDATE"
+    if upper in {"THEMESTATUS", "WEBTHEMESTATUS"}:
+        return "AT+THEMESTATUS?"
+    if upper in {"THEMEINSTALL", "WEBTHEMEINSTALL"}:
+        return "AT+THEMEINSTALL"
     if upper in {"MACHINE", "MACHINENAME", "IDENTITY"}:
         return f"AT+MACHINE={rest}" if rest else "AT+MACHINE?"
     if upper in {"IDENTIFY", "ABOUT"}:

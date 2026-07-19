@@ -29,6 +29,7 @@ bool storage_delete(const char *path);
 bool storage_rename(const char *old_path, const char *new_path);
 bool storage_mkdir(const char *path);
 bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx);
+bool storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx);
 
 void storage_sd_probe(void);
 bool storage_sd_may_mount(void);

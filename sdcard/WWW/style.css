@@ -34,6 +34,12 @@ h1 {
   color: #f6f8fb;
 }
 
+.firmware-version {
+  margin: 5px 0 0;
+  color: #9fb0c3;
+  font-size: 13px;
+}
+
 .grant {
   display: flex;
   flex-wrap: wrap;
@@ -75,10 +81,52 @@ h1 {
 }
 
 .boards a.fetch-now {
+  margin-left: auto;
   border-color: #ffd34d;
   background: #211b10;
   color: #ffd34d;
   font-weight: 700;
+}
+
+.update-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  background: #121821;
+  border: 1px solid #31415a;
+  border-left: 5px solid #ffd34d;
+}
+
+.update-panel strong {
+  color: #ffffff;
+}
+
+.update-panel span {
+  color: #9fb0c3;
+}
+
+.update-panel form {
+  margin: 0 0 0 auto;
+}
+
+.update-panel button {
+  padding: 7px 10px;
+  border: 1px solid #ffd34d;
+  background: #211b10;
+  color: #ffd34d;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.update-panel button:disabled {
+  border-color: #536171;
+  background: #18202b;
+  color: #8f9bab;
+  cursor: default;
 }
 
 table {

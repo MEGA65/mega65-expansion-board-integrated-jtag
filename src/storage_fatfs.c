@@ -270,7 +270,7 @@ bool storage_mkdir(const char *path)
     return true;
 }
 
-bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx)
+static bool storage_list_filtered(const char *path, storage_list_cb_t cb, void *ctx, bool cores_only)
 {
     DIR dir;
     FILINFO fi;
@@ -283,10 +283,20 @@ bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx)
         if (fr != FR_OK) { set_err("f_readdir", fr); f_closedir(&dir); return false; }
         if (fi.fname[0] == 0) break;
         bool is_dir = (fi.fattrib & AM_DIR) != 0;
-        if (is_dir || has_core_ext(fi.fname) || has_partial_core_ext(fi.fname)) {
+        if (!cores_only || is_dir || has_core_ext(fi.fname) || has_partial_core_ext(fi.fname)) {
             cb(fi.fname, (uint32_t)fi.fsize, is_dir, ctx);
         }
     }
     f_closedir(&dir);
     return true;
+}
+
+bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx)
+{
+    return storage_list_filtered(path, cb, ctx, true);
+}
+
+bool storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx)
+{
+    return storage_list_filtered(path, cb, ctx, false);
 }

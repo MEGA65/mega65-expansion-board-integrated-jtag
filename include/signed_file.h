@@ -16,6 +16,8 @@ typedef enum {
     M65_SIGNED_FILE_BIT = 1,
     M65_SIGNED_FILE_COR = 2,
     M65_SIGNED_FILE_M65J = 3,
+    M65_SIGNED_FILE_FIRMWARE = 4,
+    M65_SIGNED_FILE_THEME = 5,
 } m65_signed_file_type_t;
 
 typedef struct {
@@ -27,6 +29,7 @@ typedef struct {
     uint32_t done;
     uint32_t payload_done;
     bool require_signature;
+    bool preserve_transfer;
     bool candidate_signature;
     bool saw_magic;
     bool rejected;
@@ -51,3 +54,7 @@ bool signed_file_receive_begin(signed_file_rx_t *rx,
 bool signed_file_receive_write(signed_file_rx_t *rx, const uint8_t *data, size_t len);
 bool signed_file_receive_finish(signed_file_rx_t *rx);
 void signed_file_receive_abort(signed_file_rx_t *rx);
+bool signed_file_verify_stored(const remote_auth_config_t *cfg,
+                               const char *path,
+                               m65_signed_file_type_t file_type,
+                               bool require_signature);

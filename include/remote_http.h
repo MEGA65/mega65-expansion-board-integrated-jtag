@@ -24,3 +24,7 @@ bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hou
 const char *remote_http_autofetch_status(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override);
 uint32_t remote_http_autofetch_last_success_seconds(void);
 bool remote_http_autofetch_running(void);
+const char *remote_http_firmware_status(void);
+bool remote_http_firmware_update(char *err, size_t err_len);
+const char *remote_http_theme_status(void);
+bool remote_http_theme_install(char *err, size_t err_len);

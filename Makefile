@@ -21,6 +21,16 @@ PICOTOOL_PATH    ?= $(CURDIR)/$(DEPS_DIR)/picotool/build/picotool
 PICOTOOL_FETCH_FROM_GIT_PATH ?= $(if $(wildcard $(CURDIR)/build/_deps/picotool/picotool),$(CURDIR)/build/_deps,)
 WIFI_PROBE_BUILD_DIR ?= build-wifi-probe
 WIFI_PROBE_UF2 ?= $(WIFI_PROBE_BUILD_DIR)/mega65-wifi-probe.uf2
+MIRROR_DIR ?= mirror
+MIRROR_CHANNEL ?= stable
+MIRROR_BOARD ?= all
+MIRROR_SOURCE_URL ?= https://files.mega65.org
+MIRROR_EXTRA_CORES ?= $(wildcard extra_cores)
+MIRROR_FIRMWARE ?= $(UF2)
+MIRROR_THEME ?= $(MIRROR_DIR)/mega65-jtag-default-theme.m65jtheme
+MIRROR_THEME_NAME ?= default
+MIRROR_VERSION ?= v0.1
+WWW_THEME_FILES := app.js favicon-32x32.png fetch_busy.html index_bottom.html index_row.html index_top.html mega65_320x64.png style.css
 
 # Default is now FatFs-on, because P <filename> and L are the whole point.
 # Use `make nofatfs` or `make USE_FATFS=0` for a JTAG/UART-only bring-up build.
@@ -52,6 +62,7 @@ CMAKE_PICOTOOL_ARGS := $(if $(strip $(PICOTOOL_FETCH_FROM_GIT_PATH)),-DPICOTOOL_
 
 .PHONY: all help deps check-tools sdk fatfs configure build nofatfs clean distclean nuke \
         upload flash upload-picotool upload-uf2 picotool print-config terminal \
+        mirror mirror-setup \
         wifi-probe wifi-probe-lwip wifi-probe-bg wifi-probe-manual wifi-probe-manual-bg upload-wifi-probe
 
 all: build
@@ -68,6 +79,7 @@ help:
 	@echo "  make picotool          Build local picotool under .deps/picotool/build/"
 	@echo "  make upload-picotool   Flash using system/local picotool"
 	@echo "  make nofatfs           Build UART/JTAG-only firmware without SD/FatFs"
+	@echo "  make mirror            Build firmware, pack WWW theme, and prepare signed mirror/"
 	@echo "  make wifi-probe        Build standalone Pico W bare CYW43 probe, no SD/FatFs/JTAG/lwIP"
 	@echo "  make wifi-probe-lwip   Build same probe against pico_cyw43_arch_lwip_poll"
 	@echo "  make wifi-probe-bg     Build same probe against pico_cyw43_arch_lwip_threadsafe_background"
@@ -85,6 +97,11 @@ help:
 	@echo "  BUILD_DIR=build-wifi   Override build directory"
 	@echo "  ENABLE_WIFI_REMOTE=1   Default. Set 0 for non-WiFi builds"
 	@echo "  M65_SD_MODE=...        Optional: M65_SD_MODE_AUTO, M65_SD_MODE_HW_SPI, M65_SD_MODE_SCHEMATIC_BITBANG"
+	@echo "  MIRROR_CHANNEL=stable  Mirror release channel/manifest prefix"
+	@echo "  MIRROR_BOARD=all       Mirror board filter: all means both r3 and r6"
+	@echo "  MIRROR_SOURCE_URL=...  Source catalogue URL for make mirror"
+	@echo "  MIRROR_EXTRA_CORES=... Extra local .bit/.cor/.m65j files/dirs; default extra_cores/ if present"
+	@echo "  MIRROR_FIRMWARE=...    Firmware image staged into mirror; default built UF2"
 	@echo "  PICO_MOUNT=...         Mount point for upload-uf2, if autodetect fails"
 	@echo
 	@echo "Examples:"
@@ -152,6 +169,42 @@ build: configure
 	fi
 	@echo
 	@echo "Built: $(UF2)"
+
+mirror: build
+	@set -e; \
+	mkdir -p "$(MIRROR_DIR)"; \
+	echo "Packing default WWW theme: $(MIRROR_THEME)"; \
+	tar -cf "$(MIRROR_THEME)" -C sdcard/WWW $(WWW_THEME_FILES); \
+	build_marker="$$(sed -n 's/^#define M65_BUILD_MARKER "\(.*\)"/\1/p' "$(BUILD_DIR)/generated/generated_version.h")"; \
+	if [ -z "$$build_marker" ]; then \
+		echo "ERROR: could not read M65_BUILD_MARKER from $(BUILD_DIR)/generated/generated_version.h"; \
+		exit 1; \
+	fi; \
+	extra_args=(); \
+	extra_items="$(strip $(MIRROR_EXTRA_CORES))"; \
+	if [ -n "$$extra_items" ]; then \
+		echo "Including extra local cores: $$extra_items"; \
+		for extra in $$extra_items; do \
+			extra_args+=(--extra-core "$$extra"); \
+		done; \
+	fi; \
+	echo "Staging firmware image: $(MIRROR_FIRMWARE)"; \
+	echo "Preparing $(MIRROR_CHANNEL) mirror in $(MIRROR_DIR) for board(s) $(MIRROR_BOARD) with firmware build $$build_marker"; \
+	python3 tools/m65j.py mirror \
+		--board "$(MIRROR_BOARD)" \
+		--overwrite \
+		--bless \
+		--yes \
+		--firmware "$(MIRROR_FIRMWARE)" \
+		--firmware-version "$(MIRROR_VERSION)" \
+		--firmware-build "$$build_marker" \
+		--theme "$(MIRROR_THEME)" \
+		--theme-name "$(MIRROR_THEME_NAME)" \
+		--theme-version "$$build_marker" \
+		"$${extra_args[@]}" \
+		"$(MIRROR_CHANNEL)" "$(MIRROR_DIR)" "$(MIRROR_SOURCE_URL)"
+
+mirror-setup: mirror
 
 nofatfs:
 	$(MAKE) USE_FATFS=0 BUILD_DIR=build-nofatfs build

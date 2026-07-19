@@ -32,6 +32,9 @@
 #ifndef M65_WIFI_COMMAND_QUIET_MS
 #define M65_WIFI_COMMAND_QUIET_MS 15000u
 #endif
+#ifndef M65_SD_HOTPLUG_POLL_MS
+#define M65_SD_HOTPLUG_POLL_MS 2000u
+#endif
 #ifndef M65_WRITE_COMMANDS_USB_ONLY
 #define M65_WRITE_COMMANDS_USB_ONLY 1
 #endif
@@ -52,6 +55,9 @@ typedef enum {
 static command_mode_t command_mode = CMD_MODE_AT;
 static bool usb_reconnect_pending = false;
 static absolute_time_t usb_reconnect_at;
+static bool remote_init_done = false;
+static bool sd_config_loaded = false;
+static absolute_time_t sd_hotplug_poll_at;
 static bool is_partial_core_path(const char *path);
 
 typedef struct {
@@ -98,7 +104,10 @@ static void usb_reconnect_poll(void)
 
 static bool ensure_mount(void)
 {
-    if (sd_mounted) return true;
+    if (sd_mounted || storage_is_mounted()) {
+        sd_mounted = true;
+        return true;
+    }
     if (!storage_mount()) {
         uart_cmd_printf("ERR SD %s\n", storage_last_error());
         return false;
@@ -109,7 +118,10 @@ static bool ensure_mount(void)
 
 static bool ensure_mount_quiet(void)
 {
-    if (sd_mounted) return true;
+    if (sd_mounted || storage_is_mounted()) {
+        sd_mounted = true;
+        return true;
+    }
     if (!storage_mount()) return false;
     sd_mounted = true;
     return true;
@@ -408,6 +420,8 @@ static bool at_command_preserves_autofetch(const char *arg)
 
     if (ci_equal(tmp, "FETCHSTATUS") || ci_equal(tmp, "AUTOFETCHSTATUS") || ci_equal(tmp, "AFSTATUS")) return true;
     if (ci_equal(tmp, "DOWNLOADSTATUS") || ci_equal(tmp, "DLSTATUS")) return true;
+    if (ci_equal(tmp, "FWSTATUS") || ci_equal(tmp, "FIRMWARESTATUS")) return true;
+    if (ci_equal(tmp, "THEMESTATUS") || ci_equal(tmp, "WEBTHEMESTATUS")) return true;
     if (ci_equal(tmp, "FETCHNOW") || ci_equal(tmp, "AUTOFETCHNOW") || ci_equal(tmp, "AFNOW")) return true;
     if (ci_equal(tmp, "VERBOSE") || ci_equal(tmp, "WIFIVERBOSE") || ci_equal(tmp, "DEBUG")) return true;
     if (query_only &&
@@ -492,6 +506,37 @@ static void at_settings_load(void)
     remote_http_set_verbose(at_settings.verbose);
     machine_identity_set_board_rev(at_settings.fetch_board_rev);
     remote_http_autofetch_reset_schedule();
+}
+
+static void sd_backed_config_reload(bool announce)
+{
+    if (!ensure_mount_quiet()) return;
+    at_settings_load();
+    if (machine_identity_name()[0]) usb_reconnect_schedule();
+    remote_http_init();
+    sd_config_loaded = true;
+
+    if (announce && remote_http_verbose() > 0u) {
+        uart_cmd_log_puts_best_effort("+SDCARD: mounted config=reloaded transport=");
+        uart_cmd_log_puts_best_effort(storage_sd_transport_name());
+        uart_cmd_log_puts_best_effort("\r\n");
+        uart_cmd_log_puts_best_effort("+REMOTE: ");
+        uart_cmd_log_puts_best_effort(remote_http_status());
+        uart_cmd_log_puts_best_effort("\r\n");
+    }
+}
+
+static void sd_hotplug_poll(void)
+{
+    if (!remote_init_done || sd_config_loaded) return;
+
+    absolute_time_t now = get_absolute_time();
+    if (absolute_time_diff_us(now, sd_hotplug_poll_at) > 0) return;
+    sd_hotplug_poll_at = make_timeout_time_ms(M65_SD_HOTPLUG_POLL_MS);
+
+    if (storage_is_mounted() || ensure_mount_quiet()) {
+        sd_backed_config_reload(true);
+    }
 }
 
 static bool at_settings_save(void)
@@ -655,6 +700,10 @@ static void cmd_help(void)
         "+HELP: AT+AUTOFETCH[=0|1]  show/set mirror auto-update enable\n"
         "+HELP: AT+FETCHSTATUS?      show mirror auto-update/fetch status\n"
         "+HELP: AT+FETCHNOW[=3|6|remote] fetch mirror manifest now\n"
+        "+HELP: AT+FWSTATUS?        show fetched firmware update candidate\n"
+        "+HELP: AT+FWUPDATE         install fetched verified firmware update\n"
+        "+HELP: AT+THEMESTATUS?     show fetched WWW theme candidate\n"
+        "+HELP: AT+THEMEINSTALL     install fetched WWW theme; needs write grant\n"
         "+HELP: AT+FETCHINTERVAL[=hours] show/set auto-update interval; min 3\n"
         "+HELP: AT+FETCHBOARD[=3|6|remote] show/set auto-update board manifest\n"
         "+HELP: AT+VERBOSE[=0|1|2] show/set WiFi/fetch diagnostic verbosity\n"
@@ -773,9 +822,10 @@ static void cmd_sd_transport(char *arg)
 static void cmd_sdcard(void)
 {
     sdcard_state_t state = sdcard_state();
-    uart_cmd_printf("+SDCARD: state=%s mounted=%lu transport=%s\r\n",
+    uart_cmd_printf("+SDCARD: state=%s mounted=%lu config_loaded=%lu transport=%s\r\n",
                     sdcard_state_token(state),
                     (unsigned long)(storage_is_mounted() ? 1u : 0u),
+                    (unsigned long)(sd_config_loaded ? 1u : 0u),
                     storage_sd_transport_name());
     at_ok();
 }
@@ -958,6 +1008,47 @@ static void cmd_fetch_now(char *arg, bool have_value, bool query)
     at_ok();
 }
 
+static void cmd_firmware_status(void)
+{
+    uart_cmd_printf("+FWSTATUS: %s\r\n", remote_http_firmware_status());
+    at_ok();
+}
+
+static void cmd_firmware_update(void)
+{
+    if (remote_http_autofetch_running()) {
+        at_error("BUSY FETCHING");
+        return;
+    }
+    char err[128];
+    if (!remote_http_firmware_update(err, sizeof err)) {
+        at_error(err[0] ? err : "FIRMWARE UPDATE FAILED");
+        return;
+    }
+    at_ok();
+}
+
+static void cmd_theme_status(void)
+{
+    uart_cmd_printf("+THEMESTATUS: %s\r\n", remote_http_theme_status());
+    at_ok();
+}
+
+static void cmd_theme_install(void)
+{
+    if (remote_http_autofetch_running()) {
+        at_error("BUSY FETCHING");
+        return;
+    }
+    if (!require_write_authority("THEMEINSTALL")) return;
+    char err[128];
+    if (!remote_http_theme_install(err, sizeof err)) {
+        at_error(err[0] ? err : "THEME INSTALL FAILED");
+        return;
+    }
+    at_ok();
+}
+
 static void cmd_authority(void)
 {
     uint32_t remaining = write_gate_remaining_ms();
@@ -975,7 +1066,15 @@ static void cmd_mount(void)
 {
     storage_unmount();
     sd_mounted = false;
-    if (ensure_mount()) uart_cmd_puts("OK M read_only_default=1\n");
+    sd_config_loaded = false;
+    if (ensure_mount()) {
+        if (remote_init_done) {
+            sd_backed_config_reload(false);
+            uart_cmd_puts("OK M read_only_default=1 config=reloaded\n");
+        } else {
+            uart_cmd_puts("OK M read_only_default=1 config=deferred\n");
+        }
+    }
 }
 
 static void cmd_list(char *arg)
@@ -1852,6 +1951,14 @@ static void dispatch_at(char *arg)
         cmd_fetch_status();
     } else if (ci_equal(cmd, "FETCHNOW") || ci_equal(cmd, "AUTOFETCHNOW") || ci_equal(cmd, "AFNOW")) {
         cmd_fetch_now(param, value != NULL, query != NULL);
+    } else if (ci_equal(cmd, "FWSTATUS") || ci_equal(cmd, "FIRMWARESTATUS")) {
+        cmd_firmware_status();
+    } else if (ci_equal(cmd, "FWUPDATE") || ci_equal(cmd, "FIRMWAREUPDATE")) {
+        cmd_firmware_update();
+    } else if (ci_equal(cmd, "THEMESTATUS") || ci_equal(cmd, "WEBTHEMESTATUS")) {
+        cmd_theme_status();
+    } else if (ci_equal(cmd, "THEMEINSTALL") || ci_equal(cmd, "WEBTHEMEINSTALL")) {
+        cmd_theme_install();
     } else if (ci_equal(cmd, "FETCHINTERVAL")) {
         cmd_fetch_interval(param, value != NULL);
     } else if (ci_equal(cmd, "FETCHBOARD")) {
@@ -1943,8 +2050,8 @@ int main(void)
     uart_cmd_printf("OK SD %s\n", storage_sd_transport_name());
     uart_cmd_puts("OK READY\n");
 
-    bool remote_init_done = false;
     absolute_time_t remote_init_at = make_timeout_time_ms(M65_REMOTE_INIT_DELAY_MS);
+    sd_hotplug_poll_at = make_timeout_time_ms(M65_SD_HOTPLUG_POLL_MS);
 
     char line[256];
     for (;;) {
@@ -1955,12 +2062,18 @@ int main(void)
         }
         if (!remote_init_done &&
             absolute_time_diff_us(get_absolute_time(), remote_init_at) <= 0) {
-            at_settings_load();
-            if (machine_identity_name()[0]) usb_reconnect_schedule();
-            remote_http_init();
+            if (ensure_mount_quiet()) {
+                sd_backed_config_reload(false);
+            } else {
+                at_settings_load();
+                if (machine_identity_name()[0]) usb_reconnect_schedule();
+                remote_http_init();
+                sd_config_loaded = false;
+            }
             uart_cmd_printf("OK REMOTE %s\n", remote_http_status());
             remote_init_done = true;
         }
+        sd_hotplug_poll();
         remote_http_poll();
         if (remote_init_done) {
             remote_http_autofetch_poll(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev);

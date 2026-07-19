@@ -17,6 +17,28 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+execute_process(
+    COMMAND bash -c "printf '%s-%d' \"$(date +%Y-%m-%d)\" $((10#$(date +%H)*60 + 10#$(date +%M)))"
+    OUTPUT_VARIABLE M65_BUILD_TIME
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+execute_process(
+    COMMAND git rev-parse --short=8 HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+    OUTPUT_VARIABLE M65_GIT_COMMITISH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT M65_GIT_COMMITISH)
+    set(M65_GIT_COMMITISH "nogit")
+endif()
+set(M65_BUILD_MARKER "${M65_BUILD_TIME}-${M65_GIT_COMMITISH}")
+configure_file(
+    "${CMAKE_CURRENT_LIST_DIR}/include/generated_version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/generated_version.h"
+    @ONLY
+)
+
 option(M65_USE_FATFS "Build with FatFs storage backend" ON)
 option(M65_HAVE_SD_INIT_DRIVER "Call sd_init_driver() before f_mount(); usually not needed for recent carlk3 library" OFF)
 option(M65_ENABLE_WIFI_REMOTE "Build Pico W WiFi remote-delivery support" OFF)
@@ -39,6 +61,7 @@ add_executable(pico_m65jtag
 )
 
 target_include_directories(pico_m65jtag PRIVATE include)
+target_include_directories(pico_m65jtag PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(pico_m65jtag PRIVATE
     "${PICO_SDK_PATH}/lib/mbedtls/include"
     "${PICO_SDK_PATH}/lib/mbedtls/include/mbedtls"

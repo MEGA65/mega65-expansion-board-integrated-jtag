@@ -145,6 +145,18 @@ const char *remote_http_autofetch_status(int enabled_override, uint32_t interval
 }
 uint32_t remote_http_autofetch_last_success_seconds(void) { return 0xffffffffu; }
 bool remote_http_autofetch_running(void) { return false; }
+const char *remote_http_firmware_status(void) { return "firmware=unsupported"; }
+bool remote_http_firmware_update(char *err, size_t err_len)
+{
+    if (err && err_len) snprintf(err, err_len, "wifi/SD firmware update support is not built");
+    return false;
+}
+const char *remote_http_theme_status(void) { return "theme=unsupported"; }
+bool remote_http_theme_install(char *err, size_t err_len)
+{
+    if (err && err_len) snprintf(err, err_len, "wifi/SD theme support is not built");
+    return false;
+}
 
 #else
 
@@ -238,6 +250,23 @@ typedef enum {
     AUTOFETCH_VERIFY,
     AUTOFETCH_CORE,
 } autofetch_state_t;
+
+typedef enum {
+    MANIFEST_KIND_SKIP = 0,
+    MANIFEST_KIND_CORE,
+    MANIFEST_KIND_FIRMWARE,
+    MANIFEST_KIND_THEME,
+} manifest_kind_t;
+
+typedef struct {
+    manifest_kind_t kind;
+    char payload_sha[65];
+    char transfer_sha[65];
+    char rel[224];
+    char version[48];
+    char build[64];
+    char name[48];
+} manifest_entry_t;
 
 typedef enum {
     WIFI_ASSOC_OFF = 0,
@@ -349,6 +378,7 @@ static autofetch_state_t autofetch_state = AUTOFETCH_IDLE;
 static fetch_ctx_t autofetch_fc;
 static remote_auth_config_t autofetch_sig_cfg;
 static uint32_t autofetch_manifest_offset;
+static uint32_t autofetch_needed_count;
 static uint32_t autofetch_updated_count;
 static uint32_t autofetch_checked_count;
 static uint32_t autofetch_manifest_total_count;
@@ -357,9 +387,24 @@ static char autofetch_manifest_path[48];
 static char autofetch_base_url[192];
 static char autofetch_channel[24];
 static char autofetch_pending_path[224];
+static char autofetch_pending_url_path[224];
 static char autofetch_pending_sha[65];
 static char autofetch_pending_transfer_sha[65];
+static manifest_kind_t autofetch_pending_kind;
+static char autofetch_pending_version[48];
+static char autofetch_pending_build[64];
+static char autofetch_pending_name[48];
 static char autofetch_status_buf[320] = "autofetch=idle";
+static char pending_firmware_version[48];
+static char pending_firmware_build[64];
+static char pending_firmware_source[224];
+static bool pending_firmware_seen;
+static char pending_theme_name[48];
+static char pending_theme_version[48];
+static char pending_theme_source[224];
+static bool pending_theme_seen;
+static char firmware_status_buf[256] = "firmware=none";
+static char theme_status_buf[256] = "theme=none";
 static fetch_ctx_t download_fc;
 static download_job_t download_jobs[M65_DOWNLOAD_QUEUE_DEPTH];
 static int download_active_job = -1;
@@ -534,10 +579,14 @@ static const char default_top[] =
     "<style>"
     "body{font-family:Arial,sans-serif;margin:0;background:#0a0c10;color:#e8edf3}"
     "main{width:min(980px,calc(100vw - 32px));margin:24px auto}"
-    "h1{font-size:24px;margin:0}.grant,.boards a,.boards span{background:#121821;border:1px solid #273142}"
+    "h1{font-size:24px;margin:0}.firmware-version{margin:5px 0 0;color:#9fb0c3;font-size:13px}"
+    ".grant,.boards a,.boards span,.update-panel{background:#121821;border:1px solid #273142}"
     ".grant{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 16px;padding:12px 14px;border-left:5px solid #a43838}"
     ".grant-active,.grant-not-required{border-left-color:#2fa35b}.boards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}"
-    ".boards a,.boards span{padding:7px 10px}.boards a.fetch-now{border-color:#ffd34d;background:#211b10;color:#ffd34d;font-weight:700}"
+    ".boards a,.boards span{padding:7px 10px}.boards a.fetch-now{margin-left:auto;border-color:#ffd34d;background:#211b10;color:#ffd34d;font-weight:700}"
+    ".update-panel{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:16px;padding:12px 14px;border-left:5px solid #ffd34d}"
+    ".update-panel form{margin:0 0 0 auto}.update-panel button{padding:7px 10px;border:1px solid #ffd34d;background:#211b10;color:#ffd34d;font:inherit;font-weight:700}"
+    ".update-panel button:disabled{border-color:#536171;background:#18202b;color:#8f9bab}"
     "table{border-collapse:collapse;width:100%;background:#10161f}"
     "th,td{border-bottom:1px solid #263140;padding:10px 12px;text-align:left;vertical-align:top}"
     "th{background:#1b2531;color:#fff}.start{display:inline-block;margin-right:10px;padding:5px 9px;background:#1e7a46;color:#fff;text-decoration:none}"
@@ -545,10 +594,11 @@ static const char default_top[] =
     ".core-name{font-weight:700}.meta{font-size:13px;color:#9fb0c3;margin-top:4px}.meta:empty{display:none}"
     "a{color:#63b3ff}.delete{color:#ff7b7b;background:none;border:0;padding:0;font:inherit;text-decoration:underline;cursor:pointer}"
     "</style></head><body>"
-    "<main><h1>Expansion Board Integrated JTAG</h1>"
+    "<main><h1>Expansion Board Integrated JTAG</h1><p class=\"firmware-version\">{FIRMWARE_VERSION} build {FIRMWARE_BUILD}</p>"
     "<section class=\"grant grant-{WRITE_GRANT_STATUS}\"><strong>Write grant:</strong> {WRITE_GRANT_STATUS} "
     "<span>{WRITE_GRANT_MESSAGE}</span><span>Policy: {WRITE_GRANT_REQUIRED}</span></section>"
-    "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a> <a class=\"fetch-now\" href=\"{FETCH_NOW_URL}\">Download new cores</a></nav>"
+    "{FIRMWARE_UPDATE_PANEL}{THEME_INSTALL_PANEL}"
+    "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a> <a class=\"fetch-now\" href=\"{FETCH_NOW_URL}\">Check for updated cores</a></nav>"
     "<table><thead><tr><th>Core</th><th>Bytes</th><th>Actions</th></tr></thead><tbody>\n";
 static const char default_row[] =
     "<tr class=\"entry-row\" data-kind=\"{TYPE}\"><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
@@ -562,7 +612,7 @@ static const char default_bottom[] =
 static const char default_busy[] =
     "<!doctype html><html><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<meta http-equiv=\"refresh\" content=\"5\">"
+    "<meta http-equiv=\"refresh\" content=\"{FETCH_REFRESH_SECONDS}\">"
     "<title>MEGA65 JTAG busy</title>"
     "<style>"
     "body{margin:0;background:#090c11;color:#e8edf3;font-family:Arial,sans-serif}"
@@ -576,18 +626,21 @@ static const char default_busy[] =
     "@keyframes move{from{background-position:0 0}to{background-position:64px 0}}"
     "@media(max-width:620px){.grid{grid-template-columns:1fr}}"
     "</style></head><body><main><section class=\"panel\">"
-    "<h1>Fetching cores</h1><div class=\"status\">{FETCH_STATUS}</div>"
+    "<h1>Fetching cores</h1><p>{FETCH_ACTION}</p><div class=\"status\">{FETCH_STATUS}</div>"
     "<div class=\"bar\"><div class=\"fill\"></div></div>"
     "<div class=\"grid\">"
     "<div class=\"cell\"><strong>Stage</strong><br>{FETCH_STAGE}</div>"
     "<div class=\"cell\"><strong>File</strong><br>{FETCH_FILE}</div>"
     "<div class=\"cell\"><strong>Manifest</strong><br>{FETCH_CHECKED}/{FETCH_TOTAL} checked</div>"
-    "<div class=\"cell\"><strong>Updated</strong><br>{FETCH_UPDATED}</div>"
-    "<div class=\"cell\"><strong>Current file</strong><br>{FETCH_BYTES}/{FETCH_TOTAL_BYTES} bytes</div>"
+    "<div class=\"cell\"><strong>Updates</strong><br>{FETCH_NEEDED} needed / {FETCH_UPDATED} completed</div>"
+    "<div class=\"cell\"><strong>{FETCH_PROGRESS_LABEL}</strong><br>{FETCH_BYTES}/{FETCH_TOTAL_BYTES} bytes</div>"
     "<div class=\"cell\"><strong>Average rate</strong><br>{FETCH_RATE_KIBPS} KiB/s</div>"
     "</div>"
     "<form method=\"get\" action=\"/fetch/stop\"><button type=\"submit\">Stop fetch</button></form>"
     "</section></main></body></html>\n";
+
+static bool ext_equal_ci(const char *a, const char *b);
+static bool ci_equal(const char *a, const char *b);
 
 static bool has_core_ext(const char *name)
 {
@@ -614,6 +667,60 @@ static bool has_manifest_ext(const char *name)
            dot[4] == '2' && dot[5] == '5' && dot[6] == '6' && dot[7] == 0;
 }
 
+static bool has_firmware_ext(const char *name)
+{
+    const char *dot = strrchr(name ? name : "", '.');
+    if (!dot) return false;
+    return ext_equal_ci(dot, ".uf2") || ext_equal_ci(dot, ".m65fw") || ext_equal_ci(dot, ".bin");
+}
+
+static bool has_theme_ext(const char *name)
+{
+    const char *dot = strrchr(name ? name : "", '.');
+    if (!dot) return false;
+    return ext_equal_ci(dot, ".m65jtheme") || ext_equal_ci(dot, ".tar");
+}
+
+static const char *manifest_kind_name(manifest_kind_t kind)
+{
+    switch (kind) {
+    case MANIFEST_KIND_CORE: return "core";
+    case MANIFEST_KIND_FIRMWARE: return "firmware";
+    case MANIFEST_KIND_THEME: return "theme";
+    default: return "skip";
+    }
+}
+
+static bool manifest_kind_stores_signed_transfer(manifest_kind_t kind)
+{
+    return kind == MANIFEST_KIND_FIRMWARE || kind == MANIFEST_KIND_THEME;
+}
+
+static bool parse_manifest_kind(const char *s, manifest_kind_t *kind)
+{
+    if (!s || !kind) return false;
+    if (ci_equal(s, "core")) {
+        *kind = MANIFEST_KIND_CORE;
+        return true;
+    }
+    if (ci_equal(s, "firmware") || ci_equal(s, "fw")) {
+        *kind = MANIFEST_KIND_FIRMWARE;
+        return true;
+    }
+    if (ci_equal(s, "theme") || ci_equal(s, "www-theme")) {
+        *kind = MANIFEST_KIND_THEME;
+        return true;
+    }
+    return false;
+}
+
+static const char *manifest_final_path(manifest_kind_t kind, const char *rel)
+{
+    if (kind == MANIFEST_KIND_FIRMWARE) return M65_FIRMWARE_PACKAGE_PATH;
+    if (kind == MANIFEST_KIND_THEME) return M65_THEME_PACKAGE_PATH;
+    return rel;
+}
+
 static bool path_starts_with_ci(const char *s, const char *prefix)
 {
     if (!s || !prefix) return false;
@@ -634,6 +741,20 @@ static bool safe_file_path(const char *path)
     if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
     if (path_starts_with_ci(path, "WWW/") || path_starts_with_ci(path, "DOWNLOADS/")) return false;
     return has_core_ext(path) || has_manifest_ext(path);
+}
+
+static bool safe_manifest_source_path(const char *path, manifest_kind_t kind)
+{
+    if (!path || !path[0]) return false;
+    size_t n = strlen(path);
+    if (n > 220) return false;
+    if (path[0] == '/') return false;
+    if (strstr(path, "..")) return false;
+    if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
+    if (kind == MANIFEST_KIND_CORE) return has_core_ext(path);
+    if (kind == MANIFEST_KIND_FIRMWARE) return has_firmware_ext(path);
+    if (kind == MANIFEST_KIND_THEME) return has_theme_ext(path);
+    return false;
 }
 
 static bool safe_www_path(const char *path)
@@ -1087,7 +1208,7 @@ static void autofetch_hash_status_update(const char *stage,
 {
     unsigned long percent = size ? (unsigned long)(((uint64_t)done * 100u) / size) : 0ul;
     snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-             "autofetch=running stage=%s-hash file=%s bytes=%lu/%lu percent=%lu checked=%lu total=%lu updated=%lu",
+             "autofetch=running stage=%s-hash file=%s bytes=%lu/%lu percent=%lu checked=%lu total=%lu needed=%lu updated=%lu",
              stage ? stage : "file",
              path ? path : "(unset)",
              (unsigned long)done,
@@ -1095,6 +1216,7 @@ static void autofetch_hash_status_update(const char *stage,
              percent,
              (unsigned long)autofetch_checked_count,
              (unsigned long)autofetch_manifest_total_count,
+             (unsigned long)autofetch_needed_count,
              (unsigned long)autofetch_updated_count);
 }
 
@@ -1359,16 +1481,170 @@ static void load_cached_web_assets(void)
                                              &favicon_cache_len);
 }
 
+static bool storage_file_exists(const char *path)
+{
+    storage_file_t f = {0};
+    if (!storage_open(&f, path)) return false;
+    storage_close(&f);
+    return true;
+}
+
+static bool write_text_file(const char *path, const char *text)
+{
+    storage_file_t f = {0};
+    if (!storage_open_write(&f, path, true)) return false;
+    size_t put = 0;
+    size_t len = strlen(text ? text : "");
+    bool ok = storage_write(&f, text ? text : "", len, &put) && put == len && storage_sync(&f);
+    storage_close(&f);
+    return ok;
+}
+
+static void record_firmware_candidate(const manifest_entry_t *entry)
+{
+    if (!entry) return;
+    snprintf(pending_firmware_version, sizeof pending_firmware_version, "%s", entry->version);
+    snprintf(pending_firmware_build, sizeof pending_firmware_build, "%s", entry->build);
+    snprintf(pending_firmware_source, sizeof pending_firmware_source, "%s", entry->rel);
+    pending_firmware_seen = true;
+
+    char info[256];
+    snprintf(info, sizeof info,
+             "version=%s\nbuild=%s\nsource=%s\n",
+             pending_firmware_version,
+             pending_firmware_build,
+             pending_firmware_source);
+    (void)write_text_file(M65_FIRMWARE_INFO_PATH, info);
+}
+
+static void record_theme_candidate(const manifest_entry_t *entry)
+{
+    if (!entry) return;
+    snprintf(pending_theme_name, sizeof pending_theme_name, "%s", entry->name[0] ? entry->name : "theme");
+    snprintf(pending_theme_version, sizeof pending_theme_version, "%s", entry->version);
+    snprintf(pending_theme_source, sizeof pending_theme_source, "%s", entry->rel);
+    pending_theme_seen = true;
+
+    char info[256];
+    snprintf(info, sizeof info,
+             "name=%s\nversion=%s\nsource=%s\n",
+             pending_theme_name,
+             pending_theme_version,
+             pending_theme_source);
+    (void)write_text_file(M65_THEME_INFO_PATH, info);
+}
+
+static void parse_info_line(char *line, char *key, size_t key_len, char *value, size_t value_len)
+{
+    if (key_len) key[0] = 0;
+    if (value_len) value[0] = 0;
+    char *eq = strchr(line, '=');
+    if (!eq) return;
+    *eq++ = 0;
+    snprintf(key, key_len, "%s", line);
+    snprintf(value, value_len, "%s", eq);
+}
+
+static void load_pending_info_file(const char *path,
+                                   char *a,
+                                   size_t a_len,
+                                   const char *a_key,
+                                   char *b,
+                                   size_t b_len,
+                                   const char *b_key,
+                                   char *source,
+                                   size_t source_len)
+{
+    storage_file_t f = {0};
+    if (!storage_open(&f, path)) return;
+    uint32_t size = storage_size(&f);
+    if (size > 255u) size = 255u;
+    char buf[256];
+    size_t got = 0;
+    bool ok = storage_read(&f, buf, size, &got);
+    storage_close(&f);
+    if (!ok) return;
+    buf[got] = 0;
+
+    char *p = buf;
+    while (*p) {
+        char *line = p;
+        char *nl = strchr(p, '\n');
+        if (nl) {
+            *nl = 0;
+            p = nl + 1;
+        } else {
+            p += strlen(p);
+        }
+        char key[32], value[160];
+        parse_info_line(line, key, sizeof key, value, sizeof value);
+        if (a && a_key && ci_equal(key, a_key)) snprintf(a, a_len, "%s", value);
+        else if (b && b_key && ci_equal(key, b_key)) snprintf(b, b_len, "%s", value);
+        else if (source && ci_equal(key, "source")) snprintf(source, source_len, "%s", value);
+    }
+}
+
+static bool firmware_update_available(void)
+{
+    if (!storage_file_exists(M65_FIRMWARE_PACKAGE_PATH)) return false;
+    if (!pending_firmware_seen) {
+        load_pending_info_file(M65_FIRMWARE_INFO_PATH,
+                               pending_firmware_version, sizeof pending_firmware_version, "version",
+                               pending_firmware_build, sizeof pending_firmware_build, "build",
+                               pending_firmware_source, sizeof pending_firmware_source);
+        pending_firmware_seen = pending_firmware_version[0] || pending_firmware_build[0] || pending_firmware_source[0];
+    }
+    if (pending_firmware_build[0]) return strcmp(pending_firmware_build, M65_BUILD_MARKER) != 0;
+    if (pending_firmware_version[0]) return strcmp(pending_firmware_version, M65_VERSION_STRING) != 0;
+    return true;
+}
+
+static bool theme_update_available(void)
+{
+    if (!storage_file_exists(M65_THEME_PACKAGE_PATH)) return false;
+    if (!pending_theme_seen) {
+        load_pending_info_file(M65_THEME_INFO_PATH,
+                               pending_theme_name, sizeof pending_theme_name, "name",
+                               pending_theme_version, sizeof pending_theme_version, "version",
+                               pending_theme_source, sizeof pending_theme_source);
+        pending_theme_seen = pending_theme_name[0] || pending_theme_version[0] || pending_theme_source[0];
+    }
+    return true;
+}
+
 static const char *autofetch_stage_name(void)
 {
-    if (autofetch_hash_active && autofetch_hash_stage[0]) return autofetch_hash_stage;
+    if (autofetch_hash_active) return "checking SD file";
     switch (autofetch_state) {
-    case AUTOFETCH_MANIFEST: return "manifest";
-    case AUTOFETCH_SCAN: return "scan";
-    case AUTOFETCH_VERIFY: return "verify";
-    case AUTOFETCH_CORE: return "core";
+    case AUTOFETCH_MANIFEST: return "downloading manifest";
+    case AUTOFETCH_SCAN: return "checking manifest";
+    case AUTOFETCH_VERIFY: return "verifying download";
+    case AUTOFETCH_CORE: return "downloading file";
     default: return "idle";
     }
+}
+
+static const char *autofetch_action_text(void)
+{
+    if (autofetch_hash_active) {
+        if (strncmp(autofetch_hash_stage, "verify", 6) == 0) return "Verifying the downloaded file on the SD card";
+        return "Hash checking an existing SD-card file";
+    }
+    switch (autofetch_state) {
+    case AUTOFETCH_MANIFEST: return "Downloading and verifying the signed manifest";
+    case AUTOFETCH_SCAN: return "Comparing the manifest against files already on the SD card";
+    case AUTOFETCH_VERIFY: return "Verifying the downloaded file before committing it";
+    case AUTOFETCH_CORE: return "Downloading a changed file from the mirror";
+    default: return autofetch_running ? "Updating the SD card" : "Fetch is idle";
+    }
+}
+
+static const char *autofetch_progress_label(void)
+{
+    if (autofetch_hash_active) return "SD hash progress";
+    if (autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE) return "Download progress";
+    if (autofetch_state == AUTOFETCH_VERIFY) return "Verification progress";
+    return "Current progress";
 }
 
 static const char *autofetch_current_file(void)
@@ -1460,6 +1736,8 @@ static void substitution_value(const char *name,
         html_escape(autofetch_status_buf[0] ? autofetch_status_buf : "autofetch=idle", out, out_len);
     } else if (ci_equal(name, "FETCH_STAGE")) {
         snprintf(out, out_len, "%s", autofetch_stage_name());
+    } else if (ci_equal(name, "FETCH_ACTION")) {
+        html_escape(autofetch_action_text(), out, out_len);
     } else if (ci_equal(name, "FETCH_FILE")) {
         html_escape(autofetch_current_file(), out, out_len);
     } else if (ci_equal(name, "FETCH_CHANNEL")) {
@@ -1468,6 +1746,8 @@ static void substitution_value(const char *name,
         snprintf(out, out_len, "%lu", (unsigned long)autofetch_checked_count);
     } else if (ci_equal(name, "FETCH_TOTAL")) {
         snprintf(out, out_len, "%lu", (unsigned long)autofetch_manifest_total_count);
+    } else if (ci_equal(name, "FETCH_NEEDED") || ci_equal(name, "FETCH_FOUND")) {
+        snprintf(out, out_len, "%lu", (unsigned long)autofetch_needed_count);
     } else if (ci_equal(name, "FETCH_UPDATED")) {
         snprintf(out, out_len, "%lu", (unsigned long)autofetch_updated_count);
     } else if (ci_equal(name, "FETCH_BYTES")) {
@@ -1478,12 +1758,56 @@ static void substitution_value(const char *name,
         snprintf(out, out_len, "%lu", (unsigned long)autofetch_current_percent());
     } else if (ci_equal(name, "FETCH_RATE_KIBPS") || ci_equal(name, "FETCH_AVG_KIBPS")) {
         snprintf(out, out_len, "%lu", (unsigned long)autofetch_current_rate_kibps());
+    } else if (ci_equal(name, "FETCH_PROGRESS_LABEL")) {
+        html_escape(autofetch_progress_label(), out, out_len);
     } else if (ci_equal(name, "FETCH_RETRY")) {
         snprintf(out, out_len, "%lu", (unsigned long)autofetch_fetch_retry_count);
     } else if (ci_equal(name, "FETCH_RETRIES")) {
         snprintf(out, out_len, "%lu", (unsigned long)M65_AUTOFETCH_FILE_RETRIES);
     } else if (ci_equal(name, "FETCH_REFRESH_SECONDS")) {
-        snprintf(out, out_len, "5");
+        snprintf(out, out_len, "1");
+    } else if (ci_equal(name, "FIRMWARE_VERSION")) {
+        html_escape(M65_VERSION_STRING, out, out_len);
+    } else if (ci_equal(name, "FIRMWARE_BUILD")) {
+        html_escape(M65_BUILD_MARKER, out, out_len);
+    } else if (ci_equal(name, "FIRMWARE_STATUS")) {
+        html_escape(remote_http_firmware_status(), out, out_len);
+    } else if (ci_equal(name, "FIRMWARE_UPDATE_PANEL")) {
+        if (!firmware_update_available()) {
+            snprintf(out, out_len, "");
+        } else {
+            char version[80], build[96];
+            html_escape(pending_firmware_version[0] ? pending_firmware_version : "unknown", version, sizeof version);
+            html_escape(pending_firmware_build[0] ? pending_firmware_build : "unknown", build, sizeof build);
+#if M65_ENABLE_MCUBOOT_OTA
+            snprintf(out, out_len,
+                     "<section class=\"update-panel firmware-update\"><strong>New firmware is available: %s</strong>"
+                     "<span>Build %s</span><form method=\"get\" action=\"/firmware/update\">"
+                     "<button type=\"submit\">Update and reboot</button></form></section>",
+                     version, build);
+#else
+            snprintf(out, out_len,
+                     "<section class=\"update-panel firmware-update\"><strong>New firmware is available: %s</strong>"
+                     "<span>Build %s</span><button type=\"button\" disabled>OTA bootloader not installed</button></section>",
+                     version, build);
+#endif
+        }
+    } else if (ci_equal(name, "THEME_STATUS")) {
+        html_escape(remote_http_theme_status(), out, out_len);
+    } else if (ci_equal(name, "THEME_INSTALL_PANEL")) {
+        if (!theme_update_available()) {
+            snprintf(out, out_len, "");
+        } else {
+            char theme[80], version[80];
+            html_escape(pending_theme_name[0] ? pending_theme_name : "theme", theme, sizeof theme);
+            html_escape(pending_theme_version[0] ? pending_theme_version : "", version, sizeof version);
+            snprintf(out, out_len,
+                     "<section class=\"update-panel theme-update\"><strong>New web theme is available: %s%s%s</strong>"
+                     "<form method=\"get\" action=\"/theme/install\"><button type=\"submit\">Install theme</button></form></section>",
+                     theme,
+                     version[0] ? " " : "",
+                     version);
+        }
     } else if (ci_equal(name, "BOARD_REV")) {
         snprintf(out, out_len, "%lu", (unsigned long)board_rev);
     } else if (ci_equal(name, "BOARD_LABEL")) {
@@ -2030,6 +2354,32 @@ static err_t send_fetch_now(http_conn_t *c)
     return send_redirect(c, location);
 }
 
+static err_t send_firmware_update(http_conn_t *c)
+{
+    if (autofetch_web_busy()) return send_error(c, 423, "Locked", "busy fetching cores");
+    if (!check_perm(c, REMOTE_AUTH_FILES)) {
+        return send_error(c, 403, "Forbidden", "firmware updates are not authorised");
+    }
+    char err[128];
+    if (!remote_http_firmware_update(err, sizeof err)) {
+        return send_error(c, 501, "Not Implemented", err[0] ? err : "firmware update failed");
+    }
+    return send_redirect(c, "/index.html");
+}
+
+static err_t send_theme_install(http_conn_t *c)
+{
+    if (autofetch_web_busy()) return send_error(c, 423, "Locked", "busy fetching cores");
+    if (!check_perm(c, REMOTE_AUTH_FILES)) {
+        return send_error(c, 403, "Forbidden", "theme installs are not authorised");
+    }
+    char err[128];
+    if (!remote_http_theme_install(err, sizeof err)) {
+        return send_error(c, 400, "Bad Request", err[0] ? err : "theme install failed");
+    }
+    return send_redirect(c, "/index.html");
+}
+
 static err_t send_index(http_conn_t *c, uint8_t board_rev)
 {
     if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
@@ -2355,11 +2705,12 @@ static bool finish_signed_receive_logged(signed_file_rx_t *rx,
                          "finalising received file";
     if (update_autofetch_status) {
         snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                 "autofetch=running stage=signature file=%s action=\"%s\" checked=%lu total=%lu updated=%lu",
+                 "autofetch=running stage=signature file=%s action=\"%s\" checked=%lu total=%lu needed=%lu updated=%lu",
                  file,
                  action,
                  (unsigned long)autofetch_checked_count,
                  (unsigned long)autofetch_manifest_total_count,
+                 (unsigned long)autofetch_needed_count,
                  (unsigned long)autofetch_updated_count);
     }
 
@@ -2508,6 +2859,16 @@ static err_t parse_headers(http_conn_t *c)
         ci_equal(target_path, "/fetch/stop")) {
         autofetch_cancel("web stop", 900000u);
         return send_redirect(c, "/index.html");
+    }
+
+    if ((ci_equal(c->method, "GET") || ci_equal(c->method, "PUT")) &&
+        ci_equal(target_path, "/firmware/update")) {
+        return send_firmware_update(c);
+    }
+
+    if ((ci_equal(c->method, "GET") || ci_equal(c->method, "PUT")) &&
+        ci_equal(target_path, "/theme/install")) {
+        return send_theme_install(c);
     }
 
     if (autofetch_web_busy() && ci_equal(c->method, "GET") &&
@@ -2707,12 +3068,14 @@ static void fetch_report_progress(fetch_ctx_t *fc)
 
     if (fc == &autofetch_fc &&
         (autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE)) {
-        const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core";
-        const char *file = autofetch_state == AUTOFETCH_MANIFEST ? autofetch_manifest_path : autofetch_pending_path;
+        const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : manifest_kind_name(autofetch_pending_kind);
+        const char *file = autofetch_state == AUTOFETCH_MANIFEST ? autofetch_manifest_path :
+                           (autofetch_pending_url_path[0] ? autofetch_pending_url_path : autofetch_pending_path);
         snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                 "autofetch=running stage=%s file=%s bytes=%lu/%lu percent=%lu rate_KiBps=%lu avg_KiBps=%lu checked=%lu total=%lu updated=%lu",
+                 "autofetch=running stage=%s file=%s dest=%s bytes=%lu/%lu percent=%lu rate_KiBps=%lu avg_KiBps=%lu checked=%lu total=%lu needed=%lu updated=%lu",
                  stage,
                  file[0] ? file : fc->final_path,
+                 fc->final_path,
                  (unsigned long)done,
                  (unsigned long)total,
                  percent,
@@ -2720,6 +3083,7 @@ static void fetch_report_progress(fetch_ctx_t *fc)
                  avg_KiBps,
                  (unsigned long)autofetch_checked_count,
                  (unsigned long)autofetch_manifest_total_count,
+                 (unsigned long)autofetch_needed_count,
                  (unsigned long)autofetch_updated_count);
     }
 
@@ -3598,9 +3962,10 @@ static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms)
     }
     if ((autofetch_running || autofetch_state != AUTOFETCH_IDLE) && !had_status) {
         snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                 "autofetch=cancelled reason=\"%s\" checked=%lu updated=%lu",
+                 "autofetch=cancelled reason=\"%s\" checked=%lu needed=%lu updated=%lu",
                  reason ? reason : "activity",
                  (unsigned long)autofetch_checked_count,
+                 (unsigned long)autofetch_needed_count,
                  (unsigned long)autofetch_updated_count);
     }
     autofetch_running = false;
@@ -3674,31 +4039,87 @@ static bool read_manifest_line(uint32_t *offset, char *line, size_t line_len, bo
     return true;
 }
 
+static char *manifest_next_token(char **cursor)
+{
+    if (!cursor || !*cursor) return NULL;
+    char *s = *cursor;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (!*s || *s == '#') {
+        *cursor = s;
+        return NULL;
+    }
+    char *tok = s;
+    while (*s && !isspace((unsigned char)*s)) s++;
+    if (*s) *s++ = 0;
+    *cursor = s;
+    return tok;
+}
+
+static bool is_hex64_token(const char *s)
+{
+    if (!s || strlen(s) != 64) return false;
+    for (unsigned i = 0; i < 64u; ++i) {
+        if (!isxdigit((unsigned char)s[i])) return false;
+    }
+    return true;
+}
+
+static void parse_manifest_attrs(char *s, manifest_entry_t *entry)
+{
+    char *cursor = s;
+    for (;;) {
+        char *tok = manifest_next_token(&cursor);
+        if (!tok) break;
+        char *eq = strchr(tok, '=');
+        if (!eq) continue;
+        *eq++ = 0;
+        if (ci_equal(tok, "version")) snprintf(entry->version, sizeof entry->version, "%s", eq);
+        else if (ci_equal(tok, "build")) snprintf(entry->build, sizeof entry->build, "%s", eq);
+        else if (ci_equal(tok, "name")) snprintf(entry->name, sizeof entry->name, "%s", eq);
+    }
+}
+
 static bool parse_manifest_entry(char *line,
-                                 char payload_sha[65],
-                                 char transfer_sha[65],
-                                 char rel[224],
+                                 manifest_entry_t *entry,
                                  bool *skip,
                                  char *err,
                                  size_t err_len)
 {
-    *skip = true;
+    if (skip) *skip = true;
+    if (!entry) return false;
+    memset(entry, 0, sizeof *entry);
+    entry->kind = MANIFEST_KIND_SKIP;
+
     char *s = line;
     while (*s && isspace((unsigned char)*s)) s++;
     if (!*s || *s == '#') return true;
 
-    char *payload_hash = s;
-    while (*s && !isspace((unsigned char)*s)) s++;
-    if (*s) *s++ = 0;
-    while (*s && isspace((unsigned char)*s)) s++;
+    char *cursor = s;
+    char *first = manifest_next_token(&cursor);
+    if (!first) return true;
 
-    char *transfer_hash = s;
-    while (*s && !isspace((unsigned char)*s)) s++;
-    if (*s) *s++ = 0;
-    while (*s && isspace((unsigned char)*s)) s++;
+    char *payload_hash = NULL;
+    char *transfer_hash = NULL;
+    char *rel = NULL;
+    manifest_kind_t kind = MANIFEST_KIND_CORE;
 
-    if (strlen(payload_hash) != 64 || strlen(transfer_hash) != 64 || !*s) {
-        if (err && err_len) snprintf(err, err_len, "bad v2 manifest line");
+    if (is_hex64_token(first)) {
+        payload_hash = first;
+        transfer_hash = manifest_next_token(&cursor);
+        rel = manifest_next_token(&cursor);
+    } else {
+        if (!parse_manifest_kind(first, &kind)) {
+            if (err && err_len) snprintf(err, err_len, "bad v3 manifest type");
+            return false;
+        }
+        payload_hash = manifest_next_token(&cursor);
+        transfer_hash = manifest_next_token(&cursor);
+        rel = manifest_next_token(&cursor);
+    }
+
+    if (!payload_hash || !transfer_hash || !rel ||
+        !is_hex64_token(payload_hash) || !is_hex64_token(transfer_hash)) {
+        if (err && err_len) snprintf(err, err_len, "bad manifest line");
         return false;
     }
     uint8_t digest[32];
@@ -3710,14 +4131,17 @@ static bool parse_manifest_entry(char *line,
         if (err && err_len) snprintf(err, err_len, "bad manifest transfer SHA-256");
         return false;
     }
-    if (!safe_file_path(s) || !has_core_ext(s) || s[0] == '/') {
-        if (err && err_len) snprintf(err, err_len, "unsafe manifest filename");
+    if (!safe_manifest_source_path(rel, kind)) {
+        if (err && err_len) snprintf(err, err_len, "unsafe manifest %s filename", manifest_kind_name(kind));
         return false;
     }
-    snprintf(payload_sha, 65, "%s", payload_hash);
-    snprintf(transfer_sha, 65, "%s", transfer_hash);
-    snprintf(rel, 224, "%s", s);
-    *skip = false;
+
+    entry->kind = kind;
+    snprintf(entry->payload_sha, sizeof entry->payload_sha, "%s", payload_hash);
+    snprintf(entry->transfer_sha, sizeof entry->transfer_sha, "%s", transfer_hash);
+    snprintf(entry->rel, sizeof entry->rel, "%s", rel);
+    parse_manifest_attrs(cursor, entry);
+    if (skip) *skip = false;
     return true;
 }
 
@@ -3731,12 +4155,10 @@ static uint32_t count_manifest_entries(void)
         if (!read_manifest_line(&offset, line, sizeof line, &eof)) return total;
         if (eof) return total;
 
-        char payload_sha[65];
-        char transfer_sha[65];
-        char rel[224];
+        manifest_entry_t entry;
         bool skip = true;
         char err[80];
-        if (!parse_manifest_entry(line, payload_sha, transfer_sha, rel, &skip, err, sizeof err)) return total;
+        if (!parse_manifest_entry(line, &entry, &skip, err, sizeof err)) return total;
         if (!skip) total++;
     }
 }
@@ -3781,6 +4203,7 @@ static bool autofetch_start_manifest(uint8_t board_rev)
     }
     autofetch_manifest_offset = 0;
     autofetch_checked_count = 0;
+    autofetch_needed_count = 0;
     autofetch_updated_count = 0;
     autofetch_manifest_total_count = 0;
     autofetch_fetch_retry_count = 0;
@@ -3792,27 +4215,44 @@ static bool autofetch_start_manifest(uint8_t board_rev)
     return true;
 }
 
-static bool autofetch_start_core(const char *rel, const char *payload_sha, const char *transfer_sha)
+static bool autofetch_start_entry(const manifest_entry_t *entry)
 {
+    if (!entry) return false;
+    const char *final_path = manifest_final_path(entry->kind, entry->rel);
     char url[384];
-    if (!join_url_path(autofetch_base_url, rel, url, sizeof url)) {
-        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=failed reason=core-url-too-long file=%s", rel);
+    if (!join_url_path(autofetch_base_url, entry->rel, url, sizeof url)) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                 "autofetch=failed reason=url-too-long type=%s file=%s",
+                 manifest_kind_name(entry->kind),
+                 entry->rel);
         return false;
     }
     char err[96];
-    if (!fetch_start(&autofetch_fc, url, rel, &autofetch_sig_cfg, false, 600000u, err, sizeof err)) {
-        snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=failed file=%s reason=\"%s\"", rel, err);
+    if (!fetch_start(&autofetch_fc, url, final_path, &autofetch_sig_cfg, false, 600000u, err, sizeof err)) {
+        snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                 "autofetch=failed type=%s file=%s reason=\"%s\"",
+                 manifest_kind_name(entry->kind),
+                 entry->rel,
+                 err);
         return false;
     }
-    snprintf(autofetch_pending_path, sizeof autofetch_pending_path, "%s", rel);
-    snprintf(autofetch_pending_sha, sizeof autofetch_pending_sha, "%s", payload_sha);
-    snprintf(autofetch_pending_transfer_sha, sizeof autofetch_pending_transfer_sha, "%s", transfer_sha);
+    snprintf(autofetch_pending_path, sizeof autofetch_pending_path, "%s", final_path);
+    snprintf(autofetch_pending_url_path, sizeof autofetch_pending_url_path, "%s", entry->rel);
+    snprintf(autofetch_pending_sha, sizeof autofetch_pending_sha, "%s", entry->payload_sha);
+    snprintf(autofetch_pending_transfer_sha, sizeof autofetch_pending_transfer_sha, "%s", entry->transfer_sha);
+    snprintf(autofetch_pending_version, sizeof autofetch_pending_version, "%s", entry->version);
+    snprintf(autofetch_pending_build, sizeof autofetch_pending_build, "%s", entry->build);
+    snprintf(autofetch_pending_name, sizeof autofetch_pending_name, "%s", entry->name);
+    autofetch_pending_kind = entry->kind;
     autofetch_state = AUTOFETCH_CORE;
     snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-             "autofetch=running stage=core file=%s checked=%lu total=%lu updated=%lu",
-             rel,
+             "autofetch=running stage=%s file=%s dest=%s checked=%lu total=%lu needed=%lu updated=%lu",
+             manifest_kind_name(entry->kind),
+             entry->rel,
+             final_path,
              (unsigned long)autofetch_checked_count,
              (unsigned long)autofetch_manifest_total_count,
+             (unsigned long)autofetch_needed_count,
              (unsigned long)autofetch_updated_count);
     return true;
 }
@@ -3821,7 +4261,8 @@ static bool autofetch_retry_current_fetch(const char *reason)
 {
     autofetch_fetch_retry_count++;
     if (autofetch_fetch_retry_count >= M65_AUTOFETCH_FILE_RETRIES) return false;
-    const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core";
+    const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" :
+                        manifest_kind_name(autofetch_pending_kind);
     remote_log(1, "+AUTOFETCH: retry stage=%s failure=%lu/%lu reason=%s",
                stage,
                (unsigned long)autofetch_fetch_retry_count,
@@ -3848,19 +4289,23 @@ static bool autofetch_retry_current_fetch(const char *reason)
     }
 
     if (autofetch_state == AUTOFETCH_CORE) {
-        char rel[sizeof autofetch_pending_path];
-        char payload_sha[sizeof autofetch_pending_sha];
-        char transfer_sha[sizeof autofetch_pending_transfer_sha];
-        snprintf(rel, sizeof rel, "%s", autofetch_pending_path);
-        snprintf(payload_sha, sizeof payload_sha, "%s", autofetch_pending_sha);
-        snprintf(transfer_sha, sizeof transfer_sha, "%s", autofetch_pending_transfer_sha);
-        if (!autofetch_start_core(rel, payload_sha, transfer_sha)) return false;
+        manifest_entry_t entry = {0};
+        entry.kind = autofetch_pending_kind ? autofetch_pending_kind : MANIFEST_KIND_CORE;
+        snprintf(entry.rel, sizeof entry.rel, "%s", autofetch_pending_url_path[0] ? autofetch_pending_url_path : autofetch_pending_path);
+        snprintf(entry.payload_sha, sizeof entry.payload_sha, "%s", autofetch_pending_sha);
+        snprintf(entry.transfer_sha, sizeof entry.transfer_sha, "%s", autofetch_pending_transfer_sha);
+        snprintf(entry.version, sizeof entry.version, "%s", autofetch_pending_version);
+        snprintf(entry.build, sizeof entry.build, "%s", autofetch_pending_build);
+        snprintf(entry.name, sizeof entry.name, "%s", autofetch_pending_name);
+        if (!autofetch_start_entry(&entry)) return false;
         snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                 "autofetch=running stage=core-retry file=%s failure=%lu checked=%lu total=%lu updated=%lu",
-                 rel,
+                 "autofetch=running stage=%s-retry file=%s failure=%lu checked=%lu total=%lu needed=%lu updated=%lu",
+                 manifest_kind_name(entry.kind),
+                 entry.rel,
                  (unsigned long)autofetch_fetch_retry_count,
                  (unsigned long)autofetch_checked_count,
                  (unsigned long)autofetch_manifest_total_count,
+                 (unsigned long)autofetch_needed_count,
                  (unsigned long)autofetch_updated_count);
         return true;
     }
@@ -3875,17 +4320,23 @@ static void autofetch_skip_current_core(const char *reason)
                (unsigned long)autofetch_fetch_retry_count,
                reason ? reason : "fetch failed");
     snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-             "autofetch=running stage=scan skipped=%s failures=%lu reason=\"%s\" checked=%lu total=%lu updated=%lu",
+             "autofetch=running stage=scan skipped=%s failures=%lu reason=\"%s\" checked=%lu total=%lu needed=%lu updated=%lu",
              autofetch_pending_path[0] ? autofetch_pending_path : "(unset)",
              (unsigned long)autofetch_fetch_retry_count,
              reason ? reason : "fetch failed",
              (unsigned long)autofetch_checked_count,
              (unsigned long)autofetch_manifest_total_count,
+             (unsigned long)autofetch_needed_count,
              (unsigned long)autofetch_updated_count);
     autofetch_fetch_retry_count = 0;
     autofetch_pending_path[0] = 0;
+    autofetch_pending_url_path[0] = 0;
     autofetch_pending_sha[0] = 0;
     autofetch_pending_transfer_sha[0] = 0;
+    autofetch_pending_version[0] = 0;
+    autofetch_pending_build[0] = 0;
+    autofetch_pending_name[0] = 0;
+    autofetch_pending_kind = MANIFEST_KIND_SKIP;
     autofetch_state = AUTOFETCH_SCAN;
 }
 
@@ -3906,25 +4357,25 @@ static bool autofetch_scan_manifest(void)
             autofetch_state = AUTOFETCH_IDLE;
             autofetch_schedule_after(interval_ms_for_hours(http_cfg.fetch_interval_hours));
             snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                     "autofetch=idle last=success channel=%s checked=%lu total=%lu updated=%lu",
+                     "autofetch=idle last=success channel=%s checked=%lu total=%lu needed=%lu updated=%lu",
                      autofetch_channel,
                      (unsigned long)autofetch_checked_count,
                      (unsigned long)autofetch_manifest_total_count,
+                     (unsigned long)autofetch_needed_count,
                      (unsigned long)autofetch_updated_count);
-            remote_log(1, "+AUTOFETCH: done channel=%s checked=%lu total=%lu updated=%lu",
+            remote_log(1, "+AUTOFETCH: done channel=%s checked=%lu total=%lu needed=%lu updated=%lu",
                        autofetch_channel,
                        (unsigned long)autofetch_checked_count,
                        (unsigned long)autofetch_manifest_total_count,
+                       (unsigned long)autofetch_needed_count,
                        (unsigned long)autofetch_updated_count);
             return true;
         }
 
-        char payload_sha[65];
-        char transfer_sha[65];
-        char rel[224];
+        manifest_entry_t entry;
         bool skip = true;
         char err[80];
-        if (!parse_manifest_entry(line, payload_sha, transfer_sha, rel, &skip, err, sizeof err)) {
+        if (!parse_manifest_entry(line, &entry, &skip, err, sizeof err)) {
             snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
                      "autofetch=failed stage=manifest-scan reason=\"%s\"", err);
             return false;
@@ -3932,24 +4383,40 @@ static bool autofetch_scan_manifest(void)
         if (skip) continue;
 
         autofetch_checked_count++;
+        const char *final_path = manifest_final_path(entry.kind, entry.rel);
         snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                 "autofetch=running stage=scan file=%s checked=%lu total=%lu updated=%lu",
-                 rel,
+                 "autofetch=running stage=scan type=%s file=%s dest=%s checked=%lu total=%lu needed=%lu updated=%lu",
+                 manifest_kind_name(entry.kind),
+                 entry.rel,
+                 final_path,
                  (unsigned long)autofetch_checked_count,
                  (unsigned long)autofetch_manifest_total_count,
+                 (unsigned long)autofetch_needed_count,
                  (unsigned long)autofetch_updated_count);
-        remote_log(1, "+AUTOFETCH: check file=%s checked=%lu/%lu",
-                   rel,
+        remote_log(1, "+AUTOFETCH: check type=%s file=%s checked=%lu/%lu",
+                   manifest_kind_name(entry.kind),
+                   entry.rel,
                    (unsigned long)autofetch_checked_count,
                    (unsigned long)autofetch_manifest_total_count);
         char have[65];
-        if (file_sha256_hex(rel, have, "scan") && ci_equal(have, payload_sha)) {
-            remote_log(1, "+AUTOFETCH: unchanged file=%s", rel);
+        const char *wanted_hash = manifest_kind_stores_signed_transfer(entry.kind) ?
+                                  entry.transfer_sha : entry.payload_sha;
+        if (file_sha256_hex(final_path, have, "scan") && ci_equal(have, wanted_hash)) {
+            if (entry.kind == MANIFEST_KIND_FIRMWARE) record_firmware_candidate(&entry);
+            else if (entry.kind == MANIFEST_KIND_THEME) record_theme_candidate(&entry);
+            remote_log(1, "+AUTOFETCH: unchanged type=%s file=%s", manifest_kind_name(entry.kind), final_path);
             return true;
         }
-        remote_log(1, "+AUTOFETCH: update file=%s", rel);
+        remote_log(1, "+AUTOFETCH: update type=%s file=%s dest=%s",
+                   manifest_kind_name(entry.kind),
+                   entry.rel,
+                   final_path);
         autofetch_fetch_retry_count = 0;
-        if (!autofetch_start_core(rel, payload_sha, transfer_sha)) return false;
+        autofetch_needed_count++;
+        if (!autofetch_start_entry(&entry)) {
+            if (autofetch_needed_count) autofetch_needed_count--;
+            return false;
+        }
         return true;
     }
 }
@@ -3964,7 +4431,8 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
     if (autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE) {
         fetch_poll(&autofetch_fc);
         if (autofetch_fc.state == FETCH_FAILED) {
-            const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" : "core";
+            const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" :
+                                manifest_kind_name(autofetch_pending_kind);
             const char *reason = autofetch_fc.err[0] ? autofetch_fc.err : "fetch failed";
             storage_delete(autofetch_fc.tmp_path);
             if (autofetch_retry_current_fetch(reason)) return;
@@ -3998,10 +4466,11 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
             char have[65];
             autofetch_state = AUTOFETCH_VERIFY;
             snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                     "autofetch=running stage=verify file=%s checked=%lu total=%lu updated=%lu",
+                     "autofetch=running stage=verify file=%s checked=%lu total=%lu needed=%lu updated=%lu",
                      autofetch_pending_path,
                      (unsigned long)autofetch_checked_count,
                      (unsigned long)autofetch_manifest_total_count,
+                     (unsigned long)autofetch_needed_count,
                      (unsigned long)autofetch_updated_count);
             remote_log(1, "+AUTOFETCH: verify file=%s", autofetch_pending_path);
             if (!autofetch_fc.transfer_sha_hex[0] ||
@@ -4017,18 +4486,44 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
                 return;
             }
             remote_log(2, "+AUTOFETCH: transfer hash verified file=%s", autofetch_pending_path);
+            const char *wanted_hash = manifest_kind_stores_signed_transfer(autofetch_pending_kind) ?
+                                      autofetch_pending_transfer_sha : autofetch_pending_sha;
             if (!file_sha256_hex(autofetch_pending_path, have, "verify") ||
-                !ci_equal(have, autofetch_pending_sha)) {
+                !ci_equal(have, wanted_hash)) {
                 storage_delete(autofetch_pending_path);
                 snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                         "autofetch=failed stage=verify-payload file=%s", autofetch_pending_path);
-                autofetch_cancel("payload hash mismatch", 900000u);
+                         "autofetch=failed stage=verify-stored file=%s", autofetch_pending_path);
+                autofetch_cancel("stored hash mismatch", 900000u);
                 return;
             }
             autofetch_updated_count++;
-            remote_log(1, "+AUTOFETCH: verified file=%s updated=%lu",
+            if (autofetch_pending_kind == MANIFEST_KIND_FIRMWARE) {
+                manifest_entry_t entry = {0};
+                entry.kind = MANIFEST_KIND_FIRMWARE;
+                snprintf(entry.rel, sizeof entry.rel, "%s", autofetch_pending_url_path);
+                snprintf(entry.version, sizeof entry.version, "%s", autofetch_pending_version);
+                snprintf(entry.build, sizeof entry.build, "%s", autofetch_pending_build);
+                record_firmware_candidate(&entry);
+            } else if (autofetch_pending_kind == MANIFEST_KIND_THEME) {
+                manifest_entry_t entry = {0};
+                entry.kind = MANIFEST_KIND_THEME;
+                snprintf(entry.rel, sizeof entry.rel, "%s", autofetch_pending_url_path);
+                snprintf(entry.version, sizeof entry.version, "%s", autofetch_pending_version);
+                snprintf(entry.name, sizeof entry.name, "%s", autofetch_pending_name);
+                record_theme_candidate(&entry);
+            }
+            remote_log(1, "+AUTOFETCH: verified type=%s file=%s updated=%lu",
+                       manifest_kind_name(autofetch_pending_kind),
                        autofetch_pending_path,
                        (unsigned long)autofetch_updated_count);
+            autofetch_pending_path[0] = 0;
+            autofetch_pending_url_path[0] = 0;
+            autofetch_pending_sha[0] = 0;
+            autofetch_pending_transfer_sha[0] = 0;
+            autofetch_pending_version[0] = 0;
+            autofetch_pending_build[0] = 0;
+            autofetch_pending_name[0] = 0;
+            autofetch_pending_kind = MANIFEST_KIND_SKIP;
             autofetch_state = AUTOFETCH_SCAN;
         }
     }
@@ -4037,9 +4532,10 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
         if (!autofetch_scan_manifest()) {
             autofetch_cancel("manifest scan failed", 900000u);
         } else if (autofetch_state == AUTOFETCH_IDLE && !autofetch_running) {
-            remote_log(2, "+AUTOFETCH: returned-to-main-loop state=idle checked=%lu total=%lu updated=%lu",
+            remote_log(2, "+AUTOFETCH: returned-to-main-loop state=idle checked=%lu total=%lu needed=%lu updated=%lu",
                        (unsigned long)autofetch_checked_count,
                        (unsigned long)autofetch_manifest_total_count,
+                       (unsigned long)autofetch_needed_count,
                        (unsigned long)autofetch_updated_count);
         }
         return;
@@ -4095,6 +4591,326 @@ uint32_t remote_http_autofetch_last_success_seconds(void)
 bool remote_http_autofetch_running(void)
 {
     return autofetch_running;
+}
+
+const char *remote_http_firmware_status(void)
+{
+    bool have = firmware_update_available();
+    snprintf(firmware_status_buf, sizeof firmware_status_buf,
+             "firmware=%s current_version=\"%s\" current_build=%s pending_version=\"%s\" pending_build=%s path=%s source=%s update_supported=%lu",
+             have ? "pending" : "none",
+             M65_VERSION_STRING,
+             M65_BUILD_MARKER,
+             pending_firmware_version[0] ? pending_firmware_version : "",
+             pending_firmware_build[0] ? pending_firmware_build : "(unknown)",
+             have ? M65_FIRMWARE_PACKAGE_PATH : "(none)",
+             pending_firmware_source[0] ? pending_firmware_source : "(unknown)",
+             (unsigned long)M65_ENABLE_MCUBOOT_OTA);
+    return firmware_status_buf;
+}
+
+bool remote_http_firmware_update(char *err, size_t err_len)
+{
+    if (!firmware_update_available()) {
+        if (err && err_len) snprintf(err, err_len, "no pending firmware package");
+        return false;
+    }
+    if (!signed_file_verify_stored(&http_cfg,
+                                   M65_FIRMWARE_PACKAGE_PATH,
+                                   M65_SIGNED_FILE_FIRMWARE,
+                                   true)) {
+        if (err && err_len) snprintf(err, err_len, "firmware signature check failed: %s", signed_file_last_error());
+        return false;
+    }
+#if M65_ENABLE_MCUBOOT_OTA
+    if (err && err_len) snprintf(err, err_len, "MCUboot OTA apply hook is not linked yet");
+#else
+    if (err && err_len) snprintf(err, err_len, "MCUboot OTA bootloader is not installed in this build");
+#endif
+    return false;
+}
+
+typedef struct {
+    const char *dir;
+    bool ok;
+} delete_tree_ctx_t;
+
+static void delete_tree(const char *dir, bool delete_self, bool *ok);
+
+static void delete_tree_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+{
+    (void)size;
+    delete_tree_ctx_t *dt = (delete_tree_ctx_t *)ctx;
+    if (!dt || !dt->ok || !name || !name[0]) return;
+
+    char path[256];
+    if (!make_child_path(dt->dir, name, path, sizeof path)) {
+        dt->ok = false;
+        return;
+    }
+    if (is_dir) {
+        delete_tree(path, true, &dt->ok);
+    } else if (!storage_delete(path)) {
+        dt->ok = false;
+    }
+}
+
+static void delete_tree(const char *dir, bool delete_self, bool *ok)
+{
+    if (ok && !*ok) return;
+    delete_tree_ctx_t ctx = {
+        .dir = (dir && dir[0]) ? dir : "/",
+        .ok = true,
+    };
+    if (!storage_list_dir(ctx.dir, delete_tree_cb, &ctx)) {
+        ctx.ok = false;
+    }
+    if (ctx.ok && delete_self && !storage_delete(ctx.dir)) {
+        ctx.ok = false;
+    }
+    if (ok) *ok = ctx.ok;
+}
+
+static bool tar_zero_block(const uint8_t block[512])
+{
+    for (unsigned i = 0; i < 512u; ++i) {
+        if (block[i]) return false;
+    }
+    return true;
+}
+
+static bool tar_octal(const uint8_t *p, size_t len, uint32_t *out)
+{
+    uint32_t v = 0;
+    bool any = false;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = p[i];
+        if (c == 0 || c == ' ') {
+            if (any) break;
+            continue;
+        }
+        if (c < '0' || c > '7') return false;
+        any = true;
+        if (v > (UINT32_MAX >> 3)) return false;
+        v = (v << 3) | (uint32_t)(c - '0');
+    }
+    *out = v;
+    return true;
+}
+
+static bool tar_checksum_ok(const uint8_t block[512])
+{
+    uint32_t stored = 0;
+    if (!tar_octal(block + 148, 8, &stored)) return false;
+    uint32_t sum = 0;
+    for (unsigned i = 0; i < 512u; ++i) {
+        sum += (i >= 148u && i < 156u) ? (uint8_t)' ' : block[i];
+    }
+    return sum == stored;
+}
+
+static bool tar_name(const uint8_t block[512], char *out, size_t out_len)
+{
+    char name[101];
+    char prefix[156];
+    memcpy(name, block, 100);
+    name[100] = 0;
+    memcpy(prefix, block + 345, 155);
+    prefix[155] = 0;
+    if (prefix[0]) {
+        return snprintf(out, out_len, "%s/%s", prefix, name) < (int)out_len;
+    }
+    return snprintf(out, out_len, "%s", name) < (int)out_len;
+}
+
+static bool make_www_output_path(const char *rel, char *out, size_t out_len)
+{
+    char tmp[224];
+    snprintf(tmp, sizeof tmp, "%s", rel ? rel : "");
+    size_t n = strlen(tmp);
+    while (n > 0 && tmp[n - 1] == '/') tmp[--n] = 0;
+    if (!safe_www_path(tmp)) return false;
+    if (!tmp[0]) return false;
+    return snprintf(out, out_len, "WWW/%s", tmp) < (int)out_len;
+}
+
+static bool ensure_parent_dirs(const char *path)
+{
+    char tmp[256];
+    snprintf(tmp, sizeof tmp, "%s", path ? path : "");
+    for (char *p = tmp; *p; ++p) {
+        if (*p != '/') continue;
+        *p = 0;
+        if (tmp[0] && !storage_mkdir(tmp)) return false;
+        *p = '/';
+    }
+    return true;
+}
+
+static bool theme_archive_process(bool apply, char *err, size_t err_len)
+{
+    storage_file_t in = {0};
+    if (!storage_open(&in, M65_THEME_PACKAGE_PATH)) {
+        if (err && err_len) snprintf(err, err_len, "theme package not found");
+        return false;
+    }
+    uint32_t package_size = storage_size(&in);
+    if (package_size == 0 || package_size > M65_THEME_MAX_PACKAGE_BYTES) {
+        storage_close(&in);
+        if (err && err_len) snprintf(err, err_len, "theme package size is invalid");
+        return false;
+    }
+
+    uint8_t header[512];
+    uint8_t buf[M65_HTTP_IO_CHUNK];
+    bool ok = true;
+    uint32_t files = 0;
+    while (ok && storage_tell(&in) < package_size) {
+        size_t got = 0;
+        if (!storage_read(&in, header, sizeof header, &got) || got != sizeof header) {
+            ok = false;
+            if (err && err_len) snprintf(err, err_len, "short tar header");
+            break;
+        }
+        if (tar_zero_block(header)) break;
+        if (!tar_checksum_ok(header)) {
+            ok = false;
+            if (err && err_len) snprintf(err, err_len, "bad tar checksum");
+            break;
+        }
+
+        uint32_t size = 0;
+        char rel[224];
+        char out_path[256];
+        char type = (char)header[156];
+        if (!tar_octal(header + 124, 12, &size) ||
+            !tar_name(header, rel, sizeof rel) ||
+            !make_www_output_path(rel, out_path, sizeof out_path)) {
+            ok = false;
+            if (err && err_len) snprintf(err, err_len, "unsafe tar member");
+            break;
+        }
+        if (type == 0) type = '0';
+        if (type != '0' && type != '5') {
+            ok = false;
+            if (err && err_len) snprintf(err, err_len, "unsupported tar member type");
+            break;
+        }
+
+        if (apply) {
+            if (type == '5') {
+                if (!storage_mkdir(out_path)) {
+                    ok = false;
+                    if (err && err_len) snprintf(err, err_len, "cannot create theme directory: %s", storage_last_error());
+                    break;
+                }
+            } else {
+                if (!ensure_parent_dirs(out_path)) {
+                    ok = false;
+                    if (err && err_len) snprintf(err, err_len, "cannot create theme parent directory");
+                    break;
+                }
+                storage_file_t out = {0};
+                if (!storage_open_write(&out, out_path, true)) {
+                    ok = false;
+                    if (err && err_len) snprintf(err, err_len, "cannot create theme file: %s", storage_last_error());
+                    break;
+                }
+                uint32_t remain = size;
+                while (remain) {
+                    size_t want = remain > sizeof buf ? sizeof buf : remain;
+                    size_t rd = 0;
+                    size_t wr = 0;
+                    if (!storage_read(&in, buf, want, &rd) || rd != want ||
+                        !storage_write(&out, buf, rd, &wr) || wr != rd) {
+                        ok = false;
+                        if (err && err_len) snprintf(err, err_len, "theme file copy failed: %s", storage_last_error());
+                        break;
+                    }
+                    remain -= (uint32_t)rd;
+                }
+                if (!storage_sync(&out)) {
+                    ok = false;
+                    if (err && err_len) snprintf(err, err_len, "theme file sync failed: %s", storage_last_error());
+                }
+                storage_close(&out);
+                if (!ok) break;
+            }
+        } else if (type == '0') {
+            if (!storage_seek(&in, storage_tell(&in) + size)) {
+                ok = false;
+                if (err && err_len) snprintf(err, err_len, "theme seek failed");
+                break;
+            }
+        }
+
+        if (type == '0' && apply) {
+            files++;
+        } else if (type == '0') {
+            files++;
+        }
+        uint32_t pad = (512u - (size & 511u)) & 511u;
+        if (pad && !storage_seek(&in, storage_tell(&in) + pad)) {
+            ok = false;
+            if (err && err_len) snprintf(err, err_len, "theme padding seek failed");
+            break;
+        }
+    }
+    storage_close(&in);
+    if (ok && files == 0) {
+        if (err && err_len) snprintf(err, err_len, "theme archive contains no files");
+        return false;
+    }
+    return ok;
+}
+
+const char *remote_http_theme_status(void)
+{
+    bool have = theme_update_available();
+    snprintf(theme_status_buf, sizeof theme_status_buf,
+             "theme=%s name=\"%s\" version=\"%s\" path=%s source=%s",
+             have ? "pending" : "none",
+             pending_theme_name[0] ? pending_theme_name : "",
+             pending_theme_version[0] ? pending_theme_version : "",
+             have ? M65_THEME_PACKAGE_PATH : "(none)",
+             pending_theme_source[0] ? pending_theme_source : "(unknown)");
+    return theme_status_buf;
+}
+
+bool remote_http_theme_install(char *err, size_t err_len)
+{
+    if (!theme_update_available()) {
+        if (err && err_len) snprintf(err, err_len, "no pending theme package");
+        return false;
+    }
+    if (!check_write_grant()) {
+        if (err && err_len) snprintf(err, err_len, "write grant is not active");
+        return false;
+    }
+    if (!signed_file_verify_stored(&http_cfg,
+                                   M65_THEME_PACKAGE_PATH,
+                                   M65_SIGNED_FILE_THEME,
+                                   true)) {
+        if (err && err_len) snprintf(err, err_len, "theme signature check failed: %s", signed_file_last_error());
+        return false;
+    }
+    if (!theme_archive_process(false, err, err_len)) return false;
+    (void)storage_mkdir("WWW");
+
+    bool ok = true;
+    delete_tree("WWW", false, &ok);
+    if (!ok) {
+        if (err && err_len) snprintf(err, err_len, "cannot clear WWW directory");
+        return false;
+    }
+    if (!storage_mkdir("WWW")) {
+        if (err && err_len) snprintf(err, err_len, "cannot create WWW directory: %s", storage_last_error());
+        return false;
+    }
+    if (!theme_archive_process(true, err, err_len)) return false;
+    load_cached_web_assets();
+    if (err && err_len) snprintf(err, err_len, "theme installed");
+    return true;
 }
 
 static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)

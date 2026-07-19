@@ -3,6 +3,10 @@
 #include "hardware/uart.h"
 #include "hardware/spi.h"
 
+#if __has_include("generated_version.h")
+#include "generated_version.h"
+#endif
+
 // Command/control UART on the TE0790/XMOD socket. 2-wire 8N1 at 2 Mbps.
 // The firmware also listens on Pico USB CDC by default, so this UART is optional
 // for PC control but useful for MEGA65-side/native control.
@@ -100,6 +104,7 @@
 #define M65_FETCH_ACK_NUDGE_MS           1000u
 #define M65_AUTOFETCH_FILE_RETRIES       10u
 #define M65_WIFI_COMMAND_QUIET_MS        15000u
+#define M65_SD_HOTPLUG_POLL_MS           2000u
 
 #ifndef M65_LED_PIN
 #ifdef PICO_DEFAULT_LED_PIN
@@ -126,4 +131,22 @@
 #endif
 
 #define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG v0.1"
-#define M65_BUILD_MARKER     "dual-hash-download-slots-20260719"
+#ifndef M65_BUILD_MARKER
+#define M65_BUILD_MARKER     "unknown-build"
+#endif
+
+#define M65_FIRMWARE_PACKAGE_PATH "DOWNLOADS/mega65-integrated-jtag-firmware.uf2"
+#define M65_FIRMWARE_INFO_PATH    "DOWNLOADS/mega65-integrated-jtag-firmware.info"
+#define M65_THEME_PACKAGE_PATH    "DOWNLOADS/mega65-jtag-theme.m65jtheme"
+#define M65_THEME_INFO_PATH       "DOWNLOADS/mega65-jtag-theme.info"
+
+// Full MCUboot slot/swap support is a follow-up integration step. Until that
+// bootloader is present, firmware packages can be downloaded and verified but
+// cannot be applied safely by this application image.
+#ifndef M65_ENABLE_MCUBOOT_OTA
+#define M65_ENABLE_MCUBOOT_OTA 0
+#endif
+
+#ifndef M65_THEME_MAX_PACKAGE_BYTES
+#define M65_THEME_MAX_PACKAGE_BYTES 16777216u
+#endif

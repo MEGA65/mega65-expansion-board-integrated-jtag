@@ -77,6 +77,10 @@ Output:
 build-wifi/mega65-pico-jtag.uf2
 ```
 
+The firmware build marker is generated at configure time as
+`YYYY-MM-DD-<minutes-since-midnight>-<git-commitish>` and is reported by
+`ATI`, `AT+VERSION?`, and the web UI.
+
 For a non-WiFi Pico build:
 
 ```bash
@@ -157,6 +161,10 @@ AT+DOWNLOADREAD=name       read DOWNLOADS/name as raw bytes
 AT+AUTOFETCH[=0|1]         show/set mirror auto-update enable
 AT+FETCHSTATUS?            show mirror auto-update/fetch status
 AT+FETCHNOW[=3|6|remote]   fetch mirror manifest now
+AT+FWSTATUS?               show fetched firmware update candidate
+AT+FWUPDATE                install fetched verified firmware update
+AT+THEMESTATUS?            show fetched WWW theme candidate
+AT+THEMEINSTALL            install fetched WWW theme; physical WE required
 AT+FETCHINTERVAL[=hours]   show/set auto-update interval; min 3
 AT+FETCHBOARD=3|6|remote   select autofetch board manifest
 AT+VERBOSE[=0|1|2]         show/set WiFi/fetch diagnostic verbosity
@@ -323,7 +331,9 @@ tools/m65j.py -u http://mega65-jtag.local store core.bit --board 6
 tools/m65j.py -s /dev/ttyACM0 push local.bit
 ```
 
-`tools/m65j.py` reads `.m65j.config` from the current directory first, then
+`tools/m65j.py` is the single supported host utility; it contains the signing,
+serial, web, mirror, and populate code in one file. It reads `.m65j.config`
+from the current directory first, then
 `~/.m65j.config`. Use `serial=` for the USB TTY, `url=` for the HTTP
 interface, or `machine=` for a named board:
 
@@ -376,16 +386,44 @@ discovery:
 GET /identity    returns r3:name, r6:name, or r0:name
 ```
 
-`mirror` runs on the host and uses the alt-core/filehost downloader. Supply a
-release tag such as `stable`, `unstable`, or `nightly` as the first positional
-argument; if the tag is omitted, `stable` is used. It canonicalises core
-filenames by stripping version/date/build tokens, and writes a matching
-`<tag>-r3.sha256` and/or `<tag>-r6.sha256` manifest. Each non-comment manifest
-line is `<payload-sha256> <transfer-sha256>  <relative-filename>`. The payload
-hash is over the bytes stored on SD after signature stripping, so re-signing
-does not create false updates. The transfer hash is over the exact HTTP object,
-including the signature trailer. `mirror --bless` signs both the core files and
-every manifest. Autofetch requires signed manifests and signed core transfers.
+`make mirror` is the one-command host setup path. It builds
+`build-wifi/mega65-pico-jtag.uf2`, packs the current `sdcard/WWW/` content into
+`mirror/mega65-jtag-default-theme.m65jtheme`, then runs `m65j.py mirror` so the
+cores, firmware, theme package, and signed manifests are all in `mirror/` ready
+for `python3 -m http.server --directory mirror`.
+
+By default it uses `MIRROR_CHANNEL=stable`, `MIRROR_BOARD=all`,
+`MIRROR_SOURCE_URL=https://files.mega65.org`, `MIRROR_DIR=mirror`, and
+`MIRROR_FIRMWARE=build-wifi/mega65-pico-jtag.uf2`.
+`MIRROR_BOARD=all` emits both `stable-r3.sha256` and `stable-r6.sha256`, with
+the firmware and theme package entries included in both manifests.
+
+Override the defaults with Make variables, for example:
+
+```sh
+make mirror MIRROR_CHANNEL=nightly MIRROR_BOARD=r6 MIRROR_SOURCE_URL=https://files.mega65.org
+```
+
+`m65j.py mirror` runs on the host and uses the built-in alt-core/filehost
+downloader. Supply a release tag such as `stable`, `unstable`, or `nightly` as
+the first positional argument; if the tag is omitted, `stable` is used. It
+canonicalises core filenames by stripping version/date/build tokens, and writes
+a matching `<tag>-r3.sha256` and/or `<tag>-r6.sha256` manifest. Each non-comment
+manifest line is typed:
+
+```text
+core <payload-sha256> <transfer-sha256>  <relative-filename>
+firmware <payload-sha256> <transfer-sha256>  mega65-integrated-jtag-firmware.uf2 version=... build=...
+theme <payload-sha256> <transfer-sha256>  mega65-jtag-theme.m65jtheme name=... version=...
+```
+
+For cores, the payload hash is over the bytes stored on SD after signature
+stripping, so re-signing does not create false updates. The transfer hash is
+over the exact HTTP object, including the signature trailer. Firmware and theme
+packages are stored on SD with their signature trailer intact, so unchanged
+checks use the transfer hash and actuation re-verifies the stored object.
+`mirror --bless` signs core files, firmware/theme artifacts, and every manifest.
+Autofetch requires signed manifests and signed core/firmware/theme transfers.
 `populate` does the same staging work and then PUTs the manifest-listed files
 and signed manifests to the board SD card over HTTP.
 
@@ -447,6 +485,10 @@ AT+DOWNLOADREAD=<name>             read DOWNLOADS/<name>
 AT+FETCHSTATUS?                    show mirror fetch status
 AT+FETCHNOW[=3|6|remote]           start mirror fetch immediately
 AT+FETCHBOARD=3|6|remote           select autofetch board manifest
+AT+FWSTATUS?                       show staged firmware package status
+AT+FWUPDATE                        install staged verified firmware package
+AT+THEMESTATUS?                    show staged WWW theme package status
+AT+THEMEINSTALL                    install staged verified WWW theme package
 AT+MACHINE[=name]                  show/set discovery machine name
 ```
 
@@ -461,6 +503,9 @@ When signatures are required, unsigned or badly signed uploads/fetches are
 deleted instead of being committed. `PUT /jtag` spools signed transfers to SD,
 verifies them, and only then programs JTAG.
 
-Future OTA firmware update support is intentionally not implemented yet. The
-current recovery/update path is the Pico BOOTSEL flow: connect USB, press the
-BOOTSEL button, and copy `mega65-pico-jtag.uf2`.
+OTA firmware package discovery and signature-checked staging are implemented,
+but actual flash apply/reboot still requires the MCUboot bootloader integration.
+Until that is linked, `AT+FWUPDATE` and `/firmware/update` verify the staged
+package and then report that MCUboot OTA is not installed. The current recovery
+path remains the Pico BOOTSEL flow: connect USB, press the BOOTSEL button, and
+copy `mega65-pico-jtag.uf2`.
