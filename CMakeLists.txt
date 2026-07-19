@@ -97,6 +97,8 @@ if(M65_SD_MODE)
     target_compile_definitions(pico_m65jtag PRIVATE M65_SD_MODE=${M65_SD_MODE})
 endif()
 if(M65_BOOTLOADER_APP)
+    target_sources(pico_m65jtag PRIVATE src/ota_apply.c)
+    target_link_libraries(pico_m65jtag hardware_flash)
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/factory_linker")
     file(WRITE
         "${CMAKE_CURRENT_BINARY_DIR}/generated/factory_linker/pico_flash_region.ld"
@@ -122,6 +124,7 @@ target_link_libraries(pico_m65jtag
     hardware_timer
     hardware_spi
     hardware_watchdog
+    hardware_sync
     pico_mbedtls_crypto
 )
 
@@ -228,6 +231,8 @@ if(M65_BUILD_FACTORY_BOOTLOADER)
         hardware_gpio
         hardware_uart
         hardware_watchdog
+        hardware_flash
+        hardware_sync
     )
     pico_enable_stdio_usb(m65_factory_bootloader 0)
     pico_enable_stdio_uart(m65_factory_bootloader 0)

@@ -1630,7 +1630,7 @@ static void load_pending_info_file(const char *path,
     }
 }
 
-static bool firmware_update_available(void)
+bool firmware_update_available(void)
 {
     if (!storage_file_exists(M65_FIRMWARE_PACKAGE_PATH)) return false;
     if (!pending_firmware_seen) {
@@ -4853,31 +4853,7 @@ const char *remote_http_firmware_status(void)
     return firmware_status_buf;
 }
 
-bool remote_http_firmware_update(char *err, size_t err_len)
-{
-    if (!firmware_update_available()) {
-        if (err && err_len) snprintf(err, err_len, "no pending firmware package");
-        return false;
-    }
-    if (!signed_file_verify_stored(&http_cfg,
-                                   M65_FIRMWARE_PACKAGE_PATH,
-                                   M65_SIGNED_FILE_FIRMWARE,
-                                   true)) {
-        if (err && err_len) snprintf(err, err_len, "firmware signature check failed: %s", signed_file_last_error());
-        return false;
-    }
-#if M65_ENABLE_MCUBOOT_OTA
-    if (err && err_len) snprintf(err, err_len, "MCUboot OTA apply hook is not linked yet");
-#else
-    if (err && err_len) {
-        snprintf(err, err_len,
-                 M65_RESIDENT_BOOTLOADER
-                 ? "resident OTA bootloader is installed, but the flash apply hook is not linked yet"
-                 : "MCUboot OTA bootloader is not installed in this build");
-    }
-#endif
-    return false;
-}
+
 
 typedef struct {
     const char *dir;

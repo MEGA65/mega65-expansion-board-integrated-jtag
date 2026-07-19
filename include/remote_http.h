@@ -25,6 +25,7 @@ const char *remote_http_autofetch_status(int enabled_override, uint32_t interval
 uint32_t remote_http_autofetch_last_success_seconds(void);
 bool remote_http_autofetch_running(void);
 const char *remote_http_firmware_status(void);
+bool firmware_update_available(void);
 bool remote_http_firmware_update(char *err, size_t err_len);
 const char *remote_http_theme_status(void);
 bool remote_http_theme_install(char *err, size_t err_len);

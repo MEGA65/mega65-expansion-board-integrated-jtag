@@ -1,9 +1,12 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
 #include "hardware/watchdog.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 #include "pico/bootrom.h"
 #include "pico/stdlib.h"
 
@@ -183,10 +186,39 @@ static void reboot_to_slot(uint32_t slot_base)
     }
 }
 
+static void do_ota_update(void)
+{
+    diag_stage(4, "ota-start");
+    uint32_t slot1_offset = M65_BOOTLOADER_SLOT0_OFFSET + M65_BOOTLOADER_SLOT_SIZE;
+    uint32_t slot0_offset = M65_BOOTLOADER_SLOT0_OFFSET;
+
+    uint32_t ints = save_and_disable_interrupts();
+
+    // Erase slot 0
+    for (uint32_t offset = 0; offset < M65_BOOTLOADER_SLOT_SIZE; offset += FLASH_SECTOR_SIZE) {
+        flash_range_erase(slot0_offset + offset, FLASH_SECTOR_SIZE);
+    }
+
+    // Copy slot 1 to slot 0
+    uint8_t page_buf[FLASH_PAGE_SIZE];
+    for (uint32_t offset = 0; offset < M65_BOOTLOADER_SLOT_SIZE; offset += FLASH_PAGE_SIZE) {
+        memcpy(page_buf, (void*)(XIP_BASE_ADDR + slot1_offset + offset), FLASH_PAGE_SIZE);
+        flash_range_program(slot0_offset + offset, page_buf, FLASH_PAGE_SIZE);
+    }
+
+    restore_interrupts(ints);
+    diag_stage(5, "ota-done");
+}
+
 int main(void)
 {
     diag_init();
     diag_stage(1, "start");
+
+    if (watchdog_hw->scratch[2] == 0x07A07A07) {
+        watchdog_hw->scratch[2] = 0;
+        do_ota_update();
+    }
 
     uint32_t slot = slot0_base();
     if (slot_vectors_look_valid(slot)) {
