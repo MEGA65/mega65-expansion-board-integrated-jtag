@@ -27,7 +27,7 @@ MIRROR_CHANNEL ?= stable
 MIRROR_BOARD ?= all
 MIRROR_SOURCE_URL ?= https://files.mega65.org
 MIRROR_EXTRA_CORES ?= $(wildcard extra_cores)
-MIRROR_FIRMWARE ?= $(UF2)
+MIRROR_FIRMWARE ?= $(FACTORY_UF2)
 MIRROR_THEME ?= $(MIRROR_DIR)/THEMES/mega65-jtag-default-theme.m65jtheme
 MIRROR_THEME_NAME ?= default
 MIRROR_EXTRA_THEMES ?=
@@ -223,7 +223,7 @@ factory: configure-factory
 	@echo
 	@echo "Built: $(FACTORY_UF2)"
 
-mirror: build
+mirror: factory
 	@set -e; \
 	mkdir -p "$(MIRROR_DIR)"; \
 	mkdir -p "$(MIRROR_DIR)/WWW" "$(dir $(MIRROR_THEME))"; \

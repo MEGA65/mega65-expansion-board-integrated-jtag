@@ -1950,7 +1950,7 @@ static void substitution_value(const char *name,
             char version[80], build[96];
             html_escape(pending_firmware_version[0] ? pending_firmware_version : "unknown", version, sizeof version);
             html_escape(pending_firmware_build[0] ? pending_firmware_build : "unknown", build, sizeof build);
-#if M65_ENABLE_MCUBOOT_OTA
+#ifdef M65_BOOTLOADER_APP
             snprintf(out, out_len,
                      "<section class=\"update-panel firmware-update\"><strong>New firmware is available: %s</strong>"
                      "<span>Build %s</span><form method=\"get\" action=\"/firmware/update\">"
@@ -4850,7 +4850,11 @@ const char *remote_http_firmware_status(void)
              have ? M65_FIRMWARE_PACKAGE_PATH : "(none)",
              pending_firmware_source[0] ? pending_firmware_source : "(unknown)",
              M65_RESIDENT_BOOTLOADER ? "resident" : "none",
-             (unsigned long)M65_ENABLE_MCUBOOT_OTA);
+#ifdef M65_BOOTLOADER_APP
+             1lu);
+#else
+             0lu);
+#endif
     return firmware_status_buf;
 }
 
