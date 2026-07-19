@@ -300,6 +300,32 @@ static bool make_download_path(const char *name, char *out, size_t out_len)
     return snprintf(out, out_len, "DOWNLOADS/%s", name) < (int)out_len;
 }
 
+static bool ci_starts_with(const char *s, const char *prefix);
+
+static bool parse_download_slot_token(const char *token, int *slot)
+{
+    if (slot) *slot = -1;
+    if (!token || !token[0]) return true;
+
+    char buf[32];
+    size_t n = strlen(token);
+    if (n >= sizeof buf) return false;
+    snprintf(buf, sizeof buf, "%s", token);
+
+    char *s = trim_line(buf);
+    if (ci_starts_with(s, "download-")) s += 9;
+    char *dot = strchr(s, '.');
+    if (dot) *dot = 0;
+    if (ci_starts_with(s, "0x")) s += 2;
+    if (!s[0] || strlen(s) > 2) return false;
+
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 16);
+    if (!end || *end || v > 255u) return false;
+    if (slot) *slot = (int)v;
+    return true;
+}
+
 static bool ci_equal(const char *a, const char *b)
 {
     while (*a && *b) {
@@ -381,6 +407,7 @@ static bool at_command_preserves_autofetch(const char *arg)
     if (!query_only && arg[n] != '=') return false;
 
     if (ci_equal(tmp, "FETCHSTATUS") || ci_equal(tmp, "AUTOFETCHSTATUS") || ci_equal(tmp, "AFSTATUS")) return true;
+    if (ci_equal(tmp, "DOWNLOADSTATUS") || ci_equal(tmp, "DLSTATUS")) return true;
     if (ci_equal(tmp, "FETCHNOW") || ci_equal(tmp, "AUTOFETCHNOW") || ci_equal(tmp, "AFNOW")) return true;
     if (ci_equal(tmp, "VERBOSE") || ci_equal(tmp, "WIFIVERBOSE") || ci_equal(tmp, "DEBUG")) return true;
     if (query_only &&
@@ -622,7 +649,8 @@ static void cmd_help(void)
         "+HELP: AT+JTAGSTREAM=len id stream raw Xilinx payload over serial\n"
         "+HELP: AT+TESTSINK=len     receive/discard bytes; serial throughput test\n"
         "+HELP: AT+FILEWRITE=file len write core file to SD; needs write grant\n"
-        "+HELP: AT+FETCH=url name   fetch http:// URL into DOWNLOADS/name\n"
+        "+HELP: AT+FETCH=url [NN]   queue URL fetch to DOWNLOADS/download-NN.dat\n"
+        "+HELP: AT+DOWNLOADSTATUS?  show queued URL download status\n"
         "+HELP: AT+DOWNLOADREAD=name read DOWNLOADS/name as raw bytes\n"
         "+HELP: AT+AUTOFETCH[=0|1]  show/set mirror auto-update enable\n"
         "+HELP: AT+FETCHSTATUS?      show mirror auto-update/fetch status\n"
@@ -1641,26 +1669,33 @@ static void cmd_fetch(char *arg)
 
     char *rest = NULL;
     char *url = parse_filename_arg(arg, &rest);
-    char *name = parse_filename_arg(rest ? rest : (char *)"", NULL);
-    if (!url || !url[0] || !name || !name[0]) {
-        uart_cmd_puts("ERR F expected: F <http://url> <downloads-name>\n");
+    char *slot_arg = parse_filename_arg(rest ? rest : (char *)"", NULL);
+    if (!url || !url[0]) {
+        uart_cmd_puts("ERR F expected: F <http://url> [slot 00-FF]\n");
         return;
     }
-    if (!safe_download_name(name)) {
-        uart_cmd_puts("ERR F unsafe DOWNLOADS filename\n");
+    int slot = -1;
+    if (slot_arg && slot_arg[0] && !parse_download_slot_token(slot_arg, &slot)) {
+        uart_cmd_puts("ERR F optional destination must be slot 00-FF; files are DOWNLOADS/download-NN.dat\n");
         return;
     }
 
     char err[128];
-    uart_cmd_printf("OK F FETCHING url=%s name=%s\n", url, name);
-    activity_led_put(true);
-    bool ok = remote_http_fetch_to_downloads(url, name, err, sizeof err);
-    activity_led_put(false);
+    char dest[64];
+    bool ok = remote_http_download_start(url, slot, dest, sizeof dest, err, sizeof err);
     if (!ok) {
         uart_cmd_printf("ERR F %s\n", err[0] ? err : "fetch failed");
         return;
     }
-    uart_cmd_printf("OK F DONE path=DOWNLOADS/%s\n", name);
+    uart_cmd_printf("+DOWNLOAD: queued url=%s path=%s\n", url, dest);
+    uart_cmd_printf("+DOWNLOADSTATUS: %s\n", remote_http_download_status());
+    at_ok();
+}
+
+static void cmd_download_status(void)
+{
+    uart_cmd_printf("+DOWNLOADSTATUS: %s\r\n", remote_http_download_status());
+    at_ok();
 }
 
 static void cmd_read_download(char *arg)
@@ -1807,6 +1842,8 @@ static void dispatch_at(char *arg)
         cmd_write_file(param);
     } else if (ci_equal(cmd, "FETCH") || ci_equal(cmd, "HTTPFETCH") || ci_equal(cmd, "DOWNLOAD")) {
         cmd_fetch(param);
+    } else if (ci_equal(cmd, "DOWNLOADSTATUS") || ci_equal(cmd, "DLSTATUS")) {
+        cmd_download_status();
     } else if (ci_equal(cmd, "DOWNLOADREAD") || ci_equal(cmd, "READ")) {
         cmd_read_download(param);
     } else if (ci_equal(cmd, "AUTOFETCH")) {

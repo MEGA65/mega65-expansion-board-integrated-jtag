@@ -53,6 +53,12 @@
 #ifndef M65_AUTOFETCH_FILE_RETRIES
 #define M65_AUTOFETCH_FILE_RETRIES 10u
 #endif
+#ifndef M65_FETCH_MAX_BYTES
+#define M65_FETCH_MAX_BYTES 1073741824u
+#endif
+#ifndef M65_DOWNLOAD_QUEUE_DEPTH
+#define M65_DOWNLOAD_QUEUE_DEPTH 4u
+#endif
 #ifndef M65_FILE_HASH_PROGRESS_MS
 #define M65_FILE_HASH_PROGRESS_MS 1000u
 #endif
@@ -106,13 +112,15 @@ const char *remote_http_status(void) { return "wifi=not-supported"; }
 const char *remote_http_wifi_summary(void) { return "NO HARDWARE"; }
 const char *remote_http_wifi_diag(void) { return "supported=0 board=" M65_PICO_BOARD_NAME; }
 bool remote_http_wifi_probe_now(void) { return false; }
-bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err, size_t err_len)
+bool remote_http_download_start(const char *url, int slot, char *dest, size_t dest_len, char *err, size_t err_len)
 {
     (void)url;
-    (void)name;
+    (void)slot;
+    if (dest && dest_len) dest[0] = 0;
     if (err && err_len) snprintf(err, err_len, "wifi not supported");
     return false;
 }
+const char *remote_http_download_status(void) { return "downloads=unsupported"; }
 void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
 {
     (void)enabled_override;
@@ -238,6 +246,14 @@ typedef enum {
     WIFI_ASSOC_HTTP_ACTIVE,
 } wifi_assoc_state_t;
 
+typedef enum {
+    DOWNLOAD_JOB_EMPTY = 0,
+    DOWNLOAD_JOB_QUEUED,
+    DOWNLOAD_JOB_RUNNING,
+    DOWNLOAD_JOB_DONE,
+    DOWNLOAD_JOB_FAILED,
+} download_job_state_t;
+
 typedef struct {
     struct tcp_pcb *pcb;
     fetch_state_t state;
@@ -261,6 +277,9 @@ typedef struct {
     uint32_t content_length;
     uint32_t body_done;
     signed_file_rx_t signed_rx;
+    mbedtls_sha256_context transfer_sha;
+    bool transfer_sha_active;
+    char transfer_sha_hex[65];
     char err[128];
     absolute_time_t body_started_at;
     absolute_time_t last_rx_at;
@@ -270,6 +289,17 @@ typedef struct {
     uint32_t last_progress_report;
     uint32_t last_progress_bytes;
 } fetch_ctx_t;
+
+typedef struct {
+    download_job_state_t state;
+    uint8_t slot;
+    char url[320];
+    char name[24];
+    char path[48];
+    char err[128];
+    uint32_t bytes_done;
+    uint32_t bytes_total;
+} download_job_t;
 
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len);
 static int find_header_end(const char *buf, size_t len, size_t *end_len);
@@ -328,7 +358,13 @@ static char autofetch_base_url[192];
 static char autofetch_channel[24];
 static char autofetch_pending_path[224];
 static char autofetch_pending_sha[65];
+static char autofetch_pending_transfer_sha[65];
 static char autofetch_status_buf[320] = "autofetch=idle";
+static fetch_ctx_t download_fc;
+static download_job_t download_jobs[M65_DOWNLOAD_QUEUE_DEPTH];
+static int download_active_job = -1;
+static uint8_t download_next_slot;
+static char download_status_buf[320] = "downloads=idle";
 static bool autofetch_hash_active;
 static uint32_t autofetch_hash_done;
 static uint32_t autofetch_hash_size;
@@ -500,8 +536,9 @@ static const char default_top[] =
     "main{width:min(980px,calc(100vw - 32px));margin:24px auto}"
     "h1{font-size:24px;margin:0}.grant,.boards a,.boards span{background:#121821;border:1px solid #273142}"
     ".grant{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 16px;padding:12px 14px;border-left:5px solid #a43838}"
-    ".grant-active{border-left-color:#2fa35b}.boards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}"
-    ".boards a,.boards span{padding:7px 10px}table{border-collapse:collapse;width:100%;background:#10161f}"
+    ".grant-active,.grant-not-required{border-left-color:#2fa35b}.boards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}"
+    ".boards a,.boards span{padding:7px 10px}.boards a.fetch-now{border-color:#ffd34d;background:#211b10;color:#ffd34d;font-weight:700}"
+    "table{border-collapse:collapse;width:100%;background:#10161f}"
     "th,td{border-bottom:1px solid #263140;padding:10px 12px;text-align:left;vertical-align:top}"
     "th{background:#1b2531;color:#fff}.start{display:inline-block;margin-right:10px;padding:5px 9px;background:#1e7a46;color:#fff;text-decoration:none}"
     "tr[data-kind=PARTIAL] td{background:#151821;color:#96a3b2}tr[data-kind=PARTIAL] .start{background:#5e6671;cursor:default}"
@@ -510,8 +547,8 @@ static const char default_top[] =
     "</style></head><body>"
     "<main><h1>Expansion Board Integrated JTAG</h1>"
     "<section class=\"grant grant-{WRITE_GRANT_STATUS}\"><strong>Write grant:</strong> {WRITE_GRANT_STATUS} "
-    "<span>{WRITE_GRANT_SECONDS}s remaining</span><span>Policy: {WRITE_GRANT_REQUIRED}</span></section>"
-    "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a></nav>"
+    "<span>{WRITE_GRANT_MESSAGE}</span><span>Policy: {WRITE_GRANT_REQUIRED}</span></section>"
+    "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a> <a class=\"fetch-now\" href=\"{FETCH_NOW_URL}\">Download new cores</a></nav>"
     "<table><thead><tr><th>Core</th><th>Bytes</th><th>Actions</th></tr></thead><tbody>\n";
 static const char default_row[] =
     "<tr class=\"entry-row\" data-kind=\"{TYPE}\"><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
@@ -577,6 +614,17 @@ static bool has_manifest_ext(const char *name)
            dot[4] == '2' && dot[5] == '5' && dot[6] == '6' && dot[7] == 0;
 }
 
+static bool path_starts_with_ci(const char *s, const char *prefix)
+{
+    if (!s || !prefix) return false;
+    while (*prefix) {
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) return false;
+        s++;
+        prefix++;
+    }
+    return true;
+}
+
 static bool safe_file_path(const char *path)
 {
     if (!path || !path[0]) return false;
@@ -584,6 +632,7 @@ static bool safe_file_path(const char *path)
     if (n > 220) return false;
     if (strstr(path, "..")) return false;
     if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
+    if (path_starts_with_ci(path, "WWW/") || path_starts_with_ci(path, "DOWNLOADS/")) return false;
     return has_core_ext(path) || has_manifest_ext(path);
 }
 
@@ -607,6 +656,12 @@ static bool safe_download_name(const char *path)
     if (strstr(path, "..")) return false;
     if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
     return true;
+}
+
+static bool fixed_download_slot_name(int slot, char *out, size_t out_len)
+{
+    if (slot < 0 || slot > 255) return false;
+    return snprintf(out, out_len, "download-%02X.dat", (unsigned)slot) < (int)out_len;
 }
 
 static bool make_download_path(const char *name, char *out, size_t out_len)
@@ -910,6 +965,23 @@ static bool make_index_url(const char *dir_path, uint8_t board_rev, char *out, s
         return snprintf(out, out_len, "/index.html?path=%s&board=%u", encoded, (unsigned)board_rev) < (int)out_len;
     }
     return snprintf(out, out_len, "/index.html?path=%s", encoded) < (int)out_len;
+}
+
+static bool make_fetch_now_url(const char *dir_path, uint8_t board_rev, char *out, size_t out_len)
+{
+    char return_url[256];
+    char encoded_return[320];
+    if (!make_index_url(dir_path, board_rev, return_url, sizeof return_url)) {
+        snprintf(return_url, sizeof return_url, "/index.html");
+    }
+    url_encode(return_url, encoded_return, sizeof encoded_return);
+    if (board_rev == 3 || board_rev == 6) {
+        return snprintf(out, out_len,
+                        "/fetch/now?board=%u&return=%s",
+                        (unsigned)board_rev,
+                        encoded_return) < (int)out_len;
+    }
+    return snprintf(out, out_len, "/fetch/now?return=%s", encoded_return) < (int)out_len;
 }
 
 static bool make_parent_path(const char *dir_path, char *out, size_t out_len)
@@ -1365,13 +1437,25 @@ static void substitution_value(const char *name,
     char url[320];
     char tmp[300];
     if (ci_equal(name, "WRITE_GRANT_STATUS")) {
-        snprintf(out, out_len, "%s", write_gate_active() ? "active" : "inactive");
+        if (!http_cfg.require_write_grant) snprintf(out, out_len, "not-required");
+        else snprintf(out, out_len, "%s", write_gate_active() ? "active" : "inactive");
     } else if (ci_equal(name, "WRITE_GRANT_SECONDS")) {
-        snprintf(out, out_len, "%lu", (unsigned long)(write_gate_remaining_ms() / 1000u));
+        uint32_t seconds = write_gate_remaining_ms() / 1000u;
+        if (seconds) snprintf(out, out_len, "%lu", (unsigned long)seconds);
+        else snprintf(out, out_len, "");
     } else if (ci_equal(name, "WRITE_GRANT_MS")) {
         snprintf(out, out_len, "%lu", (unsigned long)write_gate_remaining_ms());
     } else if (ci_equal(name, "WRITE_GRANT_REQUIRED")) {
         snprintf(out, out_len, "%s", http_cfg.require_write_grant ? "required" : "not required");
+    } else if (ci_equal(name, "WRITE_GRANT_MESSAGE")) {
+        uint32_t seconds = write_gate_remaining_ms() / 1000u;
+        if (!http_cfg.require_write_grant) {
+            snprintf(out, out_len, "Write grant not required");
+        } else if (seconds) {
+            snprintf(out, out_len, "%lu seconds remaining", (unsigned long)seconds);
+        } else {
+            snprintf(out, out_len, "Press button above user-port to enable writing");
+        }
     } else if (ci_equal(name, "FETCH_STATUS")) {
         html_escape(autofetch_status_buf[0] ? autofetch_status_buf : "autofetch=idle", out, out_len);
     } else if (ci_equal(name, "FETCH_STAGE")) {
@@ -1408,6 +1492,8 @@ static void substitution_value(const char *name,
         make_index_url(dir_path, 3, out, out_len);
     } else if (ci_equal(name, "R6_URL")) {
         make_index_url(dir_path, 6, out, out_len);
+    } else if (ci_equal(name, "FETCH_NOW_URL")) {
+        make_fetch_now_url(dir_path, board_rev, out, out_len);
     } else if (ci_equal(name, "CURRENT_PATH")) {
         html_escape((dir_path && dir_path[0]) ? dir_path : "/", out, out_len);
     } else if (ci_equal(name, "PARENT_LINK")) {
@@ -1913,6 +1999,37 @@ static uint8_t board_from_target(const char *target)
     return 0;
 }
 
+static err_t send_fetch_now(http_conn_t *c)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
+        return send_error(c, 403, "Forbidden", "remote IP is not authorised");
+    }
+
+    char location[256];
+    jtag_return_target(c, location, sizeof location);
+
+    bool was_busy = autofetch_web_busy();
+    bool started = false;
+    uint8_t board_rev = board_from_target(c->target);
+    if (!was_busy) {
+        started = remote_http_autofetch_start_now(http_cfg.autofetch_enabled,
+                                                 http_cfg.fetch_interval_hours,
+                                                 board_rev);
+    }
+
+    if (!started && !was_busy && !autofetch_web_busy()) {
+        char msg[256];
+        snprintf(msg, sizeof msg,
+                 "fetch did not start: %s",
+                 remote_http_autofetch_status((int)http_cfg.autofetch_enabled,
+                                              http_cfg.fetch_interval_hours,
+                                              board_rev));
+        return send_error(c, 409, "Conflict", msg);
+    }
+
+    return send_redirect(c, location);
+}
+
 static err_t send_index(http_conn_t *c, uint8_t board_rev)
 {
     if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
@@ -2383,6 +2500,10 @@ static err_t parse_headers(http_conn_t *c)
         return send_error(c, 404, "Not Found", "favicon is not cached");
     }
 
+    if (ci_equal(c->method, "GET") && ci_equal(target_path, "/fetch/now")) {
+        return send_fetch_now(c);
+    }
+
     if ((ci_equal(c->method, "GET") || ci_equal(c->method, "PUT")) &&
         ci_equal(target_path, "/fetch/stop")) {
         autofetch_cancel("web stop", 900000u);
@@ -2677,7 +2798,12 @@ static void fetch_idle_diagnostics(fetch_ctx_t *fc, absolute_time_t now)
 
 static void fetch_close(fetch_ctx_t *fc, bool aborting)
 {
-    if (!fc || !fc->pcb) return;
+    if (!fc) return;
+    if (fc->transfer_sha_active) {
+        mbedtls_sha256_free(&fc->transfer_sha);
+        fc->transfer_sha_active = false;
+    }
+    if (!fc->pcb) return;
     struct tcp_pcb *pcb = fc->pcb;
     fc->pcb = NULL;
     tcp_arg(pcb, NULL);
@@ -2690,6 +2816,48 @@ static void fetch_close(fetch_ctx_t *fc, bool aborting)
     } else if (tcp_close(pcb) != ERR_OK) {
         tcp_abort(pcb);
     }
+}
+
+static bool fetch_transfer_sha_start(fetch_ctx_t *fc)
+{
+    if (!fc) return false;
+    mbedtls_sha256_init(&fc->transfer_sha);
+    if (mbedtls_sha256_starts(&fc->transfer_sha, 0) != 0) {
+        mbedtls_sha256_free(&fc->transfer_sha);
+        fc->transfer_sha_active = false;
+        return false;
+    }
+    fc->transfer_sha_active = true;
+    fc->transfer_sha_hex[0] = 0;
+    return true;
+}
+
+static bool fetch_transfer_sha_update(fetch_ctx_t *fc, const uint8_t *data, size_t len)
+{
+    if (!fc || !fc->transfer_sha_active) return true;
+    if (len && mbedtls_sha256_update(&fc->transfer_sha, data, len) != 0) {
+        mbedtls_sha256_free(&fc->transfer_sha);
+        fc->transfer_sha_active = false;
+        fetch_set_error(fc, "transfer SHA-256 update failed");
+        return false;
+    }
+    return true;
+}
+
+static bool fetch_transfer_sha_finish(fetch_ctx_t *fc)
+{
+    if (!fc || !fc->transfer_sha_active) return true;
+    uint8_t digest[32];
+    if (mbedtls_sha256_finish(&fc->transfer_sha, digest) != 0) {
+        mbedtls_sha256_free(&fc->transfer_sha);
+        fc->transfer_sha_active = false;
+        fetch_set_error(fc, "transfer SHA-256 finish failed");
+        return false;
+    }
+    mbedtls_sha256_free(&fc->transfer_sha);
+    fc->transfer_sha_active = false;
+    bytes32_to_hex(digest, fc->transfer_sha_hex);
+    return true;
 }
 
 static uint16_t fetch_random_local_port(void)
@@ -2798,6 +2966,7 @@ static bool fetch_process_body(fetch_ctx_t *fc, const uint8_t *data, size_t len)
         fetch_set_error(fc, "write grant expired");
         return false;
     }
+    if (!fetch_transfer_sha_update(fc, data, len)) return false;
     if (!signed_file_receive_write(&fc->signed_rx, data, len)) {
         fetch_set_error(fc, signed_file_last_error());
         return false;
@@ -2806,6 +2975,7 @@ static bool fetch_process_body(fetch_ctx_t *fc, const uint8_t *data, size_t len)
     fc->last_rx_at = get_absolute_time();
     fetch_report_progress(fc);
     if (fc->body_done == fc->content_length) {
+        if (!fetch_transfer_sha_finish(fc)) return false;
         if (!finish_signed_receive_logged(&fc->signed_rx, "+FETCH:", fc->final_path, fc == &autofetch_fc)) {
             fetch_set_error(fc, signed_file_last_error());
             return false;
@@ -2836,11 +3006,17 @@ static bool fetch_parse_headers(fetch_ctx_t *fc, const uint8_t *body, size_t bod
         fetch_set_error(fc, "HTTP response missing Content-Length");
         return false;
     }
-    fc->content_length = (uint32_t)strtoul(cl, NULL, 10);
-    if (fc->content_length == 0) {
+    char *cl_end = NULL;
+    unsigned long cl_value = strtoul(cl, &cl_end, 10);
+    if (cl_end == cl || cl_value == 0) {
         fetch_set_error(fc, "HTTP response has zero Content-Length");
         return false;
     }
+    if (cl_value > M65_FETCH_MAX_BYTES) {
+        fetch_set_error(fc, "HTTP response exceeds maximum download size");
+        return false;
+    }
+    fc->content_length = (uint32_t)cl_value;
     remote_log(1, "+FETCH: headers status=%d bytes=%lu dest=%s",
                status,
                (unsigned long)fc->content_length,
@@ -2855,6 +3031,10 @@ static bool fetch_parse_headers(fetch_ctx_t *fc, const uint8_t *body, size_t bod
 
     const remote_auth_config_t *cfg = fc->cfg ? fc->cfg : &http_cfg;
     storage_delete(fc->tmp_path);
+    if (!fetch_transfer_sha_start(fc)) {
+        fetch_set_error(fc, "cannot initialise transfer SHA-256");
+        return false;
+    }
     if (!signed_file_receive_begin(&fc->signed_rx,
                                    cfg,
                                    fc->final_path,
@@ -2932,7 +3112,14 @@ static void fetch_err(void *arg, err_t err)
     fetch_ctx_t *fc = (fetch_ctx_t *)arg;
     if (!fc) return;
     fc->pcb = NULL;
-    if (fc->state != FETCH_DONE) fetch_set_error(fc, "TCP connection aborted");
+    if (fc->state != FETCH_DONE) {
+        signed_file_receive_abort(&fc->signed_rx);
+        if (fc->transfer_sha_active) {
+            mbedtls_sha256_free(&fc->transfer_sha);
+            fc->transfer_sha_active = false;
+        }
+        fetch_set_error(fc, "TCP connection aborted");
+    }
 }
 
 static void fetch_dns_cb(const char *name, const ip_addr_t *ipaddr, void *arg)
@@ -3065,8 +3252,176 @@ static bool fetch_poll(fetch_ctx_t *fc)
     return false;
 }
 
-bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err, size_t err_len)
+static uint32_t download_queued_count(void)
 {
+    uint32_t count = 0;
+    for (unsigned i = 0; i < M65_DOWNLOAD_QUEUE_DEPTH; ++i) {
+        if (download_jobs[i].state == DOWNLOAD_JOB_QUEUED) count++;
+    }
+    return count;
+}
+
+static bool download_slot_in_use(uint8_t slot)
+{
+    for (unsigned i = 0; i < M65_DOWNLOAD_QUEUE_DEPTH; ++i) {
+        if ((download_jobs[i].state == DOWNLOAD_JOB_QUEUED ||
+             download_jobs[i].state == DOWNLOAD_JOB_RUNNING) &&
+            download_jobs[i].slot == slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int download_allocate_slot(int requested)
+{
+    if (requested >= 0) {
+        if (requested > 255 || download_slot_in_use((uint8_t)requested)) return -1;
+        return requested;
+    }
+    for (unsigned i = 0; i < 256u; ++i) {
+        uint8_t slot = download_next_slot++;
+        if (!download_slot_in_use(slot)) return (int)slot;
+    }
+    return -1;
+}
+
+static int download_find_free_job(void)
+{
+    for (unsigned i = 0; i < M65_DOWNLOAD_QUEUE_DEPTH; ++i) {
+        if (download_jobs[i].state == DOWNLOAD_JOB_EMPTY ||
+            download_jobs[i].state == DOWNLOAD_JOB_DONE ||
+            download_jobs[i].state == DOWNLOAD_JOB_FAILED) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void download_refresh_status(void)
+{
+    if (download_active_job >= 0 && download_active_job < (int)M65_DOWNLOAD_QUEUE_DEPTH) {
+        download_job_t *job = &download_jobs[download_active_job];
+        job->bytes_done = download_fc.body_done;
+        job->bytes_total = download_fc.content_length;
+        snprintf(download_status_buf, sizeof download_status_buf,
+                 "downloads=running slot=%02X path=%s bytes=%lu/%lu queued=%lu",
+                 (unsigned)job->slot,
+                 job->path,
+                 (unsigned long)job->bytes_done,
+                 (unsigned long)job->bytes_total,
+                 (unsigned long)download_queued_count());
+        return;
+    }
+
+    uint32_t queued = download_queued_count();
+    if (queued) {
+        snprintf(download_status_buf, sizeof download_status_buf,
+                 "downloads=queued queued=%lu",
+                 (unsigned long)queued);
+        return;
+    }
+
+    if (!download_status_buf[0]) snprintf(download_status_buf, sizeof download_status_buf, "downloads=idle");
+}
+
+static bool download_start_job(unsigned idx)
+{
+    if (idx >= M65_DOWNLOAD_QUEUE_DEPTH) return false;
+    download_job_t *job = &download_jobs[idx];
+    if (job->state != DOWNLOAD_JOB_QUEUED) return false;
+
+    char fetch_err[96];
+    if (!fetch_start(&download_fc, job->url, job->path, &http_cfg, true, 14400000u, fetch_err, sizeof fetch_err)) {
+        job->state = DOWNLOAD_JOB_FAILED;
+        snprintf(job->err, sizeof job->err, "%s", fetch_err[0] ? fetch_err : "fetch start failed");
+        snprintf(download_status_buf, sizeof download_status_buf,
+                 "downloads=failed slot=%02X path=%s reason=\"%s\" queued=%lu",
+                 (unsigned)job->slot,
+                 job->path,
+                 job->err,
+                 (unsigned long)download_queued_count());
+        remote_log(1, "+DOWNLOAD: failed slot=%02X path=%s reason=%s",
+                   (unsigned)job->slot, job->path, job->err);
+        return false;
+    }
+
+    job->state = DOWNLOAD_JOB_RUNNING;
+    job->bytes_done = 0;
+    job->bytes_total = 0;
+    job->err[0] = 0;
+    download_active_job = (int)idx;
+    snprintf(download_status_buf, sizeof download_status_buf,
+             "downloads=running slot=%02X path=%s bytes=0/0 queued=%lu",
+             (unsigned)job->slot,
+             job->path,
+             (unsigned long)download_queued_count());
+    remote_log(1, "+DOWNLOAD: start slot=%02X url=%s path=%s",
+               (unsigned)job->slot, job->url, job->path);
+    return true;
+}
+
+static void download_start_next_job(void)
+{
+    if (download_active_job >= 0) return;
+    for (unsigned i = 0; i < M65_DOWNLOAD_QUEUE_DEPTH; ++i) {
+        if (download_jobs[i].state == DOWNLOAD_JOB_QUEUED) {
+            (void)download_start_job(i);
+            return;
+        }
+    }
+    download_refresh_status();
+}
+
+static void remote_http_download_poll(void)
+{
+    if (download_active_job >= 0 && download_active_job < (int)M65_DOWNLOAD_QUEUE_DEPTH) {
+        download_job_t *job = &download_jobs[download_active_job];
+        fetch_poll(&download_fc);
+        job->bytes_done = download_fc.body_done;
+        job->bytes_total = download_fc.content_length;
+        if (download_fc.state == FETCH_DONE) {
+            job->state = DOWNLOAD_JOB_DONE;
+            snprintf(download_status_buf, sizeof download_status_buf,
+                     "downloads=done slot=%02X path=%s bytes=%lu queued=%lu",
+                     (unsigned)job->slot,
+                     job->path,
+                     (unsigned long)job->bytes_done,
+                     (unsigned long)download_queued_count());
+            remote_log(1, "+DOWNLOAD: done slot=%02X path=%s bytes=%lu",
+                       (unsigned)job->slot, job->path, (unsigned long)job->bytes_done);
+            download_active_job = -1;
+            download_start_next_job();
+            return;
+        }
+        if (download_fc.state == FETCH_FAILED) {
+            signed_file_receive_abort(&download_fc.signed_rx);
+            storage_delete(download_fc.tmp_path);
+            job->state = DOWNLOAD_JOB_FAILED;
+            snprintf(job->err, sizeof job->err, "%s", download_fc.err[0] ? download_fc.err : "fetch failed");
+            snprintf(download_status_buf, sizeof download_status_buf,
+                     "downloads=failed slot=%02X path=%s reason=\"%s\" queued=%lu",
+                     (unsigned)job->slot,
+                     job->path,
+                     job->err,
+                     (unsigned long)download_queued_count());
+            remote_log(1, "+DOWNLOAD: failed slot=%02X path=%s reason=%s",
+                       (unsigned)job->slot, job->path, job->err);
+            download_active_job = -1;
+            download_start_next_job();
+            return;
+        }
+        download_refresh_status();
+        return;
+    }
+
+    download_active_job = -1;
+    download_start_next_job();
+}
+
+bool remote_http_download_start(const char *url, int slot, char *dest, size_t dest_len, char *err, size_t err_len)
+{
+    if (dest && dest_len) dest[0] = 0;
     if (err && err_len) err[0] = 0;
     if (!http_is_active) {
         if (err && err_len) snprintf(err, err_len, "wifi HTTP is not active");
@@ -3077,31 +3432,70 @@ bool remote_http_fetch_to_downloads(const char *url, const char *name, char *err
         return false;
     }
 
-    fetch_ctx_t fc;
-    if (!safe_download_name(name) || !make_download_path(name, fc.final_path, sizeof fc.final_path)) {
-        if (err && err_len) snprintf(err, err_len, "unsafe DOWNLOADS filename");
+    char host[128];
+    char path[256];
+    uint16_t port = 0;
+    if (!parse_http_url(url, host, sizeof host, &port, path, sizeof path)) {
+        if (err && err_len) snprintf(err, err_len, "expected http://host[:port]/path URL");
         return false;
     }
+
+    uint32_t pending = download_queued_count() + (download_active_job >= 0 ? 1u : 0u);
+    if (pending >= M65_DOWNLOAD_QUEUE_DEPTH) {
+        if (err && err_len) snprintf(err, err_len, "download queue full");
+        return false;
+    }
+
+    int use_slot = download_allocate_slot(slot);
+    if (use_slot < 0) {
+        if (err && err_len) snprintf(err, err_len, "download slot unavailable");
+        return false;
+    }
+
+    int idx = download_find_free_job();
+    if (idx < 0) {
+        if (err && err_len) snprintf(err, err_len, "download queue full");
+        return false;
+    }
+
     if (!storage_mkdir("DOWNLOADS")) {
         if (err && err_len) snprintf(err, err_len, "cannot create DOWNLOADS: %s", storage_last_error());
         return false;
     }
-    char final_path[256];
-    snprintf(final_path, sizeof final_path, "%s", fc.final_path);
-    if (!fetch_start(&fc, url, final_path, &http_cfg, true, 60000u, err, err_len)) return false;
-    while (fc.state != FETCH_DONE && fc.state != FETCH_FAILED) {
-        cyw43_arch_poll();
-        fetch_poll(&fc);
-        sleep_ms(1);
-    }
 
-    bool ok = fc.state == FETCH_DONE;
-    if (!ok) {
-        signed_file_receive_abort(&fc.signed_rx);
-        storage_delete(fc.tmp_path);
-        if (err && err_len) snprintf(err, err_len, "%s", fc.err[0] ? fc.err : "fetch failed");
+    download_job_t *job = &download_jobs[idx];
+    memset(job, 0, sizeof *job);
+    job->state = DOWNLOAD_JOB_QUEUED;
+    job->slot = (uint8_t)use_slot;
+    snprintf(job->url, sizeof job->url, "%s", url);
+    if (!fixed_download_slot_name(use_slot, job->name, sizeof job->name) ||
+        !make_download_path(job->name, job->path, sizeof job->path)) {
+        job->state = DOWNLOAD_JOB_EMPTY;
+        if (err && err_len) snprintf(err, err_len, "download slot path too long");
+        return false;
     }
-    return ok;
+    if (dest && dest_len) snprintf(dest, dest_len, "%s", job->path);
+    snprintf(download_status_buf, sizeof download_status_buf,
+             "downloads=queued slot=%02X path=%s queued=%lu",
+             (unsigned)job->slot,
+             job->path,
+             (unsigned long)download_queued_count());
+    remote_log(1, "+DOWNLOAD: queued slot=%02X url=%s path=%s",
+               (unsigned)job->slot, job->url, job->path);
+
+    if (download_active_job < 0) {
+        if (!download_start_job((unsigned)idx) && job->state == DOWNLOAD_JOB_FAILED) {
+            if (err && err_len) snprintf(err, err_len, "%s", job->err[0] ? job->err : "download start failed");
+            return false;
+        }
+    }
+    return true;
+}
+
+const char *remote_http_download_status(void)
+{
+    download_refresh_status();
+    return download_status_buf;
 }
 
 static uint32_t clamp_interval_hours(uint32_t hours)
@@ -3280,31 +3674,48 @@ static bool read_manifest_line(uint32_t *offset, char *line, size_t line_len, bo
     return true;
 }
 
-static bool parse_manifest_entry(char *line, char sha[65], char rel[224], bool *skip, char *err, size_t err_len)
+static bool parse_manifest_entry(char *line,
+                                 char payload_sha[65],
+                                 char transfer_sha[65],
+                                 char rel[224],
+                                 bool *skip,
+                                 char *err,
+                                 size_t err_len)
 {
     *skip = true;
     char *s = line;
     while (*s && isspace((unsigned char)*s)) s++;
     if (!*s || *s == '#') return true;
 
-    char *hash = s;
+    char *payload_hash = s;
     while (*s && !isspace((unsigned char)*s)) s++;
     if (*s) *s++ = 0;
     while (*s && isspace((unsigned char)*s)) s++;
-    if (strlen(hash) != 64 || !*s) {
-        if (err && err_len) snprintf(err, err_len, "bad manifest line");
+
+    char *transfer_hash = s;
+    while (*s && !isspace((unsigned char)*s)) s++;
+    if (*s) *s++ = 0;
+    while (*s && isspace((unsigned char)*s)) s++;
+
+    if (strlen(payload_hash) != 64 || strlen(transfer_hash) != 64 || !*s) {
+        if (err && err_len) snprintf(err, err_len, "bad v2 manifest line");
         return false;
     }
     uint8_t digest[32];
-    if (!hex_to_bytes32(hash, digest)) {
-        if (err && err_len) snprintf(err, err_len, "bad manifest SHA-256");
+    if (!hex_to_bytes32(payload_hash, digest)) {
+        if (err && err_len) snprintf(err, err_len, "bad manifest payload SHA-256");
+        return false;
+    }
+    if (!hex_to_bytes32(transfer_hash, digest)) {
+        if (err && err_len) snprintf(err, err_len, "bad manifest transfer SHA-256");
         return false;
     }
     if (!safe_file_path(s) || !has_core_ext(s) || s[0] == '/') {
         if (err && err_len) snprintf(err, err_len, "unsafe manifest filename");
         return false;
     }
-    snprintf(sha, 65, "%s", hash);
+    snprintf(payload_sha, 65, "%s", payload_hash);
+    snprintf(transfer_sha, 65, "%s", transfer_hash);
     snprintf(rel, 224, "%s", s);
     *skip = false;
     return true;
@@ -3314,17 +3725,18 @@ static uint32_t count_manifest_entries(void)
 {
     uint32_t offset = 0;
     uint32_t total = 0;
-    char line[320];
+    char line[512];
     for (;;) {
         bool eof = false;
         if (!read_manifest_line(&offset, line, sizeof line, &eof)) return total;
         if (eof) return total;
 
-        char sha[65];
+        char payload_sha[65];
+        char transfer_sha[65];
         char rel[224];
         bool skip = true;
         char err[80];
-        if (!parse_manifest_entry(line, sha, rel, &skip, err, sizeof err)) return total;
+        if (!parse_manifest_entry(line, payload_sha, transfer_sha, rel, &skip, err, sizeof err)) return total;
         if (!skip) total++;
     }
 }
@@ -3380,7 +3792,7 @@ static bool autofetch_start_manifest(uint8_t board_rev)
     return true;
 }
 
-static bool autofetch_start_core(const char *rel, const char *sha)
+static bool autofetch_start_core(const char *rel, const char *payload_sha, const char *transfer_sha)
 {
     char url[384];
     if (!join_url_path(autofetch_base_url, rel, url, sizeof url)) {
@@ -3393,7 +3805,8 @@ static bool autofetch_start_core(const char *rel, const char *sha)
         return false;
     }
     snprintf(autofetch_pending_path, sizeof autofetch_pending_path, "%s", rel);
-    snprintf(autofetch_pending_sha, sizeof autofetch_pending_sha, "%s", sha);
+    snprintf(autofetch_pending_sha, sizeof autofetch_pending_sha, "%s", payload_sha);
+    snprintf(autofetch_pending_transfer_sha, sizeof autofetch_pending_transfer_sha, "%s", transfer_sha);
     autofetch_state = AUTOFETCH_CORE;
     snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
              "autofetch=running stage=core file=%s checked=%lu total=%lu updated=%lu",
@@ -3436,10 +3849,12 @@ static bool autofetch_retry_current_fetch(const char *reason)
 
     if (autofetch_state == AUTOFETCH_CORE) {
         char rel[sizeof autofetch_pending_path];
-        char sha[sizeof autofetch_pending_sha];
+        char payload_sha[sizeof autofetch_pending_sha];
+        char transfer_sha[sizeof autofetch_pending_transfer_sha];
         snprintf(rel, sizeof rel, "%s", autofetch_pending_path);
-        snprintf(sha, sizeof sha, "%s", autofetch_pending_sha);
-        if (!autofetch_start_core(rel, sha)) return false;
+        snprintf(payload_sha, sizeof payload_sha, "%s", autofetch_pending_sha);
+        snprintf(transfer_sha, sizeof transfer_sha, "%s", autofetch_pending_transfer_sha);
+        if (!autofetch_start_core(rel, payload_sha, transfer_sha)) return false;
         snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
                  "autofetch=running stage=core-retry file=%s failure=%lu checked=%lu total=%lu updated=%lu",
                  rel,
@@ -3470,12 +3885,13 @@ static void autofetch_skip_current_core(const char *reason)
     autofetch_fetch_retry_count = 0;
     autofetch_pending_path[0] = 0;
     autofetch_pending_sha[0] = 0;
+    autofetch_pending_transfer_sha[0] = 0;
     autofetch_state = AUTOFETCH_SCAN;
 }
 
 static bool autofetch_scan_manifest(void)
 {
-    char line[320];
+    char line[512];
     for (;;) {
         bool eof = false;
         if (!read_manifest_line(&autofetch_manifest_offset, line, sizeof line, &eof)) {
@@ -3503,11 +3919,12 @@ static bool autofetch_scan_manifest(void)
             return true;
         }
 
-        char sha[65];
+        char payload_sha[65];
+        char transfer_sha[65];
         char rel[224];
         bool skip = true;
         char err[80];
-        if (!parse_manifest_entry(line, sha, rel, &skip, err, sizeof err)) {
+        if (!parse_manifest_entry(line, payload_sha, transfer_sha, rel, &skip, err, sizeof err)) {
             snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
                      "autofetch=failed stage=manifest-scan reason=\"%s\"", err);
             return false;
@@ -3526,13 +3943,13 @@ static bool autofetch_scan_manifest(void)
                    (unsigned long)autofetch_checked_count,
                    (unsigned long)autofetch_manifest_total_count);
         char have[65];
-        if (file_sha256_hex(rel, have, "scan") && strcmp(have, sha) == 0) {
+        if (file_sha256_hex(rel, have, "scan") && ci_equal(have, payload_sha)) {
             remote_log(1, "+AUTOFETCH: unchanged file=%s", rel);
             return true;
         }
         remote_log(1, "+AUTOFETCH: update file=%s", rel);
         autofetch_fetch_retry_count = 0;
-        if (!autofetch_start_core(rel, sha)) return false;
+        if (!autofetch_start_core(rel, payload_sha, transfer_sha)) return false;
         return true;
     }
 }
@@ -3587,12 +4004,25 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
                      (unsigned long)autofetch_manifest_total_count,
                      (unsigned long)autofetch_updated_count);
             remote_log(1, "+AUTOFETCH: verify file=%s", autofetch_pending_path);
-            if (!file_sha256_hex(autofetch_pending_path, have, "verify") ||
-                strcmp(have, autofetch_pending_sha) != 0) {
+            if (!autofetch_fc.transfer_sha_hex[0] ||
+                !ci_equal(autofetch_fc.transfer_sha_hex, autofetch_pending_transfer_sha)) {
                 storage_delete(autofetch_pending_path);
                 snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
-                         "autofetch=failed stage=verify file=%s", autofetch_pending_path);
-                autofetch_cancel("hash mismatch", 900000u);
+                         "autofetch=failed stage=verify-transfer file=%s", autofetch_pending_path);
+                remote_log(1, "+AUTOFETCH: transfer hash mismatch file=%s have=%s want=%s",
+                           autofetch_pending_path,
+                           autofetch_fc.transfer_sha_hex[0] ? autofetch_fc.transfer_sha_hex : "(none)",
+                           autofetch_pending_transfer_sha);
+                autofetch_cancel("transfer hash mismatch", 900000u);
+                return;
+            }
+            remote_log(2, "+AUTOFETCH: transfer hash verified file=%s", autofetch_pending_path);
+            if (!file_sha256_hex(autofetch_pending_path, have, "verify") ||
+                !ci_equal(have, autofetch_pending_sha)) {
+                storage_delete(autofetch_pending_path);
+                snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                         "autofetch=failed stage=verify-payload file=%s", autofetch_pending_path);
+                autofetch_cancel("payload hash mismatch", 900000u);
                 return;
             }
             autofetch_updated_count++;
@@ -3985,6 +4415,7 @@ void remote_http_poll(void)
         return;
     }
     if (wifi_assoc_state == WIFI_ASSOC_CONNECTING) remote_http_poll_wifi_join();
+    if (http_is_active) remote_http_download_poll();
     remote_log_wifi_change();
 }
 

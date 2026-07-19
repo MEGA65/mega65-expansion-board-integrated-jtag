@@ -126,4 +126,4 @@
 #endif
 
 #define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG v0.1"
-#define M65_BUILD_MARKER     "autofetch-keeps-wifi-20260718"
+#define M65_BUILD_MARKER     "dual-hash-download-slots-20260719"

@@ -688,13 +688,18 @@ def write_hash_file(out_dir: Path, hash_file: str, board: str, channel: str, pat
     if not hash_file:
         return None
 
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[str, str, str]] = []
     for path in sorted(dict.fromkeys(paths if paths is not None else core_file_paths(out_dir))):
-        data = strip_signature_trailer(path.read_bytes())
+        transfer_data = path.read_bytes()
+        payload_data = strip_signature_trailer(transfer_data)
         rel = path.relative_to(out_dir).as_posix()
-        rows.append((rel, hashlib.sha256(data).hexdigest()))
+        rows.append((
+            rel,
+            hashlib.sha256(payload_data).hexdigest(),
+            hashlib.sha256(transfer_data).hexdigest(),
+        ))
 
-    body_lines = [f"{sha}  {rel}\n" for rel, sha in rows]
+    body_lines = [f"{payload_sha} {transfer_sha}  {rel}\n" for rel, payload_sha, transfer_sha in rows]
     aggregate = hashlib.sha256("".join(body_lines).encode("utf-8")).hexdigest()
 
     dest = Path(hash_file)
@@ -702,11 +707,13 @@ def write_hash_file(out_dir: Path, hash_file: str, board: str, channel: str, pat
         dest = out_dir / dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("w", encoding="utf-8") as f:
-        f.write("# m65j core mirror hash list v1\n")
+        f.write("# m65j core mirror hash list v2\n")
         f.write(f"# channel={channel}\n")
         f.write(f"# board={board.upper()}\n")
         f.write(f"# aggregate_sha256={aggregate}\n")
-        f.write("# format: <sha256>  <relative-filename>\n")
+        f.write("# format: <payload-sha256> <transfer-sha256>  <relative-filename>\n")
+        f.write("# payload-sha256 hashes the SD-stored file after signature stripping\n")
+        f.write("# transfer-sha256 hashes the exact HTTP object, including any signature trailer\n")
         for line in body_lines:
             f.write(line)
     return dest

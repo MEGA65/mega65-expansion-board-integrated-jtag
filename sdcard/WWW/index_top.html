@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MEGA65 JTAG</title>
   <link rel="icon" type="image/png" href="/favicon.ico">
-  <link rel="stylesheet" href="/WWW/style.css?v=20260715-filter">
-  <script src="/WWW/app.js?v=20260715-filter" defer></script>
+  <link rel="stylesheet" href="/WWW/style.css?v=20260719-grant">
+  <script src="/WWW/app.js?v=20260718-fetch" defer></script>
 </head>
 <body>
   <main>
@@ -16,7 +16,7 @@
     </header>
     <section class="grant grant-{WRITE_GRANT_STATUS}">
       <strong>Write grant:</strong> {WRITE_GRANT_STATUS}
-      <span>{WRITE_GRANT_SECONDS}s remaining</span>
+      <span>{WRITE_GRANT_MESSAGE}</span>
       <span>Policy: {WRITE_GRANT_REQUIRED}</span>
     </section>
     <nav class="boards">
@@ -25,6 +25,7 @@
       {PARENT_LINK}
       <a href="{R3_URL}">R3 cores</a>
       <a href="{R6_URL}">R6 cores</a>
+      <a class="fetch-now" href="{FETCH_NOW_URL}">Download new cores</a>
     </nav>
     <table>
       <thead>

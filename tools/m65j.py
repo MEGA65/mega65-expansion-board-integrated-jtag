@@ -1295,15 +1295,19 @@ def read_hash_manifest(path):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split(None, 1)
-        if len(parts) != 2 or len(parts[0]) != 64:
+        parts = line.split(None, 2)
+        if len(parts) != 3 or len(parts[0]) != 64 or len(parts[1]) != 64:
             raise SystemExit(f"bad hash manifest line {line_no}: {raw}")
-        sha, rel = parts[0].lower(), parts[1].strip()
-        if any(c not in "0123456789abcdef" for c in sha):
-            raise SystemExit(f"bad SHA-256 on manifest line {line_no}")
+        payload_sha = parts[0].lower()
+        transfer_sha = parts[1].lower()
+        rel = parts[2].strip()
+        if any(c not in "0123456789abcdef" for c in payload_sha):
+            raise SystemExit(f"bad payload SHA-256 on manifest line {line_no}")
+        if transfer_sha and any(c not in "0123456789abcdef" for c in transfer_sha):
+            raise SystemExit(f"bad transfer SHA-256 on manifest line {line_no}")
         if not rel or rel.startswith("/") or ".." in rel or "\\" in rel or ":" in rel:
             raise SystemExit(f"unsafe manifest filename on line {line_no}: {rel}")
-        rows.append((sha, rel))
+        rows.append((payload_sha, transfer_sha, rel))
     return rows
 
 
@@ -1353,7 +1357,7 @@ def populate_main(argv):
                 hash_path = out_dir / hash_path
             hash_paths.append((board, hash_path))
             rows = read_hash_manifest(hash_path)
-            for _sha, rel in rows:
+            for _payload_sha, _transfer_sha, rel in rows:
                 local = out_dir / rel
                 if not local.exists():
                     raise SystemExit(f"manifest entry is missing locally: {local}")
@@ -1412,6 +1416,7 @@ def known_top_level_command(value):
         "CORELS", "I", "T", "P", "LOAD", "PROGRAM", "JTAGLOAD", "S", "N",
         "W", "F", "R", "A", "D", "J", "X", "H", "M", "STATUS", "VERSION",
         "VER", "IDENTIFY", "ABOUT", "WIFI", "HTTP", "SDCARD", "SDSTATUS",
+        "DOWNLOADSTATUS", "DLSTATUS",
         "MACHINE", "MACHINENAME", "IDENTITY",
     }:
         return True
@@ -1586,6 +1591,7 @@ def serial_command_candidate(argv):
         "CORELS", "I", "T", "P", "LOAD", "PROGRAM", "JTAGLOAD", "S", "N",
         "W", "F", "R", "A", "D", "J", "X", "H", "M", "STATUS", "VERSION",
         "VER", "IDENTIFY", "ABOUT", "WIFI", "HTTP", "SDCARD", "SDSTATUS",
+        "DOWNLOADSTATUS", "DLSTATUS",
         "MACHINE", "MACHINENAME", "IDENTITY",
     }:
         return True
@@ -1607,7 +1613,8 @@ def serial_preferred_even_with_web_config(argv):
         "?", "V", "L", "LIST", "DIR", "LS", "LL", "DETAIL", "COREDETAIL",
         "CORELS", "I", "T", "P", "S", "N", "W", "F", "R", "A", "D",
         "J", "X", "H", "M", "VERSION", "VER", "IDENTIFY", "ABOUT",
-        "WIFI", "HTTP", "SDCARD", "SDSTATUS", "MACHINE", "MACHINENAME", "IDENTITY",
+        "WIFI", "HTTP", "SDCARD", "SDSTATUS", "DOWNLOADSTATUS", "DLSTATUS",
+        "MACHINE", "MACHINENAME", "IDENTITY",
     }:
         return True
     return lower in {"stream", "sink", "dummy", "rx-test", "push-local", "program-local"}
@@ -1891,7 +1898,8 @@ def read_response_lines(ser, cmd, timeout):
                 "I", "VERSION", "VER", "COREINFO", "CORE", "INFO",
                 "WRITEGRANT", "AUTH", "SDMODE", "JTAGID", "JTAGSTATUS",
                 "XSTATUS", "HIJACK", "MOUNT", "WIFI", "HTTP",
-                "SDCARD", "SDSTATUS", "MACHINE", "MACHINENAME", "NAME",
+                "SDCARD", "SDSTATUS", "DOWNLOADSTATUS", "DLSTATUS",
+                "MACHINE", "MACHINENAME", "NAME",
                 "IDENTITY", "VERBOSE", "WIFIVERBOSE", "DEBUG",
             }
         return command[:1].upper() in {"V", "I", "J", "H", "M", "A", "X", "D"}
@@ -2150,6 +2158,8 @@ def translate_manual_command(parts):
         return f"AT+{upper}?"
     if upper in {"SDCARD", "SDSTATUS"}:
         return "AT+SDCARD?"
+    if upper in {"DOWNLOADSTATUS", "DLSTATUS"}:
+        return "AT+DOWNLOADSTATUS?"
     if upper in {"MACHINE", "MACHINENAME", "IDENTITY"}:
         return f"AT+MACHINE={rest}" if rest else "AT+MACHINE?"
     if upper in {"IDENTIFY", "ABOUT"}:
@@ -2345,7 +2355,8 @@ def main(argv=None):
               m65j.py store [url] core.bit --board 6
               m65j.py load [url] /cores/core.cor --board 6
               m65j.py get [url] /cores/core.cor -o core.cor
-              m65j.py downloads-get [url] fetched.bit -o fetched.bit
+              m65j.py downloadstatus
+              m65j.py downloads-get [url] download-00.dat -o fetched.dat
               m65j.py put http://host/files/core.bit core.bit --board 6
               m65j.py /dev/ttyACM0 ATI
               m65j.py /dev/ttyACM0 stream local.bit

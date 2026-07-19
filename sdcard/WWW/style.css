@@ -50,6 +50,10 @@ h1 {
   border-left-color: #2fa35b;
 }
 
+.grant-not-required {
+  border-left-color: #2fa35b;
+}
+
 .grant-inactive {
   border-left-color: #a43838;
 }
@@ -68,6 +72,13 @@ h1 {
   padding: 7px 10px;
   background: #121821;
   border: 1px solid #273142;
+}
+
+.boards a.fetch-now {
+  border-color: #ffd34d;
+  background: #211b10;
+  color: #ffd34d;
+  font-weight: 700;
 }
 
 table {

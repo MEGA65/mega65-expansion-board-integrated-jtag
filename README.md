@@ -151,7 +151,8 @@ AT+JTAGLOAD=file           hijack JTAG and program existing SD core
 AT+JTAGSTREAM=len idcode   stream raw payload over serial; USB-only by default
 AT+TESTSINK=len            serial receive/discard speed test
 AT+FILEWRITE=file len      write a core file to SD; USB + physical WE required by default
-AT+FETCH=url name          fetch http:// URL into DOWNLOADS/name
+AT+FETCH=url [NN]          queue URL fetch to DOWNLOADS/download-NN.dat
+AT+DOWNLOADSTATUS?         show queued URL download status
 AT+DOWNLOADREAD=name       read DOWNLOADS/name as raw bytes
 AT+AUTOFETCH[=0|1]         show/set mirror auto-update enable
 AT+FETCHSTATUS?            show mirror auto-update/fetch status
@@ -348,7 +349,7 @@ tools/m65j.py check sdcard/cores
 tools/m65j.py push core.bit --board 6
 tools/m65j.py load /cores/mega65r6.cor --board 6
 tools/m65j.py get /cores/mega65r6.cor -o mega65r6.cor
-tools/m65j.py downloads-get fetched.bit -o fetched.bit
+tools/m65j.py downloads-get download-00.dat -o fetched.dat
 tools/m65j.py mirror stable sdcard/cores --board all --overwrite --bless --yes
 tools/m65j.py populate stable --board all --overwrite --yes
 ```
@@ -379,11 +380,14 @@ GET /identity    returns r3:name, r6:name, or r0:name
 release tag such as `stable`, `unstable`, or `nightly` as the first positional
 argument; if the tag is omitted, `stable` is used. It canonicalises core
 filenames by stripping version/date/build tokens, and writes a matching
-`<tag>-r3.sha256` and/or `<tag>-r6.sha256` manifest. Each non-comment manifest line is
-`<sha256>  <relative-filename>`, with hashes over the unsigned payload bytes so
-re-signing does not create false updates. `mirror --bless` signs both the core
-files and every manifest. `populate` does the same staging work and then PUTs the
-manifest-listed files and signed manifests to the board SD card over HTTP.
+`<tag>-r3.sha256` and/or `<tag>-r6.sha256` manifest. Each non-comment manifest
+line is `<payload-sha256> <transfer-sha256>  <relative-filename>`. The payload
+hash is over the bytes stored on SD after signature stripping, so re-signing
+does not create false updates. The transfer hash is over the exact HTTP object,
+including the signature trailer. `mirror --bless` signs both the core files and
+every manifest. Autofetch requires signed manifests and signed core transfers.
+`populate` does the same staging work and then PUTs the manifest-listed files
+and signed manifests to the board SD card over HTTP.
 
 `check` prints `[blessed]`, `[uncursed]`, or `[cursed]` for local files. A
 blessed file has a valid trailer according to the local keys, `--trusted-key`,
@@ -401,8 +405,12 @@ filehost_password=secret
 ```
 
 Firmware-side fetch support remains deliberately small:
-`AT+FETCH=<http://url> <name>` fetches one explicit HTTP URL into
-`DOWNLOADS/<name>`. For unattended updates, set `fetch_base_url`,
+`AT+FETCH=<http://url> [NN]` queues one explicit HTTP URL into a fixed
+`DOWNLOADS/download-NN.dat` slot, auto-selecting `NN` when omitted. Arbitrary
+URL fetches cannot write over `mega65-jtag.cfg`, manifests, or `WWW/` content,
+and responses over 1 GiB are rejected. Use `AT+DOWNLOADSTATUS?` to check the
+queue and `AT+DOWNLOADREAD=<name>` to stream a downloaded file over UART.
+For unattended updates, set `fetch_base_url`,
 `fetch_channel`, `fetch_board=3|6`, and `autofetch=1` in `mega65-jtag.cfg`.
 For channel `stable` and board `6`, the firmware fetches
 `stable-r6.sha256`, verifies the signed manifest first, then fetches only
@@ -433,7 +441,8 @@ without touching the SD card during a fetch.
 Useful commands:
 
 ```text
-AT+FETCH=<http://url> <name>       fetch to DOWNLOADS/<name>
+AT+FETCH=<http://url> [NN]         queue fetch to DOWNLOADS/download-NN.dat
+AT+DOWNLOADSTATUS?                 show queued URL download status
 AT+DOWNLOADREAD=<name>             read DOWNLOADS/<name>
 AT+FETCHSTATUS?                    show mirror fetch status
 AT+FETCHNOW[=3|6|remote]           start mirror fetch immediately
@@ -451,3 +460,7 @@ trusted_key=p256:04...
 When signatures are required, unsigned or badly signed uploads/fetches are
 deleted instead of being committed. `PUT /jtag` spools signed transfers to SD,
 verifies them, and only then programs JTAG.
+
+Future OTA firmware update support is intentionally not implemented yet. The
+current recovery/update path is the Pico BOOTSEL flow: connect USB, press the
+BOOTSEL button, and copy `mega65-pico-jtag.uf2`.

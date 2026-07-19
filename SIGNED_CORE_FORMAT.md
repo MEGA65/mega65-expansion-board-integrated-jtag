@@ -72,6 +72,24 @@ both check against `game.bit`.
   signatures are required, `PUT /jtag` therefore spools to `DOWNLOADS/`, verifies
   the trailer, and only then programs the verified core file.
 
+## Mirror manifests
+
+Autofetch requires the channel manifest itself to be signed, regardless of the
+general `require_signatures` setting. The signed transfer is stored on SD as the
+manifest payload after the 256-byte trailer has been verified and stripped.
+
+Manifest lines use v2 format:
+
+```text
+<payload-sha256> <transfer-sha256>  <relative-filename>
+```
+
+`payload-sha256` hashes the final SD-card file after the signature trailer has
+been removed. `transfer-sha256` hashes the exact HTTP object, including its
+signature trailer. The firmware rejects old one-hash manifests, unsigned
+manifests, bad signatures, transfer hash mismatches, payload hash mismatches,
+and manifest entries outside normal core file paths.
+
 ## Host signing utility
 
 List local public keys and the matching config lines:
