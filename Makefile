@@ -53,6 +53,10 @@ FACTORY_BOOTLOADER_BIN := $(FACTORY_BUILD_DIR)/m65_factory_bootloader.bin
 UPLOAD_UF2 ?= $(FACTORY_UF2)
 M65_BOOTLOADER_SLOT0_OFFSET ?= 0x10000
 M65_BOOTLOADER_SLOT_SIZE ?= 0xF0000
+M65_BOOT_DIAG ?= 0
+M65_FACTORY_BOOT_DIAG ?= 1
+M65_BOOT_DIAG_UART_BAUD ?= 115200
+M65_BOOT_DIAG_PIN ?=
 
 ifeq ($(USE_FATFS),1)
 CMAKE_FATFS_ARGS := -DM65_USE_FATFS=ON \
@@ -67,6 +71,12 @@ endif
 CMAKE_REMOTE_ARGS := -DM65_ENABLE_WIFI_REMOTE=$(if $(filter 1 ON on true TRUE yes YES,$(ENABLE_WIFI_REMOTE)),ON,OFF)
 CMAKE_SD_MODE_ARGS := $(if $(strip $(M65_SD_MODE)),-DM65_SD_MODE=$(M65_SD_MODE),)
 CMAKE_PICOTOOL_ARGS := $(if $(strip $(PICOTOOL_FETCH_FROM_GIT_PATH)),-DPICOTOOL_FETCH_FROM_GIT_PATH=$(PICOTOOL_FETCH_FROM_GIT_PATH),)
+CMAKE_BOOT_DIAG_ARGS := -DM65_BOOT_DIAG=$(if $(filter 1 ON on true TRUE yes YES,$(M65_BOOT_DIAG)),ON,OFF) \
+                         -DM65_BOOT_DIAG_UART_BAUD=$(M65_BOOT_DIAG_UART_BAUD) \
+                         $(if $(strip $(M65_BOOT_DIAG_PIN)),-DM65_BOOT_DIAG_PIN=$(M65_BOOT_DIAG_PIN),)
+CMAKE_FACTORY_BOOT_DIAG_ARGS := -DM65_BOOT_DIAG=$(if $(filter 1 ON on true TRUE yes YES,$(M65_FACTORY_BOOT_DIAG)),ON,OFF) \
+                                 -DM65_BOOT_DIAG_UART_BAUD=$(M65_BOOT_DIAG_UART_BAUD) \
+                                 $(if $(strip $(M65_BOOT_DIAG_PIN)),-DM65_BOOT_DIAG_PIN=$(M65_BOOT_DIAG_PIN),)
 
 .PHONY: all help deps check-tools sdk fatfs configure configure-factory build build-bare factory nofatfs clean distclean nuke \
         upload flash upload-picotool upload-uf2 picotool print-config terminal \
@@ -107,6 +117,9 @@ help:
 	@echo "  FACTORY_BUILD_DIR=...  Override relocated factory-app build directory"
 	@echo "  ENABLE_WIFI_REMOTE=1   Default. Set 0 for non-WiFi builds"
 	@echo "  M65_SD_MODE=...        Optional: M65_SD_MODE_AUTO, M65_SD_MODE_HW_SPI, M65_SD_MODE_SCHEMATIC_BITBANG"
+	@echo "  M65_FACTORY_BOOT_DIAG=1 Default. Factory image prints early UART0 boot breadcrumbs"
+	@echo "  M65_BOOT_DIAG_UART_BAUD=115200 Early boot diagnostic UART baud"
+	@echo "  M65_BOOT_DIAG_PIN=...  Optional GPIO for early boot LED pulse codes"
 	@echo "  UPLOAD_UF2=...         Override upload artifact; default factory UF2"
 	@echo "  MIRROR_CHANNEL=stable  Mirror release channel/manifest prefix"
 	@echo "  MIRROR_BOARD=all       Mirror board filter: all means both r3 and r6"
@@ -171,6 +184,7 @@ configure: $(CONFIGURE_DEPS)
 		$(CMAKE_FATFS_ARGS) \
 		$(CMAKE_REMOTE_ARGS) \
 		$(CMAKE_SD_MODE_ARGS) \
+		$(CMAKE_BOOT_DIAG_ARGS) \
 		$(CMAKE_PICOTOOL_ARGS)
 
 build: build-bare factory
@@ -191,6 +205,7 @@ configure-factory: $(CONFIGURE_DEPS)
 		$(CMAKE_FATFS_ARGS) \
 		$(CMAKE_REMOTE_ARGS) \
 		$(CMAKE_SD_MODE_ARGS) \
+		$(CMAKE_FACTORY_BOOT_DIAG_ARGS) \
 		$(CMAKE_PICOTOOL_ARGS) \
 		-DM65_BOOTLOADER_APP=ON \
 		-DM65_BUILD_FACTORY_BOOTLOADER=ON \
@@ -428,6 +443,10 @@ print-config:
 	@echo "FATFS_PATH=$(FATFS_PATH)"
 	@echo "ENABLE_WIFI_REMOTE=$(ENABLE_WIFI_REMOTE)"
 	@echo "M65_SD_MODE=$(M65_SD_MODE)"
+	@echo "M65_BOOT_DIAG=$(M65_BOOT_DIAG)"
+	@echo "M65_FACTORY_BOOT_DIAG=$(M65_FACTORY_BOOT_DIAG)"
+	@echo "M65_BOOT_DIAG_UART_BAUD=$(M65_BOOT_DIAG_UART_BAUD)"
+	@echo "M65_BOOT_DIAG_PIN=$(M65_BOOT_DIAG_PIN)"
 	@echo "UF2=$(UF2)"
 	@echo "FACTORY_BUILD_DIR=$(FACTORY_BUILD_DIR)"
 	@echo "FACTORY_UF2=$(FACTORY_UF2)"

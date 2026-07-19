@@ -44,8 +44,11 @@ option(M65_HAVE_SD_INIT_DRIVER "Call sd_init_driver() before f_mount(); usually 
 option(M65_ENABLE_WIFI_REMOTE "Build Pico W WiFi remote-delivery support" OFF)
 option(M65_BOOTLOADER_APP "Link firmware to run from resident bootloader slot 0" OFF)
 option(M65_BUILD_FACTORY_BOOTLOADER "Build the resident factory bootloader target" OFF)
+option(M65_BOOT_DIAG "Enable early boot diagnostic breadcrumbs on UART0 and optional LED GPIO" OFF)
 set(M65_BOOTLOADER_SLOT0_OFFSET "0x10000" CACHE STRING "Resident bootloader slot 0 flash offset")
 set(M65_BOOTLOADER_SLOT_SIZE "0xF0000" CACHE STRING "Resident bootloader application slot size")
+set(M65_BOOT_DIAG_UART_BAUD "115200" CACHE STRING "UART baud for early boot diagnostics")
+set(M65_BOOT_DIAG_PIN "" CACHE STRING "Optional early boot diagnostic GPIO LED pin; empty uses board default when available")
 set(M65_SD_MODE "" CACHE STRING "Optional compile-time SD mode override: M65_SD_MODE_AUTO, M65_SD_MODE_HW_SPI, or M65_SD_MODE_SCHEMATIC_BITBANG")
 set(FATFS_SD_SPI_PATH "${CMAKE_CURRENT_LIST_DIR}/third_party/no-OS-FatFS-SD-SPI-RPi-Pico" CACHE PATH "Path to no-OS-FatFS-SD-SPI-RPi-Pico repository")
 
@@ -81,6 +84,15 @@ target_compile_definitions(pico_m65jtag PRIVATE
     PICO_STDIO_USB_STDOUT_TIMEOUT_US=10000
     PICO_STDIO_DEADLOCK_TIMEOUT_MS=10
 )
+if(M65_BOOT_DIAG)
+    target_compile_definitions(pico_m65jtag PRIVATE
+        M65_BOOT_DIAG=1
+        M65_BOOT_DIAG_UART_BAUD=${M65_BOOT_DIAG_UART_BAUD}
+    )
+endif()
+if(M65_BOOT_DIAG_PIN)
+    target_compile_definitions(pico_m65jtag PRIVATE M65_BOOT_DIAG_PIN=${M65_BOOT_DIAG_PIN})
+endif()
 if(M65_SD_MODE)
     target_compile_definitions(pico_m65jtag PRIVATE M65_SD_MODE=${M65_SD_MODE})
 endif()
@@ -202,8 +214,19 @@ if(M65_BUILD_FACTORY_BOOTLOADER)
         M65_BOOTLOADER_SLOT0_OFFSET=${M65_BOOTLOADER_SLOT0_OFFSET}
         M65_BOOTLOADER_SLOT_SIZE=${M65_BOOTLOADER_SLOT_SIZE}
     )
+    if(M65_BOOT_DIAG)
+        target_compile_definitions(m65_factory_bootloader PRIVATE
+            M65_BOOT_DIAG=1
+            M65_BOOT_DIAG_UART_BAUD=${M65_BOOT_DIAG_UART_BAUD}
+        )
+    endif()
+    if(M65_BOOT_DIAG_PIN)
+        target_compile_definitions(m65_factory_bootloader PRIVATE M65_BOOT_DIAG_PIN=${M65_BOOT_DIAG_PIN})
+    endif()
     target_link_libraries(m65_factory_bootloader
         pico_stdlib
+        hardware_gpio
+        hardware_uart
         hardware_watchdog
     )
     pico_enable_stdio_usb(m65_factory_bootloader 0)

@@ -19,6 +19,18 @@
 // CMake enables pico_stdio_usb(); this switch controls the command parser use.
 #define M65_ENABLE_USB_CDC   1
 
+// Early boot diagnostics are normally quiet. Factory builds enable this from
+// CMake while we are bringing up the resident bootloader path. Diagnostics go
+// to the hardware command UART immediately; LED pulses require a real RP2040
+// GPIO LED pin. Pico W's onboard LED is on the CYW43 chip, so it is not usable
+// by the tiny bootloader.
+#ifndef M65_BOOT_DIAG
+#define M65_BOOT_DIAG 0
+#endif
+#ifndef M65_BOOT_DIAG_UART_BAUD
+#define M65_BOOT_DIAG_UART_BAUD 115200u
+#endif
+
 // The modem command surface is AT-style by default. Set this to 1 only when
 // you need the early bring-up one-letter protocol (`V`, `L`, `P`, etc.).
 #ifndef M65_ENABLE_LEGACY_UART_COMMANDS
@@ -112,6 +124,10 @@
 #else
 #define M65_LED_PIN          255u
 #endif
+#endif
+
+#ifndef M65_BOOT_DIAG_PIN
+#define M65_BOOT_DIAG_PIN    M65_LED_PIN
 #endif
 
 // Conservative default. Set to 0 for fastest CPU bit-bang.

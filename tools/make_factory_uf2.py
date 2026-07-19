@@ -19,23 +19,9 @@ def parse_int(s: str) -> int:
     return int(s, 0)
 
 
-def add_region(regions: list[tuple[int, bytes, str]], addr: int, data: bytes, name: str) -> None:
-    if not data:
-        raise SystemExit(f"{name}: empty input")
-    end = addr + len(data)
-    for other_addr, other_data, other_name in regions:
-        other_end = other_addr + len(other_data)
-        if addr < other_end and other_addr < end:
-            raise SystemExit(
-                f"{name} at 0x{addr:08x}..0x{end:08x} overlaps "
-                f"{other_name} at 0x{other_addr:08x}..0x{other_end:08x}"
-            )
-    regions.append((addr, data, name))
-
-
-def iter_blocks(regions: list[tuple[int, bytes, str]]) -> list[tuple[int, bytes]]:
+def iter_blocks(regions: list[tuple[int, bytes]]) -> list[tuple[int, bytes]]:
     blocks: list[tuple[int, bytes]] = []
-    for base, data, _name in sorted(regions):
+    for base, data in sorted(regions):
         for off in range(0, len(data), BLOCK_PAYLOAD):
             chunk = data[off:off + BLOCK_PAYLOAD]
             blocks.append((base + off, chunk))
@@ -84,15 +70,29 @@ def main(argv: list[str] | None = None) -> int:
     if len(app) > args.app_size:
         raise SystemExit(f"app is {len(app)} bytes, exceeds slot size {args.app_size} bytes")
 
-    regions: list[tuple[int, bytes, str]] = []
-    add_region(regions, XIP_BASE + args.bootloader_offset, bootloader, "bootloader")
-    add_region(regions, XIP_BASE + args.app_offset, app, "app")
+    if args.bootloader_offset != 0:
+        raise SystemExit("factory UF2 currently expects bootloader-offset=0")
+    if args.app_offset < len(bootloader):
+        raise SystemExit(
+            f"app offset 0x{args.app_offset:x} overlaps bootloader length 0x{len(bootloader):x}"
+        )
+
+    # Keep this UF2 contiguous from flash base through the app. The RP2040 ROM
+    # UF2 loader should handle sparse address ranges, but contiguous blocks are
+    # easier to reason about and avoid host/bootloader edge cases during the
+    # first factory install.
+    image = bytearray(args.app_offset + len(app))
+    image[:] = b"\xff" * len(image)
+    image[:len(bootloader)] = bootloader
+    image[args.app_offset:args.app_offset + len(app)] = app
+
+    regions: list[tuple[int, bytes]] = [(XIP_BASE, bytes(image))]
     blocks = iter_blocks(regions)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     write_uf2(args.output, blocks, UF2_FAMILY_RP2040)
     print(
         f"Wrote {args.output}: bootloader={len(bootloader)} bytes "
-        f"app={len(app)} bytes blocks={len(blocks)}"
+        f"pad={args.app_offset - len(bootloader)} bytes app={len(app)} bytes blocks={len(blocks)}"
     )
     return 0
 

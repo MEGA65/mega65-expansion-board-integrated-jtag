@@ -204,6 +204,51 @@ static void activity_led_put(bool on)
 #endif
 }
 
+static void boot_diag_pin_init(void)
+{
+#if M65_BOOT_DIAG && M65_BOOT_DIAG_PIN != 255
+    gpio_init(M65_BOOT_DIAG_PIN);
+    gpio_set_dir(M65_BOOT_DIAG_PIN, GPIO_OUT);
+    gpio_put(M65_BOOT_DIAG_PIN, 0);
+#endif
+}
+
+static void boot_diag_uart_init(void)
+{
+#if M65_BOOT_DIAG
+    uart_init(M65_UART_ID, M65_BOOT_DIAG_UART_BAUD);
+    gpio_set_function(M65_UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(M65_UART_RX_PIN, GPIO_FUNC_UART);
+    uart_set_format(M65_UART_ID, 8, 1, UART_PARITY_NONE);
+    uart_set_hw_flow(M65_UART_ID, false, false);
+    uart_set_fifo_enabled(M65_UART_ID, true);
+#endif
+}
+
+static void boot_diag_stage(unsigned stage, const char *label)
+{
+#if M65_BOOT_DIAG
+    uart_puts(M65_UART_ID, "M65APP ");
+    uart_putc_raw(M65_UART_ID, (char)('0' + (stage % 10u)));
+    uart_puts(M65_UART_ID, " ");
+    uart_puts(M65_UART_ID, label);
+    uart_puts(M65_UART_ID, "\r\n");
+    uart_tx_wait_blocking(M65_UART_ID);
+#if M65_BOOT_DIAG_PIN != 255
+    for (unsigned i = 0; i < stage; i++) {
+        gpio_put(M65_BOOT_DIAG_PIN, 1);
+        sleep_ms(70);
+        gpio_put(M65_BOOT_DIAG_PIN, 0);
+        sleep_ms(90);
+    }
+    sleep_ms(180);
+#endif
+#else
+    (void)stage;
+    (void)label;
+#endif
+}
+
 static bool write_command_source_allowed(void)
 {
 #if M65_WRITE_COMMANDS_USB_ONLY
@@ -2034,17 +2079,39 @@ static void dispatch(char *line)
 
 int main(void)
 {
+#if M65_BOOT_DIAG
+    boot_diag_uart_init();
+    boot_diag_pin_init();
+    boot_diag_stage(1, "main-enter");
+#endif
+
     machine_identity_init_defaults();
+    boot_diag_stage(2, "identity-defaults");
+
     stdio_init_all();
+    boot_diag_stage(3, "stdio-init");
+
     sleep_ms(200);
 
     activity_led_init();
+    boot_diag_stage(4, "activity-led");
 
     write_gate_init();
-    uart_cmd_init();
+    boot_diag_stage(5, "writegate");
+
     jtag_gpio_init();
+    boot_diag_stage(6, "jtag-init");
+
+    boot_diag_stage(7, "sd-probe-start");
     storage_sd_probe();
+    boot_diag_stage(8, "sd-probe-done");
+
+    boot_diag_stage(9, "remote-boot-check-start");
     remote_http_boot_check();
+    boot_diag_stage(0, "remote-boot-check-done");
+
+    boot_diag_stage(1, "switching-uart-to-2000000");
+    uart_cmd_init();
 
     uart_cmd_printf("OK BOOT %s\n", M65_VERSION_STRING);
     uart_cmd_printf("OK SD %s\n", storage_sd_transport_name());
