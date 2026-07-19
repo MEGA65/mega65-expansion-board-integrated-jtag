@@ -137,8 +137,9 @@
 
 #define M65_FIRMWARE_PACKAGE_PATH "DOWNLOADS/mega65-integrated-jtag-firmware.uf2"
 #define M65_FIRMWARE_INFO_PATH    "DOWNLOADS/mega65-integrated-jtag-firmware.info"
-#define M65_THEME_PACKAGE_PATH    "DOWNLOADS/mega65-jtag-theme.m65jtheme"
-#define M65_THEME_INFO_PATH       "DOWNLOADS/mega65-jtag-theme.info"
+#define M65_THEME_DIR_PATH        "THEMES"
+#define M65_THEME_PACKAGE_PATH    "THEMES/mega65-jtag-theme.m65jtheme"
+#define M65_THEME_INFO_PATH       "THEMES/mega65-jtag-theme.info"
 
 // Full MCUboot slot/swap support is a follow-up integration step. Until that
 // bootloader is present, firmware packages can be downloaded and verified but

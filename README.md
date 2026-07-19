@@ -387,16 +387,23 @@ GET /identity    returns r3:name, r6:name, or r0:name
 ```
 
 `make mirror` is the one-command host setup path. It builds
-`build-wifi/mega65-pico-jtag.uf2`, packs the current `sdcard/WWW/` content into
-`mirror/mega65-jtag-default-theme.m65jtheme`, then runs `m65j.py mirror` so the
-cores, firmware, theme package, and signed manifests are all in `mirror/` ready
-for `python3 -m http.server --directory mirror`.
+`build-wifi/mega65-pico-jtag.uf2`, copies the default `sdcard/WWW/` files and a
+`mega65-jtag.cfg.example` into `mirror/`, packs the same web files into
+`mirror/THEMES/mega65-jtag-default-theme.m65jtheme`, then runs `m65j.py mirror`
+so the cores, firmware packages, theme packages, signed manifests, and a static
+`mirror/index.html` landing page are all ready for
+`python3 -m http.server --directory mirror`.
 
 By default it uses `MIRROR_CHANNEL=stable`, `MIRROR_BOARD=all`,
 `MIRROR_SOURCE_URL=https://files.mega65.org`, `MIRROR_DIR=mirror`, and
 `MIRROR_FIRMWARE=build-wifi/mega65-pico-jtag.uf2`.
 `MIRROR_BOARD=all` emits both `stable-r3.sha256` and `stable-r6.sha256`, with
 the firmware and theme package entries included in both manifests.
+The mirror root also contains a plain `mega65-pico-jtag.uf2` for initial
+BOOTSEL installs; the signed OTA artifact remains
+`mega65-integrated-jtag-firmware.uf2`.
+Set `MIRROR_EXTRA_THEMES="path/to/other.m65jtheme path/to/other.tar"` to publish
+additional selectable theme packages under `mirror/THEMES/`.
 
 Override the defaults with Make variables, for example:
 
@@ -414,7 +421,7 @@ manifest line is typed:
 ```text
 core <payload-sha256> <transfer-sha256>  <relative-filename>
 firmware <payload-sha256> <transfer-sha256>  mega65-integrated-jtag-firmware.uf2 version=... build=...
-theme <payload-sha256> <transfer-sha256>  mega65-jtag-theme.m65jtheme name=... version=...
+theme <payload-sha256> <transfer-sha256>  THEMES/mega65-jtag-default-theme.m65jtheme name=... version=...
 ```
 
 For cores, the payload hash is over the bytes stored on SD after signature
@@ -426,6 +433,10 @@ checks use the transfer hash and actuation re-verifies the stored object.
 Autofetch requires signed manifests and signed core/firmware/theme transfers.
 `populate` does the same staging work and then PUTs the manifest-listed files
 and signed manifests to the board SD card over HTTP.
+
+Fetched theme packages are stored under `THEMES/`. In the device web UI,
+`THEMES/` is shown as a normal directory; clicking a `.m65jtheme` or `.tar`
+package verifies it and installs it into `WWW/`, subject to the write grant.
 
 `check` prints `[blessed]`, `[uncursed]`, or `[cursed]` for local files. A
 blessed file has a valid trailer according to the local keys, `--trusted-key`,

@@ -28,3 +28,4 @@ const char *remote_http_firmware_status(void);
 bool remote_http_firmware_update(char *err, size_t err_len);
 const char *remote_http_theme_status(void);
 bool remote_http_theme_install(char *err, size_t err_len);
+bool remote_http_theme_install_named(const char *theme_name, char *err, size_t err_len);

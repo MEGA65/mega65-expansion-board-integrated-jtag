@@ -27,8 +27,9 @@ MIRROR_BOARD ?= all
 MIRROR_SOURCE_URL ?= https://files.mega65.org
 MIRROR_EXTRA_CORES ?= $(wildcard extra_cores)
 MIRROR_FIRMWARE ?= $(UF2)
-MIRROR_THEME ?= $(MIRROR_DIR)/mega65-jtag-default-theme.m65jtheme
+MIRROR_THEME ?= $(MIRROR_DIR)/THEMES/mega65-jtag-default-theme.m65jtheme
 MIRROR_THEME_NAME ?= default
+MIRROR_EXTRA_THEMES ?=
 MIRROR_VERSION ?= v0.1
 WWW_THEME_FILES := app.js favicon-32x32.png fetch_busy.html index_bottom.html index_row.html index_top.html mega65_320x64.png style.css
 
@@ -102,6 +103,7 @@ help:
 	@echo "  MIRROR_SOURCE_URL=...  Source catalogue URL for make mirror"
 	@echo "  MIRROR_EXTRA_CORES=... Extra local .bit/.cor/.m65j files/dirs; default extra_cores/ if present"
 	@echo "  MIRROR_FIRMWARE=...    Firmware image staged into mirror; default built UF2"
+	@echo "  MIRROR_EXTRA_THEMES=... Extra local .m65jtheme/.tar files to publish under THEMES/"
 	@echo "  PICO_MOUNT=...         Mount point for upload-uf2, if autodetect fails"
 	@echo
 	@echo "Examples:"
@@ -173,6 +175,12 @@ build: configure
 mirror: build
 	@set -e; \
 	mkdir -p "$(MIRROR_DIR)"; \
+	mkdir -p "$(MIRROR_DIR)/WWW" "$(dir $(MIRROR_THEME))"; \
+	echo "Copying default SD web assets into $(MIRROR_DIR)/WWW"; \
+	for asset in $(WWW_THEME_FILES); do \
+		cp "sdcard/WWW/$$asset" "$(MIRROR_DIR)/WWW/$$asset"; \
+	done; \
+	cp sdcard/mega65-jtag.cfg "$(MIRROR_DIR)/mega65-jtag.cfg.example"; \
 	echo "Packing default WWW theme: $(MIRROR_THEME)"; \
 	tar -cf "$(MIRROR_THEME)" -C sdcard/WWW $(WWW_THEME_FILES); \
 	build_marker="$$(sed -n 's/^#define M65_BUILD_MARKER "\(.*\)"/\1/p' "$(BUILD_DIR)/generated/generated_version.h")"; \
@@ -188,6 +196,14 @@ mirror: build
 			extra_args+=(--extra-core "$$extra"); \
 		done; \
 	fi; \
+	theme_args=(); \
+	theme_items="$(strip $(MIRROR_EXTRA_THEMES))"; \
+	if [ -n "$$theme_items" ]; then \
+		echo "Including extra local themes: $$theme_items"; \
+		for theme in $$theme_items; do \
+			theme_args+=(--theme "$$theme"); \
+		done; \
+	fi; \
 	echo "Staging firmware image: $(MIRROR_FIRMWARE)"; \
 	echo "Preparing $(MIRROR_CHANNEL) mirror in $(MIRROR_DIR) for board(s) $(MIRROR_BOARD) with firmware build $$build_marker"; \
 	python3 tools/m65j.py mirror \
@@ -201,6 +217,7 @@ mirror: build
 		--theme "$(MIRROR_THEME)" \
 		--theme-name "$(MIRROR_THEME_NAME)" \
 		--theme-version "$$build_marker" \
+		"$${theme_args[@]}" \
 		"$${extra_args[@]}" \
 		"$(MIRROR_CHANNEL)" "$(MIRROR_DIR)" "$(MIRROR_SOURCE_URL)"
 

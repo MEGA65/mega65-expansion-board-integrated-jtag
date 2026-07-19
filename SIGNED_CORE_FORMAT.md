@@ -86,7 +86,7 @@ Manifest lines use v3 typed format:
 ```text
 core <payload-sha256> <transfer-sha256>  <relative-filename>
 firmware <payload-sha256> <transfer-sha256>  mega65-integrated-jtag-firmware.uf2 version=... build=...
-theme <payload-sha256> <transfer-sha256>  mega65-jtag-theme.m65jtheme name=... version=...
+theme <payload-sha256> <transfer-sha256>  THEMES/mega65-jtag-default-theme.m65jtheme name=... version=...
 ```
 
 For `core` rows, `payload-sha256` hashes the final SD-card file after the
@@ -98,10 +98,10 @@ signatures, transfer hash mismatches, stored-file hash mismatches, and manifest
 entries outside the allowed typed paths.
 
 Firmware rows always download to `DOWNLOADS/mega65-integrated-jtag-firmware.uf2`.
-Theme rows always download to `DOWNLOADS/mega65-jtag-theme.m65jtheme`. The
-source URL path is freely named in the mirror, but the on-device destination is
-fixed to prevent a mirror from overwriting config, manifests, or arbitrary web
-assets.
+Theme rows download to `THEMES/<basename>.m65jtheme` or `THEMES/<basename>.tar`.
+The firmware ignores directory components in theme manifest paths and keeps only
+the safe basename under `THEMES/`, so a mirror cannot overwrite config,
+manifests, or arbitrary web assets.
 
 ## Host signing utility
 

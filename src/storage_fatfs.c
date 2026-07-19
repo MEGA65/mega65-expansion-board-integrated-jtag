@@ -229,6 +229,24 @@ static bool has_core_ext(const char *name)
            (e1 == 'm' && e2 == '6' && e3 == '5' && e4 == 'j' && e5 == 0);
 }
 
+static bool ext_equal_ci_local(const char *a, const char *b)
+{
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static bool has_theme_ext(const char *name)
+{
+    const char *dot = strrchr(name ? name : "", '.');
+    if (!dot) return false;
+    return ext_equal_ci_local(dot, ".m65jtheme") || ext_equal_ci_local(dot, ".tar");
+}
+
 static bool has_partial_core_ext(const char *name)
 {
     size_t n = strlen(name ? name : "");
@@ -277,13 +295,17 @@ static bool storage_list_filtered(const char *path, storage_list_cb_t cb, void *
     const char *p = (path && path[0]) ? path : "/";
     FRESULT fr = f_opendir(&dir, p);
     if (fr != FR_OK) { set_err("f_opendir", fr); return false; }
+    bool in_theme_dir = ext_equal_ci_local(p, M65_THEME_DIR_PATH) ||
+                        (p[0] == '/' && ext_equal_ci_local(p + 1, M65_THEME_DIR_PATH));
 
     for (;;) {
         fr = f_readdir(&dir, &fi);
         if (fr != FR_OK) { set_err("f_readdir", fr); f_closedir(&dir); return false; }
         if (fi.fname[0] == 0) break;
         bool is_dir = (fi.fattrib & AM_DIR) != 0;
-        if (!cores_only || is_dir || has_core_ext(fi.fname) || has_partial_core_ext(fi.fname)) {
+        if (!cores_only || is_dir || has_core_ext(fi.fname) ||
+            (in_theme_dir && has_theme_ext(fi.fname)) ||
+            has_partial_core_ext(fi.fname)) {
             cb(fi.fname, (uint32_t)fi.fsize, is_dir, ctx);
         }
     }

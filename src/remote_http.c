@@ -157,6 +157,12 @@ bool remote_http_theme_install(char *err, size_t err_len)
     if (err && err_len) snprintf(err, err_len, "wifi/SD theme support is not built");
     return false;
 }
+bool remote_http_theme_install_named(const char *theme_name, char *err, size_t err_len)
+{
+    (void)theme_name;
+    if (err && err_len) snprintf(err, err_len, "wifi/SD theme support is not built");
+    return false;
+}
 
 #else
 
@@ -335,6 +341,7 @@ static int find_header_end(const char *buf, size_t len, size_t *end_len);
 static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms);
 static bool autofetch_start_manifest(uint8_t board_rev);
 static void close_http_listener(void);
+static bool ensure_parent_dirs(const char *path);
 static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len);
 static err_t http_poll_cb(void *arg, struct tcp_pcb *pcb);
 static void html_escape(const char *in, char *out, size_t out_len);
@@ -714,10 +721,45 @@ static bool parse_manifest_kind(const char *s, manifest_kind_t *kind)
     return false;
 }
 
+static const char *path_basename_const(const char *path)
+{
+    const char *base = path ? strrchr(path, '/') : NULL;
+    return base ? base + 1 : path;
+}
+
+static bool safe_theme_package_name(const char *name)
+{
+    if (!name || !name[0]) return false;
+    size_t n = strlen(name);
+    if (n > 180) return false;
+    if (strchr(name, '/') || strchr(name, '\\') || strchr(name, ':') ||
+        strchr(name, '*') || strchr(name, '?')) {
+        return false;
+    }
+    if (strstr(name, "..")) return false;
+    return has_theme_ext(name);
+}
+
+static bool make_theme_package_path_from_name(const char *name, char *out, size_t out_len)
+{
+    if (!safe_theme_package_name(name)) return false;
+    return snprintf(out, out_len, "%s/%s", M65_THEME_DIR_PATH, name) < (int)out_len;
+}
+
+static bool make_theme_package_path_from_rel(const char *rel, char *out, size_t out_len)
+{
+    const char *base = path_basename_const(rel);
+    return make_theme_package_path_from_name(base, out, out_len);
+}
+
 static const char *manifest_final_path(manifest_kind_t kind, const char *rel)
 {
     if (kind == MANIFEST_KIND_FIRMWARE) return M65_FIRMWARE_PACKAGE_PATH;
-    if (kind == MANIFEST_KIND_THEME) return M65_THEME_PACKAGE_PATH;
+    if (kind == MANIFEST_KIND_THEME) {
+        static char theme_path[256];
+        if (make_theme_package_path_from_rel(rel, theme_path, sizeof theme_path)) return theme_path;
+        return M65_THEME_PACKAGE_PATH;
+    }
     return rel;
 }
 
@@ -1599,9 +1641,30 @@ static bool firmware_update_available(void)
     return true;
 }
 
+typedef struct {
+    char first[192];
+    uint32_t count;
+} theme_scan_ctx_t;
+
+static void theme_scan_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+{
+    (void)size;
+    theme_scan_ctx_t *ts = (theme_scan_ctx_t *)ctx;
+    if (!ts || is_dir || !safe_theme_package_name(name)) return;
+    if (!ts->first[0]) snprintf(ts->first, sizeof ts->first, "%s", name);
+    ts->count++;
+}
+
+static uint32_t theme_scan(theme_scan_ctx_t *out)
+{
+    theme_scan_ctx_t ts = {0};
+    (void)storage_list_dir(M65_THEME_DIR_PATH, theme_scan_cb, &ts);
+    if (out) *out = ts;
+    return ts.count;
+}
+
 static bool theme_update_available(void)
 {
-    if (!storage_file_exists(M65_THEME_PACKAGE_PATH)) return false;
     if (!pending_theme_seen) {
         load_pending_info_file(M65_THEME_INFO_PATH,
                                pending_theme_name, sizeof pending_theme_name, "name",
@@ -1609,7 +1672,57 @@ static bool theme_update_available(void)
                                pending_theme_source, sizeof pending_theme_source);
         pending_theme_seen = pending_theme_name[0] || pending_theme_version[0] || pending_theme_source[0];
     }
-    return true;
+    return theme_scan(NULL) > 0;
+}
+
+static bool theme_package_exists_by_name(const char *name, char *path, size_t path_len)
+{
+    if (!safe_theme_package_name(name)) return false;
+    char candidate[256];
+    if (make_theme_package_path_from_name(name, candidate, sizeof candidate) &&
+        storage_file_exists(candidate)) {
+        if (path && path_len) snprintf(path, path_len, "%s", candidate);
+        return true;
+    }
+    const char *legacy = path_basename_const(M65_THEME_PACKAGE_PATH);
+    if (legacy && ci_equal(name, legacy) && storage_file_exists(M65_THEME_PACKAGE_PATH)) {
+        if (path && path_len) snprintf(path, path_len, "%s", M65_THEME_PACKAGE_PATH);
+        return true;
+    }
+    return false;
+}
+
+static bool select_theme_package(const char *requested, char *path, size_t path_len, char *name, size_t name_len)
+{
+    if (path && path_len) path[0] = 0;
+    if (name && name_len) name[0] = 0;
+
+    if (requested && requested[0]) {
+        if (!safe_theme_package_name(requested)) return false;
+        if (!theme_package_exists_by_name(requested, path, path_len)) return false;
+        if (name && name_len) snprintf(name, name_len, "%s", requested);
+        return true;
+    }
+
+    if (!pending_theme_seen) {
+        (void)theme_update_available();
+    }
+    if (pending_theme_source[0]) {
+        const char *base = path_basename_const(pending_theme_source);
+        if (base && theme_package_exists_by_name(base, path, path_len)) {
+            if (name && name_len) snprintf(name, name_len, "%s", base);
+            return true;
+        }
+    }
+
+    theme_scan_ctx_t scan;
+    if (theme_scan(&scan) && scan.first[0] &&
+        theme_package_exists_by_name(scan.first, path, path_len)) {
+        if (name && name_len) snprintf(name, name_len, "%s", scan.first);
+        return true;
+    }
+
+    return false;
 }
 
 static const char *autofetch_stage_name(void)
@@ -1709,9 +1822,12 @@ static void substitution_value(const char *name,
 {
     char escaped[256];
     char encoded[256];
+    char encoded_return[320];
     char js_name[256];
     char url[320];
     char tmp[300];
+    bool is_partial = !is_dir && is_partial_core_path(file_path);
+    bool is_theme = !is_dir && has_theme_ext(file_path);
     if (ci_equal(name, "WRITE_GRANT_STATUS")) {
         if (!http_cfg.require_write_grant) snprintf(out, out_len, "not-required");
         else snprintf(out, out_len, "%s", write_gate_active() ? "active" : "inactive");
@@ -1795,19 +1911,7 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "THEME_STATUS")) {
         html_escape(remote_http_theme_status(), out, out_len);
     } else if (ci_equal(name, "THEME_INSTALL_PANEL")) {
-        if (!theme_update_available()) {
-            snprintf(out, out_len, "");
-        } else {
-            char theme[80], version[80];
-            html_escape(pending_theme_name[0] ? pending_theme_name : "theme", theme, sizeof theme);
-            html_escape(pending_theme_version[0] ? pending_theme_version : "", version, sizeof version);
-            snprintf(out, out_len,
-                     "<section class=\"update-panel theme-update\"><strong>New web theme is available: %s%s%s</strong>"
-                     "<form method=\"get\" action=\"/theme/install\"><button type=\"submit\">Install theme</button></form></section>",
-                     theme,
-                     version[0] ? " " : "",
-                     version);
-        }
+        snprintf(out, out_len, "");
     } else if (ci_equal(name, "BOARD_REV")) {
         snprintf(out, out_len, "%lu", (unsigned long)board_rev);
     } else if (ci_equal(name, "BOARD_LABEL")) {
@@ -1835,17 +1939,22 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "FILENAME_JS")) {
         js_string_escape(file_name ? file_name : "", out, out_len);
     } else if (ci_equal(name, "TYPE")) {
-        snprintf(out, out_len, "%s", is_dir ? "DIR" : (is_partial_core_path(file_path) ? "PARTIAL" : "CORE"));
+        snprintf(out, out_len, "%s", is_dir ? "DIR" : (is_partial ? "PARTIAL" : (is_theme ? "THEME" : "CORE")));
     } else if (ci_equal(name, "SIZE")) {
         if (is_dir) snprintf(out, out_len, "-");
         else snprintf(out, out_len, "%lu", (unsigned long)size);
     } else if (ci_equal(name, "PRIMARY_LABEL")) {
-        snprintf(out, out_len, "%s", is_dir ? "Open" : (is_partial_core_path(file_path) ? "Downloading" : "Launch Core"));
+        snprintf(out, out_len, "%s", is_dir ? "Open" : (is_partial ? "Downloading" : (is_theme ? "Set Theme" : "Launch Core")));
     } else if (ci_equal(name, "PRIMARY_URL")) {
         if (is_dir) {
             make_index_url(file_path, board_rev, out, out_len);
-        } else if (is_partial_core_path(file_path)) {
+        } else if (is_partial) {
             snprintf(out, out_len, "#");
+        } else if (is_theme) {
+            url_encode(file_name ? file_name : "", encoded, sizeof encoded);
+            if (!make_index_url(dir_path, board_rev, url, sizeof url)) snprintf(url, sizeof url, "/index.html");
+            url_encode(url, encoded_return, sizeof encoded_return);
+            snprintf(out, out_len, "/theme/install?theme=%s&return=%s", encoded, encoded_return);
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
             if (board_rev == 3 || board_rev == 6) {
@@ -1857,7 +1966,7 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "FILE_URL")) {
         if (is_dir) {
             make_index_url(file_path, board_rev, out, out_len);
-        } else if (is_partial_core_path(file_path)) {
+        } else if (is_partial || is_theme) {
             snprintf(out, out_len, "#");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
@@ -1866,7 +1975,7 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "JTAG_URL")) {
         if (is_dir) {
             make_index_url(file_path, board_rev, out, out_len);
-        } else if (is_partial_core_path(file_path)) {
+        } else if (is_partial || is_theme) {
             snprintf(out, out_len, "#");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
@@ -1877,14 +1986,14 @@ static void substitution_value(const char *name,
             }
         }
     } else if (ci_equal(name, "DELETE_URL")) {
-        if (is_dir || is_partial_core_path(file_path)) {
+        if (is_dir || is_partial || is_theme) {
             snprintf(out, out_len, "#");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
             snprintf(out, out_len, "/delete?file=%s", encoded);
         }
     } else if (ci_equal(name, "ACTIONS")) {
-        if (is_dir || is_partial_core_path(file_path)) {
+        if (is_dir || is_partial || is_theme) {
             snprintf(out, out_len, "");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
@@ -1896,6 +2005,7 @@ static void substitution_value(const char *name,
         }
     } else if (ci_equal(name, "CORE_META")) {
         if (is_dir) snprintf(out, out_len, "");
+        else if (is_theme) snprintf(out, out_len, "Web interface theme package");
         else format_core_meta_html(file_path, file_name, out, out_len);
     } else if (ci_equal(name, "PATH")) {
         snprintf(out, out_len, "%s", file_path ? file_path : "");
@@ -2047,7 +2157,8 @@ static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
     if (!make_child_path(il->dir_path, name, full_path, sizeof full_path)) return;
 
     bool is_partial = !is_dir && is_partial_core_path(full_path);
-    if (!is_dir && !is_partial && (il->board_rev == 3 || il->board_rev == 6)) {
+    bool is_theme = !is_dir && has_theme_ext(full_path);
+    if (!is_dir && !is_partial && !is_theme && (il->board_rev == 3 || il->board_rev == 6)) {
         core_file_t cf;
         if (!core_open(&cf, full_path)) return;
         bool match = core_matches_board(&cf, full_path, il->board_rev);
@@ -2373,11 +2484,15 @@ static err_t send_theme_install(http_conn_t *c)
     if (!check_perm(c, REMOTE_AUTH_FILES)) {
         return send_error(c, 403, "Forbidden", "theme installs are not authorised");
     }
+    char theme[192];
+    const char *theme_arg = parse_query_value(c->target, "theme", theme, sizeof theme) ? theme : NULL;
     char err[128];
-    if (!remote_http_theme_install(err, sizeof err)) {
+    if (!remote_http_theme_install_named(theme_arg, err, sizeof err)) {
         return send_error(c, 400, "Bad Request", err[0] ? err : "theme install failed");
     }
-    return send_redirect(c, "/index.html");
+    char location[256];
+    jtag_return_target(c, location, sizeof location);
+    return send_redirect(c, location);
 }
 
 static err_t send_index(http_conn_t *c, uint8_t board_rev)
@@ -3395,6 +3510,10 @@ static bool fetch_parse_headers(fetch_ctx_t *fc, const uint8_t *body, size_t bod
 
     const remote_auth_config_t *cfg = fc->cfg ? fc->cfg : &http_cfg;
     storage_delete(fc->tmp_path);
+    if (!ensure_parent_dirs(fc->tmp_path)) {
+        fetch_set_error(fc, "cannot create destination directory");
+        return false;
+    }
     if (!fetch_transfer_sha_start(fc)) {
         fetch_set_error(fc, "cannot initialise transfer SHA-256");
         return false;
@@ -4747,10 +4866,10 @@ static bool ensure_parent_dirs(const char *path)
     return true;
 }
 
-static bool theme_archive_process(bool apply, char *err, size_t err_len)
+static bool theme_archive_process(const char *package_path, bool apply, char *err, size_t err_len)
 {
     storage_file_t in = {0};
-    if (!storage_open(&in, M65_THEME_PACKAGE_PATH)) {
+    if (!storage_open(&in, package_path)) {
         if (err && err_len) snprintf(err, err_len, "theme package not found");
         return false;
     }
@@ -4866,18 +4985,27 @@ static bool theme_archive_process(bool apply, char *err, size_t err_len)
 
 const char *remote_http_theme_status(void)
 {
-    bool have = theme_update_available();
+    (void)theme_update_available();
+    theme_scan_ctx_t scan;
+    uint32_t count = theme_scan(&scan);
     snprintf(theme_status_buf, sizeof theme_status_buf,
-             "theme=%s name=\"%s\" version=\"%s\" path=%s source=%s",
-             have ? "pending" : "none",
+             "theme=%s count=%lu selected=\"%s\" name=\"%s\" version=\"%s\" dir=%s source=%s",
+             count ? "available" : "none",
+             (unsigned long)count,
+             scan.first,
              pending_theme_name[0] ? pending_theme_name : "",
              pending_theme_version[0] ? pending_theme_version : "",
-             have ? M65_THEME_PACKAGE_PATH : "(none)",
+             M65_THEME_DIR_PATH,
              pending_theme_source[0] ? pending_theme_source : "(unknown)");
     return theme_status_buf;
 }
 
 bool remote_http_theme_install(char *err, size_t err_len)
+{
+    return remote_http_theme_install_named(NULL, err, err_len);
+}
+
+bool remote_http_theme_install_named(const char *theme_name, char *err, size_t err_len)
 {
     if (!theme_update_available()) {
         if (err && err_len) snprintf(err, err_len, "no pending theme package");
@@ -4887,14 +5015,20 @@ bool remote_http_theme_install(char *err, size_t err_len)
         if (err && err_len) snprintf(err, err_len, "write grant is not active");
         return false;
     }
+    char package_path[256];
+    char selected_name[192];
+    if (!select_theme_package(theme_name, package_path, sizeof package_path, selected_name, sizeof selected_name)) {
+        if (err && err_len) snprintf(err, err_len, "theme package not found");
+        return false;
+    }
     if (!signed_file_verify_stored(&http_cfg,
-                                   M65_THEME_PACKAGE_PATH,
+                                   package_path,
                                    M65_SIGNED_FILE_THEME,
                                    true)) {
         if (err && err_len) snprintf(err, err_len, "theme signature check failed: %s", signed_file_last_error());
         return false;
     }
-    if (!theme_archive_process(false, err, err_len)) return false;
+    if (!theme_archive_process(package_path, false, err, err_len)) return false;
     (void)storage_mkdir("WWW");
 
     bool ok = true;
@@ -4907,9 +5041,9 @@ bool remote_http_theme_install(char *err, size_t err_len)
         if (err && err_len) snprintf(err, err_len, "cannot create WWW directory: %s", storage_last_error());
         return false;
     }
-    if (!theme_archive_process(true, err, err_len)) return false;
+    if (!theme_archive_process(package_path, true, err, err_len)) return false;
     load_cached_web_assets();
-    if (err && err_len) snprintf(err, err_len, "theme installed");
+    if (err && err_len) snprintf(err, err_len, "theme installed: %s", selected_name);
     return true;
 }
 
