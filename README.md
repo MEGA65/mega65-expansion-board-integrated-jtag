@@ -402,6 +402,12 @@ the firmware and theme package entries included in both manifests.
 The mirror root also contains a plain `mega65-pico-jtag.uf2` for initial
 BOOTSEL installs; the signed OTA artifact remains
 `mega65-integrated-jtag-firmware.uf2`.
+It also writes `sdcard-files.zip` with the SD-card config, `WWW/`, and
+`THEMES/`. For each mirrored board revision it writes
+`sdcard-files-r3-cores.zip` and/or `sdcard-files-r6-cores.zip` with those files,
+that board's staged cores, and that board's signed manifest. It also writes
+`sdcard-files-all-cores.zip` with every staged core for every mirrored board
+revision and the signed manifests.
 Set `MIRROR_EXTRA_THEMES="path/to/other.m65jtheme path/to/other.tar"` to publish
 additional selectable theme packages under `mirror/THEMES/`.
 

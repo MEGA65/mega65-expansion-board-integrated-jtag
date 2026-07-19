@@ -255,6 +255,7 @@ typedef enum {
     AUTOFETCH_SCAN,
     AUTOFETCH_VERIFY,
     AUTOFETCH_CORE,
+    AUTOFETCH_RETRY_WAIT,
 } autofetch_state_t;
 
 typedef enum {
@@ -390,6 +391,9 @@ static uint32_t autofetch_updated_count;
 static uint32_t autofetch_checked_count;
 static uint32_t autofetch_manifest_total_count;
 static uint32_t autofetch_fetch_retry_count;
+static autofetch_state_t autofetch_retry_state = AUTOFETCH_IDLE;
+static absolute_time_t autofetch_retry_at;
+static char autofetch_retry_reason[96];
 static char autofetch_manifest_path[48];
 static char autofetch_base_url[192];
 static char autofetch_channel[24];
@@ -1733,6 +1737,7 @@ static const char *autofetch_stage_name(void)
     case AUTOFETCH_SCAN: return "checking manifest";
     case AUTOFETCH_VERIFY: return "verifying download";
     case AUTOFETCH_CORE: return "downloading file";
+    case AUTOFETCH_RETRY_WAIT: return "waiting to retry";
     default: return "idle";
     }
 }
@@ -1748,6 +1753,7 @@ static const char *autofetch_action_text(void)
     case AUTOFETCH_SCAN: return "Comparing the manifest against files already on the SD card";
     case AUTOFETCH_VERIFY: return "Verifying the downloaded file before committing it";
     case AUTOFETCH_CORE: return "Downloading a changed file from the mirror";
+    case AUTOFETCH_RETRY_WAIT: return "Waiting before retrying a failed transfer";
     default: return autofetch_running ? "Updating the SD card" : "Fetch is idle";
     }
 }
@@ -1764,7 +1770,11 @@ static const char *autofetch_current_file(void)
 {
     if (autofetch_hash_active && autofetch_hash_path[0]) return autofetch_hash_path;
     if (autofetch_state == AUTOFETCH_MANIFEST) return autofetch_manifest_path;
-    if (autofetch_state == AUTOFETCH_CORE || autofetch_state == AUTOFETCH_VERIFY) return autofetch_pending_path;
+    if (autofetch_state == AUTOFETCH_CORE || autofetch_state == AUTOFETCH_VERIFY ||
+        autofetch_state == AUTOFETCH_RETRY_WAIT) {
+        return autofetch_pending_url_path[0] ? autofetch_pending_url_path :
+               (autofetch_pending_path[0] ? autofetch_pending_path : autofetch_manifest_path);
+    }
     return autofetch_manifest_path[0] ? autofetch_manifest_path : "(none)";
 }
 
@@ -1792,6 +1802,46 @@ static uint32_t autofetch_current_percent(void)
     uint32_t total = autofetch_current_total_bytes();
     if (!total) return (autofetch_running || autofetch_state != AUTOFETCH_IDLE) ? 0u : 100u;
     return (uint32_t)(((uint64_t)autofetch_current_bytes() * 100u) / total);
+}
+
+static uint32_t autofetch_current_percent_x10(void)
+{
+    uint32_t total = autofetch_current_total_bytes();
+    if (!total) return (autofetch_running || autofetch_state != AUTOFETCH_IDLE) ? 0u : 1000u;
+    uint64_t x10 = ((uint64_t)autofetch_current_bytes() * 1000u) / total;
+    return x10 > 1000u ? 1000u : (uint32_t)x10;
+}
+
+static uint32_t autofetch_overall_percent_x10(void)
+{
+    if (!autofetch_running && autofetch_state == AUTOFETCH_IDLE) return 1000u;
+
+    uint32_t total = autofetch_manifest_total_count;
+    if (!total) return autofetch_current_percent_x10();
+
+    uint32_t completed = autofetch_checked_count;
+    bool current_entry_active = autofetch_hash_active ||
+                                autofetch_state == AUTOFETCH_CORE ||
+                                autofetch_state == AUTOFETCH_VERIFY ||
+                                autofetch_state == AUTOFETCH_RETRY_WAIT;
+    uint32_t fraction = 0;
+    if (current_entry_active && completed) {
+        completed--;
+        fraction = autofetch_current_percent_x10();
+    }
+    if (completed > total) completed = total;
+
+    uint64_t numerator = (uint64_t)completed * 1000u + fraction;
+    uint64_t percent_x10 = numerator / total;
+    return percent_x10 > 1000u ? 1000u : (uint32_t)percent_x10;
+}
+
+static void format_percent_x10(uint32_t percent_x10, char *out, size_t out_len)
+{
+    if (percent_x10 >= 1000u) snprintf(out, out_len, "100");
+    else snprintf(out, out_len, "%lu.%lu",
+                  (unsigned long)(percent_x10 / 10u),
+                  (unsigned long)(percent_x10 % 10u));
 }
 
 static uint32_t autofetch_current_rate_kibps(void)
@@ -1871,6 +1921,10 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "FETCH_TOTAL_BYTES")) {
         snprintf(out, out_len, "%lu", (unsigned long)autofetch_current_total_bytes());
     } else if (ci_equal(name, "FETCH_PERCENT")) {
+        format_percent_x10(autofetch_overall_percent_x10(), out, out_len);
+    } else if (ci_equal(name, "FETCH_OVERALL_PERCENT")) {
+        format_percent_x10(autofetch_overall_percent_x10(), out, out_len);
+    } else if (ci_equal(name, "FETCH_FILE_PERCENT")) {
         snprintf(out, out_len, "%lu", (unsigned long)autofetch_current_percent());
     } else if (ci_equal(name, "FETCH_RATE_KIBPS") || ci_equal(name, "FETCH_AVG_KIBPS")) {
         snprintf(out, out_len, "%lu", (unsigned long)autofetch_current_rate_kibps());
@@ -1881,7 +1935,7 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "FETCH_RETRIES")) {
         snprintf(out, out_len, "%lu", (unsigned long)M65_AUTOFETCH_FILE_RETRIES);
     } else if (ci_equal(name, "FETCH_REFRESH_SECONDS")) {
-        snprintf(out, out_len, "1");
+        snprintf(out, out_len, "2");
     } else if (ci_equal(name, "FIRMWARE_VERSION")) {
         html_escape(M65_VERSION_STRING, out, out_len);
     } else if (ci_equal(name, "FIRMWARE_BUILD")) {
@@ -4089,6 +4143,8 @@ static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms)
     }
     autofetch_running = false;
     autofetch_state = AUTOFETCH_IDLE;
+    autofetch_retry_state = AUTOFETCH_IDLE;
+    autofetch_retry_reason[0] = 0;
     autofetch_schedule_after(retry_delay_ms ? retry_delay_ms : 900000u);
 }
 
@@ -4376,19 +4432,27 @@ static bool autofetch_start_entry(const manifest_entry_t *entry)
     return true;
 }
 
-static bool autofetch_retry_current_fetch(const char *reason)
+static bool autofetch_fetch_error_retryable(const char *reason)
 {
-    autofetch_fetch_retry_count++;
-    if (autofetch_fetch_retry_count >= M65_AUTOFETCH_FILE_RETRIES) return false;
-    const char *stage = autofetch_state == AUTOFETCH_MANIFEST ? "manifest" :
+    if (!reason || !reason[0]) return false;
+    return strncmp(reason, "TCP ", 4) == 0 ||
+           strstr(reason, "connection closed before download completed") != NULL ||
+           strcmp(reason, "DNS lookup failed") == 0 ||
+           strcmp(reason, "cannot send HTTP request") == 0 ||
+           strcmp(reason, "fetch timed out") == 0;
+}
+
+static bool autofetch_start_retry_fetch(const char *reason)
+{
+    const char *stage = autofetch_retry_state == AUTOFETCH_MANIFEST ? "manifest" :
                         manifest_kind_name(autofetch_pending_kind);
-    remote_log(1, "+AUTOFETCH: retry stage=%s failure=%lu/%lu reason=%s",
+    remote_log(1, "+AUTOFETCH: retrying stage=%s failure=%lu/%lu reason=%s",
                stage,
                (unsigned long)autofetch_fetch_retry_count,
                (unsigned long)M65_AUTOFETCH_FILE_RETRIES,
                reason ? reason : "fetch failed");
 
-    if (autofetch_state == AUTOFETCH_MANIFEST) {
+    if (autofetch_retry_state == AUTOFETCH_MANIFEST) {
         char url[320];
         if (!join_url_path(autofetch_base_url, autofetch_manifest_path, url, sizeof url)) {
             snprintf(autofetch_status_buf, sizeof autofetch_status_buf, "autofetch=failed stage=manifest reason=manifest-url-too-long");
@@ -4407,7 +4471,7 @@ static bool autofetch_retry_current_fetch(const char *reason)
         return true;
     }
 
-    if (autofetch_state == AUTOFETCH_CORE) {
+    if (autofetch_retry_state == AUTOFETCH_CORE) {
         manifest_entry_t entry = {0};
         entry.kind = autofetch_pending_kind ? autofetch_pending_kind : MANIFEST_KIND_CORE;
         snprintf(entry.rel, sizeof entry.rel, "%s", autofetch_pending_url_path[0] ? autofetch_pending_url_path : autofetch_pending_path);
@@ -4430,6 +4494,42 @@ static bool autofetch_retry_current_fetch(const char *reason)
     }
 
     return false;
+}
+
+static bool autofetch_retry_current_fetch(const char *reason)
+{
+    if (!autofetch_fetch_error_retryable(reason)) {
+        remote_log(1, "+AUTOFETCH: no-retry stage=%s reason=%s",
+                   autofetch_state == AUTOFETCH_MANIFEST ? "manifest" :
+                   manifest_kind_name(autofetch_pending_kind),
+                   reason ? reason : "fetch failed");
+        return false;
+    }
+    autofetch_fetch_retry_count++;
+    if (autofetch_fetch_retry_count >= M65_AUTOFETCH_FILE_RETRIES) return false;
+
+    autofetch_retry_state = autofetch_state;
+    snprintf(autofetch_retry_reason, sizeof autofetch_retry_reason, "%s", reason ? reason : "fetch failed");
+    autofetch_retry_at = make_timeout_time_ms(2000u);
+    autofetch_state = AUTOFETCH_RETRY_WAIT;
+    snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+             "autofetch=running stage=retry-wait type=%s file=%s failure=%lu/%lu reason=\"%s\" checked=%lu total=%lu needed=%lu updated=%lu",
+             autofetch_retry_state == AUTOFETCH_MANIFEST ? "manifest" : manifest_kind_name(autofetch_pending_kind),
+             autofetch_retry_state == AUTOFETCH_MANIFEST ? autofetch_manifest_path :
+             (autofetch_pending_url_path[0] ? autofetch_pending_url_path : autofetch_pending_path),
+             (unsigned long)autofetch_fetch_retry_count,
+             (unsigned long)M65_AUTOFETCH_FILE_RETRIES,
+             autofetch_retry_reason,
+             (unsigned long)autofetch_checked_count,
+             (unsigned long)autofetch_manifest_total_count,
+             (unsigned long)autofetch_needed_count,
+             (unsigned long)autofetch_updated_count);
+    remote_log(1, "+AUTOFETCH: retry-wait stage=%s failure=%lu/%lu in_ms=2000 reason=%s",
+               autofetch_retry_state == AUTOFETCH_MANIFEST ? "manifest" : manifest_kind_name(autofetch_pending_kind),
+               (unsigned long)autofetch_fetch_retry_count,
+               (unsigned long)M65_AUTOFETCH_FILE_RETRIES,
+               autofetch_retry_reason);
+    return true;
 }
 
 static void autofetch_skip_current_core(const char *reason)
@@ -4546,6 +4646,29 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
 
     uint32_t interval_hours = effective_fetch_interval(interval_hours_override);
     uint8_t board_rev = effective_fetch_board(board_rev_override);
+
+    if (autofetch_state == AUTOFETCH_RETRY_WAIT) {
+        absolute_time_t now = get_absolute_time();
+        if (absolute_time_diff_us(now, autofetch_retry_at) > 0) return;
+        autofetch_state = autofetch_retry_state;
+        if (!autofetch_start_retry_fetch(autofetch_retry_reason)) {
+            const char *reason = autofetch_retry_reason[0] ? autofetch_retry_reason : "retry failed";
+            autofetch_retry_state = AUTOFETCH_IDLE;
+            if (autofetch_state == AUTOFETCH_CORE) {
+                autofetch_skip_current_core(reason);
+                return;
+            }
+            snprintf(autofetch_status_buf, sizeof autofetch_status_buf,
+                     "autofetch=failed stage=manifest reason=\"%s\"",
+                     reason);
+            remote_log(1, "+AUTOFETCH: failed stage=manifest reason=%s", reason);
+            autofetch_cancel("retry failed", 900000u);
+            return;
+        }
+        autofetch_retry_state = AUTOFETCH_IDLE;
+        autofetch_retry_reason[0] = 0;
+        return;
+    }
 
     if (autofetch_state == AUTOFETCH_MANIFEST || autofetch_state == AUTOFETCH_CORE) {
         fetch_poll(&autofetch_fc);
