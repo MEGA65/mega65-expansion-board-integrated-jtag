@@ -12,6 +12,7 @@ SHELL := /bin/bash
 PROJECT          ?= mega65-pico-jtag
 CMAKE_TARGET     ?= pico_m65jtag
 BUILD_DIR        ?= build-wifi
+FACTORY_BUILD_DIR ?= $(BUILD_DIR)-factory
 DEPS_DIR         ?= .deps
 PICO_BOARD       ?= pico_w
 PICO_SDK_PATH    ?= $(CURDIR)/$(DEPS_DIR)/pico-sdk
@@ -46,6 +47,12 @@ UF2 := $(BUILD_DIR)/$(PROJECT).uf2
 ELF := $(BUILD_DIR)/$(PROJECT).elf
 CMAKE_UF2 := $(BUILD_DIR)/$(CMAKE_TARGET).uf2
 CMAKE_ELF := $(BUILD_DIR)/$(CMAKE_TARGET).elf
+FACTORY_UF2 := $(BUILD_DIR)/$(PROJECT)-factory.uf2
+FACTORY_APP_BIN := $(FACTORY_BUILD_DIR)/$(CMAKE_TARGET).bin
+FACTORY_BOOTLOADER_BIN := $(FACTORY_BUILD_DIR)/m65_factory_bootloader.bin
+UPLOAD_UF2 ?= $(FACTORY_UF2)
+M65_BOOTLOADER_SLOT0_OFFSET ?= 0x10000
+M65_BOOTLOADER_SLOT_SIZE ?= 0xF0000
 
 ifeq ($(USE_FATFS),1)
 CMAKE_FATFS_ARGS := -DM65_USE_FATFS=ON \
@@ -61,7 +68,7 @@ CMAKE_REMOTE_ARGS := -DM65_ENABLE_WIFI_REMOTE=$(if $(filter 1 ON on true TRUE ye
 CMAKE_SD_MODE_ARGS := $(if $(strip $(M65_SD_MODE)),-DM65_SD_MODE=$(M65_SD_MODE),)
 CMAKE_PICOTOOL_ARGS := $(if $(strip $(PICOTOOL_FETCH_FROM_GIT_PATH)),-DPICOTOOL_FETCH_FROM_GIT_PATH=$(PICOTOOL_FETCH_FROM_GIT_PATH),)
 
-.PHONY: all help deps check-tools sdk fatfs configure build nofatfs clean distclean nuke \
+.PHONY: all help deps check-tools sdk fatfs configure configure-factory build build-bare factory nofatfs clean distclean nuke \
         upload flash upload-picotool upload-uf2 picotool print-config terminal \
         mirror mirror-setup \
         wifi-probe wifi-probe-lwip wifi-probe-bg wifi-probe-manual wifi-probe-manual-bg upload-wifi-probe
@@ -73,12 +80,13 @@ help:
 	@echo
 	@echo "Main targets:"
 	@echo "  make deps              Install Ubuntu/Debian build dependencies with apt"
-	@echo "  make                   Clone SDK/FatFs if needed, configure, and build UF2"
-	@echo "  make flash             Flash the Pico; alias for make upload"
-	@echo "  make upload            Try picotool first, then UF2 mass-storage copy"
-	@echo "  make upload-uf2        Copy UF2 to mounted RPI-RP2/RP2350 BOOTSEL drive"
+	@echo "  make                   Clone SDK/FatFs if needed, build bare and factory UF2s"
+	@echo "  make factory           Build resident-bootloader factory UF2"
+	@echo "  make flash             Flash the factory UF2; alias for make upload"
+	@echo "  make upload            Try picotool first, then factory UF2 mass-storage copy"
+	@echo "  make upload-uf2        Copy factory UF2 to mounted RPI-RP2/RP2350 BOOTSEL drive"
 	@echo "  make picotool          Build local picotool under .deps/picotool/build/"
-	@echo "  make upload-picotool   Flash using system/local picotool"
+	@echo "  make upload-picotool   Flash factory UF2 using system/local picotool"
 	@echo "  make nofatfs           Build UART/JTAG-only firmware without SD/FatFs"
 	@echo "  make mirror            Build firmware, pack WWW theme, and prepare signed mirror/"
 	@echo "  make wifi-probe        Build standalone Pico W bare CYW43 probe, no SD/FatFs/JTAG/lwIP"
@@ -96,8 +104,10 @@ help:
 	@echo "  PICO_BOARD=pico_w      Default. Pico SDK board name: pico, pico_w, pico2, ..."
 	@echo "  PICO_SDK_PATH=...      Override SDK path"
 	@echo "  BUILD_DIR=build-wifi   Override build directory"
+	@echo "  FACTORY_BUILD_DIR=...  Override relocated factory-app build directory"
 	@echo "  ENABLE_WIFI_REMOTE=1   Default. Set 0 for non-WiFi builds"
 	@echo "  M65_SD_MODE=...        Optional: M65_SD_MODE_AUTO, M65_SD_MODE_HW_SPI, M65_SD_MODE_SCHEMATIC_BITBANG"
+	@echo "  UPLOAD_UF2=...         Override upload artifact; default factory UF2"
 	@echo "  MIRROR_CHANNEL=stable  Mirror release channel/manifest prefix"
 	@echo "  MIRROR_BOARD=all       Mirror board filter: all means both r3 and r6"
 	@echo "  MIRROR_SOURCE_URL=...  Source catalogue URL for make mirror"
@@ -163,7 +173,9 @@ configure: $(CONFIGURE_DEPS)
 		$(CMAKE_SD_MODE_ARGS) \
 		$(CMAKE_PICOTOOL_ARGS)
 
-build: configure
+build: build-bare factory
+
+build-bare: configure
 	cmake --build "$(BUILD_DIR)" --parallel
 	@if [ "$(PROJECT)" != "$(CMAKE_TARGET)" ]; then \
 		cp "$(CMAKE_UF2)" "$(UF2)"; \
@@ -171,6 +183,30 @@ build: configure
 	fi
 	@echo
 	@echo "Built: $(UF2)"
+
+configure-factory: $(CONFIGURE_DEPS)
+	cmake -S . -B "$(FACTORY_BUILD_DIR)" \
+		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
+		-DPICO_BOARD="$(PICO_BOARD)" \
+		$(CMAKE_FATFS_ARGS) \
+		$(CMAKE_REMOTE_ARGS) \
+		$(CMAKE_SD_MODE_ARGS) \
+		$(CMAKE_PICOTOOL_ARGS) \
+		-DM65_BOOTLOADER_APP=ON \
+		-DM65_BUILD_FACTORY_BOOTLOADER=ON \
+		-DM65_BOOTLOADER_SLOT0_OFFSET="$(M65_BOOTLOADER_SLOT0_OFFSET)" \
+		-DM65_BOOTLOADER_SLOT_SIZE="$(M65_BOOTLOADER_SLOT_SIZE)"
+
+factory: configure-factory
+	cmake --build "$(FACTORY_BUILD_DIR)" --parallel
+	python3 tools/make_factory_uf2.py \
+		--bootloader "$(FACTORY_BOOTLOADER_BIN)" \
+		--app "$(FACTORY_APP_BIN)" \
+		--output "$(FACTORY_UF2)" \
+		--app-offset "$(M65_BOOTLOADER_SLOT0_OFFSET)" \
+		--app-size "$(M65_BOOTLOADER_SLOT_SIZE)"
+	@echo
+	@echo "Built: $(FACTORY_UF2)"
 
 mirror: build
 	@set -e; \
@@ -219,7 +255,9 @@ mirror: build
 		--theme-version "$$build_marker" \
 		"$${theme_args[@]}" \
 		"$${extra_args[@]}" \
-		"$(MIRROR_CHANNEL)" "$(MIRROR_DIR)" "$(MIRROR_SOURCE_URL)"
+		"$(MIRROR_CHANNEL)" "$(MIRROR_DIR)" "$(MIRROR_SOURCE_URL)"; \
+	echo "Publishing factory UF2 for fresh BOOTSEL installs: $(FACTORY_UF2)"; \
+	cp "$(FACTORY_UF2)" "$(MIRROR_DIR)/mega65-pico-jtag.uf2"
 
 mirror-setup: mirror
 
@@ -312,7 +350,7 @@ clean:
 	@if [ -d "$(BUILD_DIR)" ]; then cmake --build "$(BUILD_DIR)" --target clean; fi
 
 distclean:
-	rm -rf "$(BUILD_DIR)" build-nofatfs "$(WIFI_PROBE_BUILD_DIR)" "$(WIFI_PROBE_BUILD_DIR)-lwip" "$(WIFI_PROBE_BUILD_DIR)-bg" "$(WIFI_PROBE_BUILD_DIR)-manual" "$(WIFI_PROBE_BUILD_DIR)-manual-bg"
+	rm -rf "$(BUILD_DIR)" "$(FACTORY_BUILD_DIR)" build-nofatfs "$(WIFI_PROBE_BUILD_DIR)" "$(WIFI_PROBE_BUILD_DIR)-lwip" "$(WIFI_PROBE_BUILD_DIR)-bg" "$(WIFI_PROBE_BUILD_DIR)-manual" "$(WIFI_PROBE_BUILD_DIR)-manual-bg"
 
 nuke: distclean
 	rm -rf "$(DEPS_DIR)"
@@ -333,20 +371,20 @@ flash: upload
 upload: build
 	@if command -v picotool >/dev/null 2>&1; then \
 		echo "Trying system picotool..."; \
-		sudo picotool load -x "$(UF2)" || { echo "picotool failed; trying UF2 copy"; $(MAKE) upload-uf2 BUILD_DIR="$(BUILD_DIR)" PROJECT="$(PROJECT)"; }; \
+		sudo picotool load -x "$(UPLOAD_UF2)" || { echo "picotool failed; trying UF2 copy"; $(MAKE) upload-uf2 BUILD_DIR="$(BUILD_DIR)" PROJECT="$(PROJECT)" UPLOAD_UF2="$(UPLOAD_UF2)"; }; \
 	elif [ -x "$(PICOTOOL_PATH)" ]; then \
 		echo "Trying local $(PICOTOOL_PATH)..."; \
-		sudo "$(PICOTOOL_PATH)" load -x "$(UF2)" || { echo "picotool failed; trying UF2 copy"; $(MAKE) upload-uf2 BUILD_DIR="$(BUILD_DIR)" PROJECT="$(PROJECT)"; }; \
+		sudo "$(PICOTOOL_PATH)" load -x "$(UPLOAD_UF2)" || { echo "picotool failed; trying UF2 copy"; $(MAKE) upload-uf2 BUILD_DIR="$(BUILD_DIR)" PROJECT="$(PROJECT)" UPLOAD_UF2="$(UPLOAD_UF2)"; }; \
 	else \
 		echo "picotool not found; trying UF2 mass-storage copy."; \
-		$(MAKE) upload-uf2 BUILD_DIR="$(BUILD_DIR)" PROJECT="$(PROJECT)"; \
+		$(MAKE) upload-uf2 BUILD_DIR="$(BUILD_DIR)" PROJECT="$(PROJECT)" UPLOAD_UF2="$(UPLOAD_UF2)"; \
 	fi
 
 upload-picotool: build
 	@if command -v picotool >/dev/null 2>&1; then \
-		sudo picotool load -x "$(UF2)"; \
+		sudo picotool load -x "$(UPLOAD_UF2)"; \
 	elif [ -x "$(PICOTOOL_PATH)" ]; then \
-		sudo "$(PICOTOOL_PATH)" load -x "$(UF2)"; \
+		sudo "$(PICOTOOL_PATH)" load -x "$(UPLOAD_UF2)"; \
 	else \
 		echo "No picotool found. Run 'make picotool' or install it with your distro."; \
 		exit 1; \
@@ -354,7 +392,7 @@ upload-picotool: build
 
 upload-uf2: build
 	@set -e; \
-	if [ ! -f "$(UF2)" ]; then echo "No UF2 at $(UF2)"; exit 1; fi; \
+	if [ ! -f "$(UPLOAD_UF2)" ]; then echo "No UF2 at $(UPLOAD_UF2)"; exit 1; fi; \
 	mount="$$PICO_MOUNT"; \
 	if [ -z "$$mount" ]; then \
 		for d in \
@@ -374,8 +412,8 @@ upload-uf2: build
 		echo "Hold BOOTSEL while plugging the Pico into USB, or set PICO_MOUNT=/path/to/RPI-RP2."; \
 		exit 1; \
 	fi; \
-	echo "Copying $(UF2) to $$mount/"; \
-	cp "$(UF2)" "$$mount/"; \
+	echo "Copying $(UPLOAD_UF2) to $$mount/"; \
+	cp "$(UPLOAD_UF2)" "$$mount/"; \
 	sync; \
 	echo "Flash requested. The Pico should reboot after the UF2 copy completes."
 
@@ -391,6 +429,9 @@ print-config:
 	@echo "ENABLE_WIFI_REMOTE=$(ENABLE_WIFI_REMOTE)"
 	@echo "M65_SD_MODE=$(M65_SD_MODE)"
 	@echo "UF2=$(UF2)"
+	@echo "FACTORY_BUILD_DIR=$(FACTORY_BUILD_DIR)"
+	@echo "FACTORY_UF2=$(FACTORY_UF2)"
+	@echo "UPLOAD_UF2=$(UPLOAD_UF2)"
 
 terminal:
 	@echo "Example command client:"

@@ -42,6 +42,10 @@ configure_file(
 option(M65_USE_FATFS "Build with FatFs storage backend" ON)
 option(M65_HAVE_SD_INIT_DRIVER "Call sd_init_driver() before f_mount(); usually not needed for recent carlk3 library" OFF)
 option(M65_ENABLE_WIFI_REMOTE "Build Pico W WiFi remote-delivery support" OFF)
+option(M65_BOOTLOADER_APP "Link firmware to run from resident bootloader slot 0" OFF)
+option(M65_BUILD_FACTORY_BOOTLOADER "Build the resident factory bootloader target" OFF)
+set(M65_BOOTLOADER_SLOT0_OFFSET "0x10000" CACHE STRING "Resident bootloader slot 0 flash offset")
+set(M65_BOOTLOADER_SLOT_SIZE "0xF0000" CACHE STRING "Resident bootloader application slot size")
 set(M65_SD_MODE "" CACHE STRING "Optional compile-time SD mode override: M65_SD_MODE_AUTO, M65_SD_MODE_HW_SPI, or M65_SD_MODE_SCHEMATIC_BITBANG")
 set(FATFS_SD_SPI_PATH "${CMAKE_CURRENT_LIST_DIR}/third_party/no-OS-FatFS-SD-SPI-RPi-Pico" CACHE PATH "Path to no-OS-FatFS-SD-SPI-RPi-Pico repository")
 
@@ -79,6 +83,24 @@ target_compile_definitions(pico_m65jtag PRIVATE
 )
 if(M65_SD_MODE)
     target_compile_definitions(pico_m65jtag PRIVATE M65_SD_MODE=${M65_SD_MODE})
+endif()
+if(M65_BOOTLOADER_APP)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/factory_linker")
+    file(WRITE
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/factory_linker/pico_flash_region.ld"
+        "FLASH(rx) : ORIGIN = 0x10000000 + ${M65_BOOTLOADER_SLOT0_OFFSET}, LENGTH = ${M65_BOOTLOADER_SLOT_SIZE}\n"
+    )
+    pico_add_linker_script_override_path(
+        pico_m65jtag
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/factory_linker"
+        FILES pico_flash_region.ld
+    )
+    target_compile_definitions(pico_m65jtag PRIVATE
+        M65_BOOTLOADER_APP=1
+        M65_RESIDENT_BOOTLOADER=1
+        M65_BOOTLOADER_SLOT0_OFFSET=${M65_BOOTLOADER_SLOT0_OFFSET}
+        M65_BOOTLOADER_SLOT_SIZE=${M65_BOOTLOADER_SLOT_SIZE}
+    )
 endif()
 
 target_link_libraries(pico_m65jtag
@@ -171,3 +193,20 @@ pico_enable_stdio_uart(pico_m65jtag 0)
 
 
 pico_add_extra_outputs(pico_m65jtag)
+
+if(M65_BUILD_FACTORY_BOOTLOADER)
+    add_executable(m65_factory_bootloader
+        bootloader/main.c
+    )
+    target_compile_definitions(m65_factory_bootloader PRIVATE
+        M65_BOOTLOADER_SLOT0_OFFSET=${M65_BOOTLOADER_SLOT0_OFFSET}
+        M65_BOOTLOADER_SLOT_SIZE=${M65_BOOTLOADER_SLOT_SIZE}
+    )
+    target_link_libraries(m65_factory_bootloader
+        pico_stdlib
+        hardware_watchdog
+    )
+    pico_enable_stdio_usb(m65_factory_bootloader 0)
+    pico_enable_stdio_uart(m65_factory_bootloader 0)
+    pico_add_extra_outputs(m65_factory_bootloader)
+endif()

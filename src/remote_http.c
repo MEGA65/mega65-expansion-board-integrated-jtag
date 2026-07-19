@@ -1958,8 +1958,9 @@ static void substitution_value(const char *name,
 #else
             snprintf(out, out_len,
                      "<section class=\"update-panel firmware-update\"><strong>New firmware is available: %s</strong>"
-                     "<span>Build %s</span><button type=\"button\" disabled>OTA bootloader not installed</button></section>",
-                     version, build);
+                     "<span>Build %s</span><button type=\"button\" disabled>%s</button></section>",
+                     version, build,
+                     M65_RESIDENT_BOOTLOADER ? "OTA apply hook not installed" : "OTA bootloader not installed");
 #endif
         }
     } else if (ci_equal(name, "THEME_STATUS")) {
@@ -4839,7 +4840,7 @@ const char *remote_http_firmware_status(void)
 {
     bool have = firmware_update_available();
     snprintf(firmware_status_buf, sizeof firmware_status_buf,
-             "firmware=%s current_version=\"%s\" current_build=%s pending_version=\"%s\" pending_build=%s path=%s source=%s update_supported=%lu",
+             "firmware=%s current_version=\"%s\" current_build=%s pending_version=\"%s\" pending_build=%s path=%s source=%s bootloader=%s update_supported=%lu",
              have ? "pending" : "none",
              M65_VERSION_STRING,
              M65_BUILD_MARKER,
@@ -4847,6 +4848,7 @@ const char *remote_http_firmware_status(void)
              pending_firmware_build[0] ? pending_firmware_build : "(unknown)",
              have ? M65_FIRMWARE_PACKAGE_PATH : "(none)",
              pending_firmware_source[0] ? pending_firmware_source : "(unknown)",
+             M65_RESIDENT_BOOTLOADER ? "resident" : "none",
              (unsigned long)M65_ENABLE_MCUBOOT_OTA);
     return firmware_status_buf;
 }
@@ -4867,7 +4869,12 @@ bool remote_http_firmware_update(char *err, size_t err_len)
 #if M65_ENABLE_MCUBOOT_OTA
     if (err && err_len) snprintf(err, err_len, "MCUboot OTA apply hook is not linked yet");
 #else
-    if (err && err_len) snprintf(err, err_len, "MCUboot OTA bootloader is not installed in this build");
+    if (err && err_len) {
+        snprintf(err, err_len,
+                 M65_RESIDENT_BOOTLOADER
+                 ? "resident OTA bootloader is installed, but the flash apply hook is not linked yet"
+                 : "MCUboot OTA bootloader is not installed in this build");
+    }
 #endif
     return false;
 }

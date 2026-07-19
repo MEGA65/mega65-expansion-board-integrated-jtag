@@ -144,6 +144,10 @@
 // Full MCUboot slot/swap support is a follow-up integration step. Until that
 // bootloader is present, firmware packages can be downloaded and verified but
 // cannot be applied safely by this application image.
+#ifndef M65_RESIDENT_BOOTLOADER
+#define M65_RESIDENT_BOOTLOADER 0
+#endif
+
 #ifndef M65_ENABLE_MCUBOOT_OTA
 #define M65_ENABLE_MCUBOOT_OTA 0
 #endif

@@ -75,7 +75,12 @@ Output:
 
 ```text
 build-wifi/mega65-pico-jtag.uf2
+build-wifi/mega65-pico-jtag-factory.uf2
 ```
+
+`mega65-pico-jtag.uf2` is the bare/recovery app image. The factory image
+contains a small resident RP2040 bootloader plus the same firmware linked into
+slot 0 at flash offset `0x10000`; this is the image to install on a fresh Pico.
 
 The firmware build marker is generated at configure time as
 `YYYY-MM-DD-<minutes-since-midnight>-<git-commitish>` and is reported by
@@ -101,7 +106,8 @@ make USE_FATFS=0 build
 
 ## Flashing
 
-The Makefile has both `upload` and `flash`; they are aliases.
+The Makefile has both `upload` and `flash`; they are aliases and default to the
+factory UF2.
 
 ```bash
 make flash
@@ -118,6 +124,12 @@ The simplest method is still UF2:
 ```bash
 # Hold BOOTSEL while plugging in the Pico, then:
 make upload-uf2
+```
+
+To deliberately flash the bare/recovery app instead of the factory image:
+
+```bash
+make upload-uf2 UPLOAD_UF2=build-wifi/mega65-pico-jtag.uf2
 ```
 
 If autodetection fails:
@@ -386,12 +398,13 @@ discovery:
 GET /identity    returns r3:name, r6:name, or r0:name
 ```
 
-`make mirror` is the one-command host setup path. It builds
-`build-wifi/mega65-pico-jtag.uf2`, copies the default `sdcard/WWW/` files and a
-`mega65-jtag.cfg.example` into `mirror/`, packs the same web files into
-`mirror/THEMES/mega65-jtag-default-theme.m65jtheme`, then runs `m65j.py mirror`
-so the cores, firmware packages, theme packages, signed manifests, and a static
-`mirror/index.html` landing page are all ready for
+`make mirror` is the one-command host setup path. It builds both
+`build-wifi/mega65-pico-jtag.uf2` and
+`build-wifi/mega65-pico-jtag-factory.uf2`, copies the default `sdcard/WWW/`
+files and a `mega65-jtag.cfg.example` into `mirror/`, packs the same web files
+into `mirror/THEMES/mega65-jtag-default-theme.m65jtheme`, then runs
+`m65j.py mirror` so the cores, firmware packages, theme packages, signed
+manifests, and a static `mirror/index.html` landing page are all ready for
 `python3 -m http.server --directory mirror`.
 
 By default it uses `MIRROR_CHANNEL=stable`, `MIRROR_BOARD=all`,
@@ -399,8 +412,9 @@ By default it uses `MIRROR_CHANNEL=stable`, `MIRROR_BOARD=all`,
 `MIRROR_FIRMWARE=build-wifi/mega65-pico-jtag.uf2`.
 `MIRROR_BOARD=all` emits both `stable-r3.sha256` and `stable-r6.sha256`, with
 the firmware and theme package entries included in both manifests.
-The mirror root also contains a plain `mega65-pico-jtag.uf2` for initial
-BOOTSEL installs; the signed OTA artifact remains
+The mirror root also contains `mega65-pico-jtag.uf2` for initial BOOTSEL
+installs; `make mirror` publishes the factory UF2 at that filename so fresh
+Picos get the resident bootloader. The signed OTA artifact remains
 `mega65-integrated-jtag-firmware.uf2`.
 It also writes `sdcard-files.zip` with the SD-card config, `WWW/`, and
 `THEMES/`. For each mirrored board revision it writes
@@ -520,9 +534,11 @@ When signatures are required, unsigned or badly signed uploads/fetches are
 deleted instead of being committed. `PUT /jtag` spools signed transfers to SD,
 verifies them, and only then programs JTAG.
 
-OTA firmware package discovery and signature-checked staging are implemented,
-but actual flash apply/reboot still requires the MCUboot bootloader integration.
-Until that is linked, `AT+FWUPDATE` and `/firmware/update` verify the staged
-package and then report that MCUboot OTA is not installed. The current recovery
-path remains the Pico BOOTSEL flow: connect USB, press the BOOTSEL button, and
-copy `mega65-pico-jtag.uf2`.
+Factory installs include a small resident RP2040 bootloader and run the firmware
+from slot 0 at flash offset `0x10000`. OTA firmware package discovery and
+signature-checked staging are implemented, but the flash apply/reboot hook is
+still a follow-up step. Until that is linked, `AT+FWUPDATE` and
+`/firmware/update` verify the staged package and then report that the apply hook
+is not installed. The current recovery path remains the Pico BOOTSEL flow:
+connect USB, press the BOOTSEL button, and copy `mega65-pico-jtag-factory.uf2`
+or the mirror's `mega65-pico-jtag.uf2` factory download.
