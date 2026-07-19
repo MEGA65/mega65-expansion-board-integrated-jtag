@@ -1,0 +1,3 @@
+#pragma once
+
+#define M65_BUILD_MARKER "@M65_BUILD_MARKER@"
