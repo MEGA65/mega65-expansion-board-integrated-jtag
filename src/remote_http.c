@@ -99,6 +99,7 @@
 #define M65_HTTP_FAVICON_MAX 4096u
 #endif
 
+
 #if !M65_WIFI_SUPPORTED
 
 void remote_http_init(void) {}
@@ -5529,5 +5530,13 @@ bool remote_http_wifi_probe_now(void)
     snprintf(http_status_buf, sizeof http_status_buf, "wifi=probe-pending hardware=cyw43 manual=1");
     return true;
 }
+
+#ifndef M65_BOOTLOADER_APP
+bool remote_http_firmware_update(char *err, size_t err_len)
+{
+    if (err && err_len) snprintf(err, err_len, "OTA firmware updates require M65_BOOTLOADER_APP");
+    return false;
+}
+#endif
 
 #endif
