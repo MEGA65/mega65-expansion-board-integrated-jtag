@@ -79,6 +79,19 @@ CMAKE_FACTORY_BOOT_DIAG_ARGS := -DM65_BOOT_DIAG=$(if $(filter 1 ON on true TRUE 
                                  -DM65_BOOT_DIAG_UART_BAUD=$(M65_BOOT_DIAG_UART_BAUD) \
                                  $(if $(strip $(M65_BOOT_DIAG_PIN)),-DM65_BOOT_DIAG_PIN=$(M65_BOOT_DIAG_PIN),)
 
+define CMAKE_FRESH_IF_STALE
+$(strip $(shell \
+	if [ -f "$(1)/CMakeCache.txt" ]; then \
+		cache_source=$$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$(1)/CMakeCache.txt"); \
+		cache_build=$$(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "$(1)/CMakeCache.txt"); \
+		expected_source=$$(cd "$(2)" && pwd -P); \
+		expected_build=$$(cd "$(1)" && pwd -P); \
+		if [ "$$cache_source" != "$$expected_source" ] || [ "$$cache_build" != "$$expected_build" ]; then \
+			printf '%s' --fresh; \
+		fi; \
+	fi))
+endef
+
 .PHONY: all help deps check-tools sdk fatfs configure configure-factory build build-bare factory nofatfs clean distclean nuke \
         upload flash upload-picotool upload-uf2 picotool print-config terminal \
         mirror mirror-setup \
@@ -179,7 +192,7 @@ fatfs:
 	fi
 
 configure: $(CONFIGURE_DEPS)
-	cmake -S . -B "$(BUILD_DIR)" \
+	cmake $(call CMAKE_FRESH_IF_STALE,$(BUILD_DIR),.) -S . -B "$(BUILD_DIR)" \
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
 		-DPICO_BOARD="$(PICO_BOARD)" \
 		$(CMAKE_FATFS_ARGS) \
@@ -200,7 +213,7 @@ build-bare: configure
 	@echo "Built: $(UF2)"
 
 configure-factory: $(CONFIGURE_DEPS)
-	cmake -S . -B "$(FACTORY_BUILD_DIR)" \
+	cmake $(call CMAKE_FRESH_IF_STALE,$(FACTORY_BUILD_DIR),.) -S . -B "$(FACTORY_BUILD_DIR)" \
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
 		-DPICO_BOARD="$(PICO_BOARD)" \
 		$(CMAKE_FATFS_ARGS) \
@@ -281,7 +294,7 @@ nofatfs:
 	$(MAKE) USE_FATFS=0 BUILD_DIR=build-nofatfs build
 
 wifi-probe: sdk
-	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)" \
+	cmake $(call CMAKE_FRESH_IF_STALE,$(WIFI_PROBE_BUILD_DIR),wifi_probe) -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)" \
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
 		-DPICO_BOARD=pico_w \
 		-DWIFI_PROBE_MODE=none \
@@ -292,7 +305,7 @@ wifi-probe: sdk
 	@echo "Built: $(WIFI_PROBE_UF2)"
 
 wifi-probe-lwip: sdk
-	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-lwip" \
+	cmake $(call CMAKE_FRESH_IF_STALE,$(WIFI_PROBE_BUILD_DIR)-lwip,wifi_probe) -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-lwip" \
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
 		-DPICO_BOARD=pico_w \
 		-DWIFI_PROBE_MODE=lwip_poll \
@@ -303,7 +316,7 @@ wifi-probe-lwip: sdk
 	@echo "Built: $(WIFI_PROBE_BUILD_DIR)-lwip/mega65-wifi-probe-lwip.uf2"
 
 wifi-probe-bg: sdk
-	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-bg" \
+	cmake $(call CMAKE_FRESH_IF_STALE,$(WIFI_PROBE_BUILD_DIR)-bg,wifi_probe) -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-bg" \
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
 		-DPICO_BOARD=pico_w \
 		-DWIFI_PROBE_MODE=lwip_background \
@@ -314,7 +327,7 @@ wifi-probe-bg: sdk
 	@echo "Built: $(WIFI_PROBE_BUILD_DIR)-bg/mega65-wifi-probe-bg.uf2"
 
 wifi-probe-manual: sdk
-	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-manual" \
+	cmake $(call CMAKE_FRESH_IF_STALE,$(WIFI_PROBE_BUILD_DIR)-manual,wifi_probe) -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-manual" \
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
 		-DPICO_BOARD=pico_w \
 		-DWIFI_PROBE_MODE=manual_poll \
@@ -325,7 +338,7 @@ wifi-probe-manual: sdk
 	@echo "Built: $(WIFI_PROBE_BUILD_DIR)-manual/mega65-wifi-probe-manual.uf2"
 
 wifi-probe-manual-bg: sdk
-	cmake -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-manual-bg" \
+	cmake $(call CMAKE_FRESH_IF_STALE,$(WIFI_PROBE_BUILD_DIR)-manual-bg,wifi_probe) -S wifi_probe -B "$(WIFI_PROBE_BUILD_DIR)-manual-bg" \
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)" \
 		-DPICO_BOARD=pico_w \
 		-DWIFI_PROBE_MODE=manual_background \
@@ -377,7 +390,7 @@ picotool: sdk
 		mkdir -p "$(DEPS_DIR)"; \
 		git clone "$(PICOTOOL_REPO)" "$(DEPS_DIR)/picotool"; \
 	fi
-	cmake -S "$(DEPS_DIR)/picotool" -B "$(DEPS_DIR)/picotool/build" \
+	cmake $(call CMAKE_FRESH_IF_STALE,$(DEPS_DIR)/picotool/build,$(DEPS_DIR)/picotool) -S "$(DEPS_DIR)/picotool" -B "$(DEPS_DIR)/picotool/build" \
 		-DPICO_SDK_PATH="$(PICO_SDK_PATH)"
 	cmake --build "$(DEPS_DIR)/picotool/build" --parallel
 	@echo "Built: $(PICOTOOL_PATH)"

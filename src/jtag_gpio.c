@@ -115,6 +115,11 @@ void jtag_gpio_init(void)
     gpio_set_dir(M65_JTAG_TDI_PIN, GPIO_IN);
     gpio_set_dir(M65_JTAG_TDO_PIN, GPIO_IN);
 
+    gpio_disable_pulls(M65_JTAG_TCK_PIN);
+    gpio_disable_pulls(M65_JTAG_TMS_PIN);
+    gpio_disable_pulls(M65_JTAG_TDI_PIN);
+    gpio_disable_pulls(M65_JTAG_TDO_PIN);
+
 #if M65_JTAG_HIJACK_ACTIVE_HIGH
     gpio_put(M65_JTAG_HIJACK_PIN, 0);
 #else
