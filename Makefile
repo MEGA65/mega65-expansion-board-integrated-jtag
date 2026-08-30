@@ -32,6 +32,7 @@ MIRROR_THEME ?= $(MIRROR_DIR)/THEMES/mega65-jtag-default-theme.m65jtheme
 MIRROR_THEME_NAME ?= default
 MIRROR_EXTRA_THEMES ?=
 MIRROR_VERSION ?= v0.1
+MIRROR_BUILD_MARKER_FILE ?= $(FACTORY_BUILD_DIR)/generated/generated_version.h
 WWW_THEME_FILES := app.js favicon-32x32.png fetch_busy.html index_bottom.html index_row.html index_top.html mega65_320x64.png style.css
 
 # Default is now FatFs-on, because P <filename> and L are the whole point.
@@ -125,7 +126,7 @@ help:
 	@echo "  MIRROR_BOARD=all       Mirror board filter: all means both r3 and r6"
 	@echo "  MIRROR_SOURCE_URL=...  Source catalogue URL for make mirror"
 	@echo "  MIRROR_EXTRA_CORES=... Extra local .bit/.cor/.m65j files/dirs; default extra_cores/ if present"
-	@echo "  MIRROR_FIRMWARE=...    Firmware image staged into mirror; default built UF2"
+	@echo "  MIRROR_FIRMWARE=...    Firmware image staged into mirror; default factory UF2"
 	@echo "  MIRROR_EXTRA_THEMES=... Extra local .m65jtheme/.tar files to publish under THEMES/"
 	@echo "  PICO_MOUNT=...         Mount point for upload-uf2, if autodetect fails"
 	@echo
@@ -234,9 +235,9 @@ mirror: factory
 	cp sdcard/mega65-jtag.cfg "$(MIRROR_DIR)/mega65-jtag.cfg.example"; \
 	echo "Packing default WWW theme: $(MIRROR_THEME)"; \
 	tar -cf "$(MIRROR_THEME)" -C sdcard/WWW $(WWW_THEME_FILES); \
-	build_marker="$$(sed -n 's/^#define M65_BUILD_MARKER "\(.*\)"/\1/p' "$(BUILD_DIR)/generated/generated_version.h")"; \
+	build_marker="$$(sed -n 's/^#define M65_BUILD_MARKER "\(.*\)"/\1/p' "$(MIRROR_BUILD_MARKER_FILE)")"; \
 	if [ -z "$$build_marker" ]; then \
-		echo "ERROR: could not read M65_BUILD_MARKER from $(BUILD_DIR)/generated/generated_version.h"; \
+		echo "ERROR: could not read M65_BUILD_MARKER from $(MIRROR_BUILD_MARKER_FILE)"; \
 		exit 1; \
 	fi; \
 	extra_args=(); \

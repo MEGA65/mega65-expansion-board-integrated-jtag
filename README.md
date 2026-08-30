@@ -404,18 +404,17 @@ discovery:
 GET /identity    returns r3:name, r6:name, or r0:name
 ```
 
-`make mirror` is the one-command host setup path. It builds both
-`build-wifi/mega65-pico-jtag.uf2` and
-`build-wifi/mega65-pico-jtag-factory.uf2`, copies the default `sdcard/WWW/`
-files and a `mega65-jtag.cfg.example` into `mirror/`, packs the same web files
-into `mirror/THEMES/mega65-jtag-default-theme.m65jtheme`, then runs
-`m65j.py mirror` so the cores, firmware packages, theme packages, signed
-manifests, and a static `mirror/index.html` landing page are all ready for
+`make mirror` is the one-command host setup path. It builds the factory UF2,
+copies the default `sdcard/WWW/` files and a `mega65-jtag.cfg.example` into
+`mirror/`, packs the same web files into
+`mirror/THEMES/mega65-jtag-default-theme.m65jtheme`, then runs `m65j.py mirror`
+so the cores, firmware packages, theme packages, signed manifests, and a static
+`mirror/index.html` landing page are all ready for
 `python3 -m http.server --directory mirror`.
 
 By default it uses `MIRROR_CHANNEL=stable`, `MIRROR_BOARD=all`,
 `MIRROR_SOURCE_URL=https://files.mega65.org`, `MIRROR_DIR=mirror`, and
-`MIRROR_FIRMWARE=build-wifi/mega65-pico-jtag.uf2`.
+`MIRROR_FIRMWARE=build-wifi/mega65-pico-jtag-factory.uf2`.
 `MIRROR_BOARD=all` emits both `stable-r3.sha256` and `stable-r6.sha256`, with
 the firmware and theme package entries included in both manifests.
 The mirror root also contains `mega65-pico-jtag.uf2` for initial BOOTSEL
