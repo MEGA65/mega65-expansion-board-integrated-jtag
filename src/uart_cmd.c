@@ -16,6 +16,7 @@
 #endif
 
 static uart_cmd_source_t last_cmd_source = UART_CMD_SRC_UART;
+static bool command_echo_enabled = true;
 
 void uart_cmd_init(void)
 {
@@ -27,13 +28,72 @@ void uart_cmd_init(void)
     uart_set_fifo_enabled(M65_UART_ID, true);
 }
 
-static bool feed_line_char(char c, char *buf, size_t buflen, size_t *pos)
+typedef enum {
+    LINE_FEED_NONE = 0,
+    LINE_FEED_READY,
+    LINE_FEED_IGNORED,
+} line_feed_result_t;
+
+static void write_text_to_uart(const char *s)
 {
-    if (c == '\r') return false;
-    if (c == '\n') {
+    bool prev_cr = false;
+    for (; *s; s++) {
+        if (*s == '\n' && !prev_cr) {
+            uart_putc_raw(M65_UART_ID, '\r');
+        }
+        uart_putc_raw(M65_UART_ID, *s);
+        prev_cr = *s == '\r';
+    }
+}
+
+static void write_text_to_usb(const char *s, bool flush)
+{
+#if M65_ENABLE_USB_CDC
+    stdio_put_string(s, -1, false, true);
+    if (flush) fflush(stdout);
+#else
+    (void)s;
+    (void)flush;
+#endif
+}
+
+static void echo_input_char(uart_cmd_source_t src, char c)
+{
+    if (!command_echo_enabled) return;
+
+    const char *s = (c == '\r' || c == '\n') ? "\r\n" : NULL;
+    if (src == UART_CMD_SRC_USB) {
+#if M65_ENABLE_USB_CDC
+        if (s) {
+            stdio_put_string(s, 2, false, false);
+        } else {
+            stdio_put_string(&c, 1, false, false);
+        }
+        fflush(stdout);
+#endif
+        return;
+    }
+
+    if (s) {
+        uart_write_blocking(M65_UART_ID, (const uint8_t *)s, 2);
+    } else {
+        uart_putc_raw(M65_UART_ID, c);
+    }
+}
+
+static line_feed_result_t feed_line_char(char c, char *buf, size_t buflen, size_t *pos, bool *last_was_cr)
+{
+    if (c == '\n' && last_was_cr && *last_was_cr) {
+        *last_was_cr = false;
+        return LINE_FEED_IGNORED;
+    }
+
+    if (last_was_cr) *last_was_cr = c == '\r';
+
+    if (c == '\r' || c == '\n') {
         buf[*pos] = 0;
         *pos = 0;
-        return true;
+        return LINE_FEED_READY;
     }
     if (*pos + 1 < buflen) {
         buf[(*pos)++] = c;
@@ -41,19 +101,23 @@ static bool feed_line_char(char c, char *buf, size_t buflen, size_t *pos)
         // Overflow: drop the partial line. The eventual newline returns blank.
         *pos = 0;
     }
-    return false;
+    return LINE_FEED_NONE;
 }
 
 bool uart_cmd_read_line(char *buf, size_t buflen)
 {
     static size_t uart_pos = 0;
     static size_t usb_pos = 0;
+    static bool uart_last_was_cr = false;
+    static bool usb_last_was_cr = false;
 
     if (!buf || buflen == 0) return false;
 
     while (uart_is_readable(M65_UART_ID)) {
         char c = (char)uart_getc(M65_UART_ID);
-        if (feed_line_char(c, buf, buflen, &uart_pos)) {
+        line_feed_result_t r = feed_line_char(c, buf, buflen, &uart_pos, &uart_last_was_cr);
+        if (r != LINE_FEED_IGNORED) echo_input_char(UART_CMD_SRC_UART, c);
+        if (r == LINE_FEED_READY) {
             last_cmd_source = UART_CMD_SRC_UART;
             return true;
         }
@@ -67,7 +131,9 @@ bool uart_cmd_read_line(char *buf, size_t buflen)
     int n = 0;
     while ((n = stdio_get_until(tmp, (int)sizeof tmp, get_absolute_time())) > 0) {
         for (int i = 0; i < n; i++) {
-            if (feed_line_char(tmp[i], buf, buflen, &usb_pos)) {
+            line_feed_result_t r = feed_line_char(tmp[i], buf, buflen, &usb_pos, &usb_last_was_cr);
+            if (r != LINE_FEED_IGNORED) echo_input_char(UART_CMD_SRC_USB, tmp[i]);
+            if (r == LINE_FEED_READY) {
                 last_cmd_source = UART_CMD_SRC_USB;
                 return true;
             }
@@ -154,13 +220,10 @@ void uart_cmd_puts(const char *s)
 
     // Broadcast replies to both command ports. That is deliberately simple:
     // native MEGA65-side UART control and PC-side USB CDC both see the same log.
-    uart_puts(M65_UART_ID, s);
-#if M65_ENABLE_USB_CDC
+    write_text_to_uart(s);
     // pico_enable_stdio_usb() routes stdout to USB CDC. Keep replies simple;
     // only the binary receive path needs chunking.
-    fputs(s, stdout);
-    fflush(stdout);
-#endif
+    write_text_to_usb(s, true);
 }
 
 void uart_cmd_printf(const char *fmt, ...)
@@ -176,10 +239,17 @@ void uart_cmd_printf(const char *fmt, ...)
 void uart_cmd_log_puts_best_effort(const char *s)
 {
     if (!s) return;
-    size_t len = strlen(s);
 
-    for (size_t i = 0; i < len && uart_is_writable(M65_UART_ID); i++) {
-        uart_putc_raw(M65_UART_ID, s[i]);
+    const char *p = s;
+    bool prev_cr = false;
+    for (; *p && uart_is_writable(M65_UART_ID); p++) {
+        if (*p == '\n' && !prev_cr) {
+            if (!uart_is_writable(M65_UART_ID)) break;
+            uart_putc_raw(M65_UART_ID, '\r');
+        }
+        if (!uart_is_writable(M65_UART_ID)) break;
+        uart_putc_raw(M65_UART_ID, *p);
+        prev_cr = *p == '\r';
     }
 
 #if M65_ENABLE_USB_CDC
@@ -187,7 +257,7 @@ void uart_cmd_log_puts_best_effort(const char *s)
     // The Pico SDK path has bounded timeouts, and we deliberately do not
     // fflush() here. Dropped/truncated progress chatter is better than a wedged
     // network stack or command parser.
-    stdio_put_string(s, (int)len, false, false);
+    write_text_to_usb(s, false);
 #endif
 }
 
@@ -204,6 +274,16 @@ void uart_cmd_log_printf_best_effort(const char *fmt, ...)
 uart_cmd_source_t uart_cmd_last_source(void)
 {
     return last_cmd_source;
+}
+
+void uart_cmd_set_echo(bool enabled)
+{
+    command_echo_enabled = enabled;
+}
+
+bool uart_cmd_echo_enabled(void)
+{
+    return command_echo_enabled;
 }
 
 const char *uart_cmd_source_name(uart_cmd_source_t src)

@@ -43,6 +43,12 @@
 #endif
 
 #define AT_SETTINGS_PATH "AT_SETTINGS.cfg"
+#ifndef M65_CORE_LIST_INDEX_MAX
+#define M65_CORE_LIST_INDEX_MAX 128u
+#endif
+#ifndef M65_CORE_LIST_INDEX_PATH_POOL
+#define M65_CORE_LIST_INDEX_PATH_POOL 8192u
+#endif
 
 static bool sd_mounted = false;
 static remote_auth_config_t remote_cfg;
@@ -59,6 +65,26 @@ static bool remote_init_done = false;
 static bool sd_config_loaded = false;
 static absolute_time_t sd_hotplug_poll_at;
 static bool is_partial_core_path(const char *path);
+static bool make_child_path(const char *dir, const char *name, char *out, size_t out_len);
+
+typedef struct {
+    uint16_t number;
+    uint16_t path_off;
+    uint16_t path_len;
+    bool is_dir;
+    bool is_partial;
+} core_list_index_entry_t;
+
+static core_list_index_entry_t core_list_index[M65_CORE_LIST_INDEX_MAX];
+static char core_list_path_pool[M65_CORE_LIST_INDEX_PATH_POOL];
+static uint16_t core_list_index_count;
+static uint16_t core_list_path_pool_used;
+static bool core_list_index_valid;
+
+typedef struct {
+    const char *dir;
+    uint16_t next_number;
+} numbered_list_ctx_t;
 
 typedef struct {
     int autofetch; // -1 = use mega65-jtag.cfg default, 0 = off, 1 = on
@@ -127,15 +153,6 @@ static bool ensure_mount_quiet(void)
     return true;
 }
 
-static void list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
-{
-    (void)ctx;
-    uart_cmd_printf("%s %lu %s\n",
-                    is_dir ? "DIR" : (is_partial_core_path(name) ? "PARTIAL" : "CORE"),
-                    (unsigned long)size,
-                    name);
-}
-
 static void uart_quoted(const char *s)
 {
     uart_cmd_puts("\"");
@@ -157,6 +174,73 @@ static bool make_child_path(const char *dir, const char *name, char *out, size_t
     size_t n = strlen(dir);
     const char *sep = (n && dir[n - 1] == '/') ? "" : "/";
     return snprintf(out, out_len, "%s%s%s", dir, sep, name) < (int)out_len;
+}
+
+static void core_list_index_begin(void)
+{
+    core_list_index_count = 0;
+    core_list_path_pool_used = 0;
+    core_list_index_valid = false;
+}
+
+static void core_list_index_commit(void)
+{
+    core_list_index_valid = true;
+}
+
+static const char *core_list_index_path(const core_list_index_entry_t *entry)
+{
+    if (!entry || entry->path_off >= core_list_path_pool_used) return "";
+    return core_list_path_pool + entry->path_off;
+}
+
+static bool core_list_index_add(uint16_t number, const char *dir, const char *name, bool is_dir, bool is_partial)
+{
+    if (core_list_index_count >= M65_CORE_LIST_INDEX_MAX) return false;
+
+    char path[256];
+    if (!make_child_path(dir, name, path, sizeof path)) return false;
+
+    size_t path_len = strlen(path);
+    if (path_len + 1u > sizeof core_list_path_pool - core_list_path_pool_used) return false;
+
+    core_list_index_entry_t *entry = &core_list_index[core_list_index_count++];
+    entry->number = number;
+    entry->path_off = core_list_path_pool_used;
+    entry->path_len = (uint16_t)path_len;
+    entry->is_dir = is_dir;
+    entry->is_partial = is_partial;
+    memcpy(core_list_path_pool + entry->path_off, path, path_len + 1u);
+    core_list_path_pool_used = (uint16_t)(core_list_path_pool_used + path_len + 1u);
+    return true;
+}
+
+static const core_list_index_entry_t *core_list_index_find(uint16_t number)
+{
+    if (!core_list_index_valid || number == 0) return NULL;
+    for (uint16_t i = 0; i < core_list_index_count; i++) {
+        if (core_list_index[i].number == number) return &core_list_index[i];
+    }
+    return NULL;
+}
+
+static void list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+{
+    numbered_list_ctx_t *lc = (numbered_list_ctx_t *)ctx;
+    uint16_t number = lc ? lc->next_number++ : 0;
+    char path[256];
+    bool have_path = make_child_path(lc ? lc->dir : "/", name, path, sizeof path);
+    bool is_partial = is_partial_core_path(have_path ? path : name);
+
+    if (number) {
+        (void)core_list_index_add(number, lc ? lc->dir : "/", name, is_dir, is_partial);
+    }
+
+    uart_cmd_printf("%3lu %s %lu %s\n",
+                    (unsigned long)number,
+                    is_dir ? "DIR" : (is_partial ? "PARTIAL" : "CORE"),
+                    (unsigned long)size,
+                    name);
 }
 
 static uint8_t core_effective_board(const core_file_t *cf, const char *path)
@@ -452,6 +536,12 @@ static bool at_command_preserves_autofetch(const char *arg)
         return (reg == 60u || reg == 61u) && end && *end == '?' && end[1] == 0;
     }
 
+    if (toupper((unsigned char)arg[0]) == 'E' &&
+        (arg[1] == '0' || arg[1] == '1') &&
+        arg[2] == 0) {
+        return true;
+    }
+
     if (*arg != '+') return false;
     arg++;
     size_t n = 0;
@@ -726,16 +816,17 @@ static void cmd_help(void)
 {
     uart_cmd_puts(
         "+HELP: AT                  modem attention check\n"
+        "+HELP: ATE0 / ATE1         disable/enable command echo\n"
         "+HELP: ATI                 identify firmware and WiFi capability\n"
         "+HELP: ATD*                novelty dial command\n"
         "+HELP: AT+GO64             enter BASIC command mode\n"
         "+HELP: GO64                enter BASIC command mode\n"
         "+HELP: AT+VERSION?         firmware version and transport status\n"
-        "+HELP: AT+CORELIST[=path]  list .BIT/.COR/.M65J files and dirs\n"
+        "+HELP: AT+CORELIST[=path]  list numbered .BIT/.COR/.M65J files and dirs\n"
         "+HELP: AT+COREDETAIL[=path] detailed list with COR title/version/board\n"
         "+HELP: AT+COREINFO=file    inspect core file\n"
         "+HELP: AT+CORETEST=file    read core payload from SD and discard\n"
-        "+HELP: AT+JTAGLOAD=file    hijack JTAG and program core from SD\n"
+        "+HELP: AT+JTAGLOAD=file|n  hijack JTAG and program core from SD\n"
         "+HELP: AT+JTAGSTREAM=len id stream raw Xilinx payload over serial\n"
         "+HELP: AT+TESTSINK=len     receive/discard bytes; serial throughput test\n"
         "+HELP: AT+FILEWRITE=file len write core file to SD; needs write grant\n"
@@ -1128,36 +1219,49 @@ static void cmd_list(char *arg)
     char *path = unquote_filename(arg);
     if (!path[0]) path = "/";
     uart_cmd_printf("OK L %s\n", path);
-    if (!storage_list_cores(path, list_cb, NULL)) {
+    numbered_list_ctx_t ctx = {
+        .dir = path,
+        .next_number = 1,
+    };
+    core_list_index_begin();
+    if (!storage_list_cores(path, list_cb, &ctx)) {
+        core_list_index_begin();
         uart_cmd_printf("ERR L %s\n", storage_last_error());
         return;
     }
+    core_list_index_commit();
     uart_cmd_puts("END\n");
 }
 
-typedef struct {
-    const char *dir;
-} detail_list_ctx_t;
-
 static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
 {
-    detail_list_ctx_t *dl = (detail_list_ctx_t *)ctx;
+    numbered_list_ctx_t *dl = (numbered_list_ctx_t *)ctx;
+    uint16_t number = dl ? dl->next_number++ : 0;
     char path[256];
     if (!make_child_path(dl && dl->dir ? dl->dir : "/", name, path, sizeof path)) {
-        uart_cmd_puts("+COREERR: path-too-long name=");
+        uart_cmd_printf("+COREERR: index=%lu path-too-long name=", (unsigned long)number);
         uart_quoted(name);
         uart_cmd_puts("\n");
         return;
     }
 
+    bool is_partial = is_partial_core_path(path);
+    if (number) {
+        (void)core_list_index_add(number, dl && dl->dir ? dl->dir : "/", name, is_dir, is_partial);
+    }
+
     if (is_dir) {
-        uart_cmd_printf("+COREDIR: size=%lu path=", (unsigned long)size);
+        uart_cmd_printf("+COREDIR: index=%lu size=%lu path=",
+                        (unsigned long)number,
+                        (unsigned long)size);
         uart_quoted(path);
         uart_cmd_puts("\n");
         return;
     }
-    if (is_partial_core_path(path)) {
-        uart_cmd_printf("+COREPARTIAL: size=%lu path=", (unsigned long)size);
+    if (is_partial) {
+        uart_cmd_printf("+COREPARTIAL: index=%lu size=%lu path=",
+                        (unsigned long)number,
+                        (unsigned long)size);
         uart_quoted(path);
         uart_cmd_puts(" status=\"download in progress\"\n");
         return;
@@ -1165,7 +1269,9 @@ static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *c
 
     core_file_t cf;
     if (!core_open(&cf, path)) {
-        uart_cmd_printf("+COREERR: size=%lu path=", (unsigned long)size);
+        uart_cmd_printf("+COREERR: index=%lu size=%lu path=",
+                        (unsigned long)number,
+                        (unsigned long)size);
         uart_quoted(path);
         uart_cmd_puts(" error=");
         uart_quoted(core_last_error());
@@ -1174,7 +1280,8 @@ static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *c
     }
 
     uint8_t board = core_effective_board(&cf, path);
-    uart_cmd_printf("+COREDETAIL: size=%lu kind=%s board=%s board_id=%lu payload_offset=%lu payload_length=%lu expected_idcode=%08lx path=",
+    uart_cmd_printf("+COREDETAIL: index=%lu size=%lu kind=%s board=%s board_id=%lu payload_offset=%lu payload_length=%lu expected_idcode=%08lx path=",
+                    (unsigned long)number,
                     (unsigned long)size,
                     core_kind_name(cf.kind),
                     core_board_label(board),
@@ -1199,11 +1306,17 @@ static void cmd_detail_list(char *arg)
     char *path = unquote_filename(arg);
     if (!path[0]) path = "/";
     uart_cmd_printf("OK LD %s\n", path);
-    detail_list_ctx_t ctx = { .dir = path };
+    numbered_list_ctx_t ctx = {
+        .dir = path,
+        .next_number = 1,
+    };
+    core_list_index_begin();
     if (!storage_list_cores(path, detail_list_cb, &ctx)) {
+        core_list_index_begin();
         uart_cmd_printf("ERR LD %s\n", storage_last_error());
         return;
     }
+    core_list_index_commit();
     uart_cmd_puts("END\n");
 }
 
@@ -1498,6 +1611,87 @@ static void cmd_test_read(char *arg)
     core_close(&cf);
 }
 
+static bool parse_core_list_number(const char *s, uint16_t *number_out)
+{
+    s = trim_line((char *)s);
+    if (!s || !s[0]) return false;
+    for (const char *p = s; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return false;
+    }
+
+    char *end = NULL;
+    unsigned long n = strtoul(s, &end, 10);
+    if (!end || *end || n == 0 || n > 65535u) return false;
+    if (number_out) *number_out = (uint16_t)n;
+    return true;
+}
+
+static const char *path_basename(const char *path)
+{
+    path = path ? path : "";
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static const char *core_list_resolve_bare_name(const char *name)
+{
+    if (!core_list_index_valid || !name || !name[0]) return NULL;
+    if (strchr(name, '/') || strchr(name, '\\')) return NULL;
+
+    const char *folded_match = NULL;
+    bool folded_ambiguous = false;
+
+    for (uint16_t i = 0; i < core_list_index_count; i++) {
+        const core_list_index_entry_t *entry = &core_list_index[i];
+        if (entry->is_dir || entry->is_partial) continue;
+
+        const char *path = core_list_index_path(entry);
+        const char *base = path_basename(path);
+        if (strcmp(base, name) == 0) return path;
+        if (ci_equal(base, name)) {
+            if (folded_match && strcmp(folded_match, path) != 0) {
+                folded_ambiguous = true;
+            } else {
+                folded_match = path;
+            }
+        }
+    }
+
+    return folded_ambiguous ? NULL : folded_match;
+}
+
+static bool resolve_program_target(char *name, const char **path_out)
+{
+    uint16_t number = 0;
+    if (parse_core_list_number(name, &number)) {
+        if (!core_list_index_valid) {
+            uart_cmd_puts("ERR P no numbered core list; run AT+CORELIST first\n");
+            return false;
+        }
+
+        const core_list_index_entry_t *entry = core_list_index_find(number);
+        if (!entry) {
+            uart_cmd_printf("ERR P no core list entry %lu\n", (unsigned long)number);
+            return false;
+        }
+        if (entry->is_dir) {
+            uart_cmd_printf("ERR P core list entry %lu is a directory\n", (unsigned long)number);
+            return false;
+        }
+        if (entry->is_partial) {
+            uart_cmd_printf("ERR P core list entry %lu is a partial download\n", (unsigned long)number);
+            return false;
+        }
+
+        *path_out = core_list_index_path(entry);
+        return true;
+    }
+
+    const char *listed_path = core_list_resolve_bare_name(name);
+    *path_out = listed_path ? listed_path : name;
+    return true;
+}
+
 static void cmd_program(char *arg)
 {
     if (!ensure_mount()) return;
@@ -1507,8 +1701,11 @@ static void cmd_program(char *arg)
         return;
     }
 
+    const char *path = name;
+    if (!resolve_program_target(name, &path)) return;
+
     core_file_t cf;
-    if (!core_open(&cf, name)) {
+    if (!core_open(&cf, path)) {
         uart_cmd_printf("ERR P %s\n", core_last_error());
         return;
     }
@@ -1914,6 +2111,18 @@ static void dispatch_at(char *arg)
 {
     arg = trim_line(arg);
     if (!arg[0]) {
+        at_ok();
+        return;
+    }
+
+    if (ci_equal(arg, "E0")) {
+        uart_cmd_set_echo(false);
+        at_ok();
+        return;
+    }
+
+    if (ci_equal(arg, "E1")) {
+        uart_cmd_set_echo(true);
         at_ok();
         return;
     }

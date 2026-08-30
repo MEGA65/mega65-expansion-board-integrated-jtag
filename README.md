@@ -151,19 +151,21 @@ Replies are currently broadcast to both ports. This is intentional and keeps MEG
 
 The command set is AT-style by default and remains experimental. Command names,
 responses, fields, and error text may change while the firmware and utilities
-are still at v0.1.
+are still at v0.1. Commands may be terminated with either CR or LF. Text replies
+use CR+LF line endings, and command echo defaults to enabled.
 
 ```text
 AT                         modem attention check
+ATE0 / ATE1                disable/enable command echo
 ATI                        identify firmware and WiFi capability
 ATD*                       novelty dial command
 AT+GO64 or GO64            enter BASIC command mode
 AT+VERSION?                firmware version and transport status
-AT+CORELIST[=path]         list .BIT/.COR/.M65J files and dirs
+AT+CORELIST[=path]         list numbered .BIT/.COR/.M65J files and dirs
 AT+COREDETAIL[=path]       detailed list with COR title/version/board
 AT+COREINFO=file           inspect core file
 AT+CORETEST=file           SD read-speed test; read payload and discard
-AT+JTAGLOAD=file           hijack JTAG and program existing SD core
+AT+JTAGLOAD=file|number    hijack JTAG and program existing SD core
 AT+JTAGSTREAM=len idcode   stream raw payload over serial; USB-only by default
 AT+TESTSINK=len            serial receive/discard speed test
 AT+FILEWRITE=file len      write a core file to SD; USB + physical WE required by default
@@ -212,7 +214,11 @@ python3 tools/m65j.py /dev/ttyACM0 AT+CORELIST=/
 python3 tools/m65j.py /dev/ttyACM0 AT+COREDETAIL=/
 python3 tools/m65j.py /dev/ttyACM0 AT+COREINFO=/cores/mega65r6.cor
 python3 tools/m65j.py /dev/ttyACM0 AT+JTAGLOAD=/cores/mega65r6.cor
+python3 tools/m65j.py /dev/ttyACM0 AT+JTAGLOAD=1
 ```
+
+The numeric `AT+JTAGLOAD` form uses the last successful `AT+CORELIST` or
+`AT+COREDETAIL` result, preserving the exact FAT directory entry name.
 
 Set `M65_ENABLE_LEGACY_UART_COMMANDS=1` at compile time only if you need the
 early bring-up one-letter protocol. `tools/m65j.py` still translates the
@@ -266,7 +272,7 @@ Command:
 AT+JTAGSTATUS?             read JTAG IDCODE plus Xilinx BOOTSTS/STAT/BYPASS
 ```
 
-After `AT+JTAGLOAD=file` or `stream <local.bit>`, the firmware prints a
+After `AT+JTAGLOAD=file`, `AT+JTAGLOAD=number`, or `stream <local.bit>`, the firmware prints a
 diagnostic line before the terminal `OK ... DONE` line:
 
 ```text
