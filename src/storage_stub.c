@@ -1,5 +1,6 @@
 #include "storage.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static char last_err[96] = "storage disabled; build without nofatfs to enable SD/FatFs";
@@ -22,6 +23,7 @@ bool storage_rename(const char *old_path, const char *new_path) { (void)old_path
 bool storage_mkdir(const char *path) { (void)path; return false; }
 bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx) { (void)path; (void)cb; (void)ctx; return false; }
 bool storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx) { (void)path; (void)cb; (void)ctx; return false; }
+void storage_format_timestamp(const storage_timestamp_t *ts, char *out, size_t out_len) { (void)ts; if (out && out_len) snprintf(out, out_len, "-"); }
 void storage_sd_probe(void) {}
 bool storage_sd_may_mount(void) { return false; }
 bool storage_sd_set_transport(const char *name) { (void)name; return false; }

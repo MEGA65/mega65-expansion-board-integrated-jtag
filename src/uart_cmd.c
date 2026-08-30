@@ -274,7 +274,7 @@ void uart_cmd_puts(const char *s)
 
 void uart_cmd_printf(const char *fmt, ...)
 {
-    char tmp[384];
+    char tmp[M65_UART_FORMAT_MAX];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(tmp, sizeof tmp, fmt, ap);
@@ -286,30 +286,19 @@ void uart_cmd_log_puts_best_effort(const char *s)
 {
     if (!s) return;
 
-    const char *p = s;
-    bool prev_cr = false;
-    for (; *p && uart_is_writable(M65_UART_ID); p++) {
-        if (*p == '\n' && !prev_cr) {
-            if (!uart_is_writable(M65_UART_ID)) break;
-            uart_putc_raw(M65_UART_ID, '\r');
-        }
-        if (!uart_is_writable(M65_UART_ID)) break;
-        uart_putc_raw(M65_UART_ID, *p);
-        prev_cr = *p == '\r';
-    }
+    write_text_to_uart(s);
 
 #if M65_ENABLE_USB_CDC
     // Background status lines must never pin the main loop behind a CDC flush.
-    // The Pico SDK path has bounded timeouts, and we deliberately do not
-    // fflush() here. Dropped/truncated progress chatter is better than a wedged
-    // network stack or command parser.
+    // The hardware UART path is fast and blocking so log lines stay intact;
+    // the Pico SDK CDC path stays unflushed to avoid wedging the network stack.
     write_text_to_usb(s, false);
 #endif
 }
 
 void uart_cmd_log_printf_best_effort(const char *fmt, ...)
 {
-    char tmp[384];
+    char tmp[M65_UART_FORMAT_MAX];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(tmp, sizeof tmp, fmt, ap);

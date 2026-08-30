@@ -8,7 +8,21 @@ typedef struct {
     void *impl;
 } storage_file_t;
 
-typedef void (*storage_list_cb_t)(const char *name, uint32_t size, bool is_dir, void *ctx);
+typedef struct {
+    bool valid;
+    uint16_t year;
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t second;
+} storage_timestamp_t;
+
+typedef void (*storage_list_cb_t)(const char *name,
+                                  uint32_t size,
+                                  bool is_dir,
+                                  const storage_timestamp_t *modified,
+                                  void *ctx);
 
 bool storage_mount(void);
 void storage_unmount(void);
@@ -30,6 +44,7 @@ bool storage_rename(const char *old_path, const char *new_path);
 bool storage_mkdir(const char *path);
 bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx);
 bool storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx);
+void storage_format_timestamp(const storage_timestamp_t *ts, char *out, size_t out_len);
 
 void storage_sd_probe(void);
 bool storage_sd_may_mount(void);

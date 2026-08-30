@@ -23,6 +23,9 @@
 #ifndef M65_UART_TEXT_PACE_CHARS
 #define M65_UART_TEXT_PACE_CHARS 96u
 #endif
+#ifndef M65_UART_FORMAT_MAX
+#define M65_UART_FORMAT_MAX 768u
+#endif
 
 // Also accept commands on the Pico's native USB CDC serial port.
 // CMake enables pico_stdio_usb(); this switch controls the command parser use.

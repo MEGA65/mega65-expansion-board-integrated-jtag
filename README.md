@@ -162,8 +162,8 @@ ATI                        identify firmware and WiFi capability
 ATD*                       novelty dial command
 AT+GO64 or GO64            enter BASIC command mode
 AT+VERSION?                firmware version and transport status
-AT+CORELIST[=path]         list numbered .BIT/.COR/.M65J files and dirs
-AT+COREDETAIL[=path]       detailed list with COR title/version/board
+AT+CORELIST[=path]         list numbered .BIT/.COR/.M65J files, dirs and dates
+AT+COREDETAIL[=path]       detailed list with dates/COR title/version/board
 AT+COREINFO=file           inspect core file
 AT+CORETEST=file           SD read-speed test; read payload and discard
 AT+JTAGLOAD=file|number    hijack JTAG and program existing SD core

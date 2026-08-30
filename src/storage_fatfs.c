@@ -215,6 +215,48 @@ void storage_close(storage_file_t *f)
     }
 }
 
+static storage_timestamp_t fatfs_timestamp(uint16_t fdate, uint16_t ftime)
+{
+    storage_timestamp_t ts = {0};
+    if (fdate == 0) return ts;
+
+    uint16_t year = (uint16_t)(1980u + ((fdate >> 9) & 0x7fu));
+    uint8_t month = (uint8_t)((fdate >> 5) & 0x0fu);
+    uint8_t day = (uint8_t)(fdate & 0x1fu);
+    uint8_t hour = (uint8_t)((ftime >> 11) & 0x1fu);
+    uint8_t minute = (uint8_t)((ftime >> 5) & 0x3fu);
+    uint8_t second = (uint8_t)((ftime & 0x1fu) * 2u);
+
+    if (month < 1u || month > 12u || day < 1u || day > 31u ||
+        hour > 23u || minute > 59u || second > 59u) {
+        return ts;
+    }
+
+    ts.valid = true;
+    ts.year = year;
+    ts.month = month;
+    ts.day = day;
+    ts.hour = hour;
+    ts.minute = minute;
+    ts.second = second;
+    return ts;
+}
+
+void storage_format_timestamp(const storage_timestamp_t *ts, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    if (!ts || !ts->valid) {
+        snprintf(out, out_len, "-");
+        return;
+    }
+    snprintf(out, out_len, "%04u-%02u-%02u %02u:%02u",
+             (unsigned)ts->year,
+             (unsigned)ts->month,
+             (unsigned)ts->day,
+             (unsigned)ts->hour,
+             (unsigned)ts->minute);
+}
+
 static bool has_core_ext(const char *name)
 {
     const char *dot = strrchr(name, '.');
@@ -306,7 +348,8 @@ static bool storage_list_filtered(const char *path, storage_list_cb_t cb, void *
         if (!cores_only || is_dir || has_core_ext(fi.fname) ||
             (in_theme_dir && has_theme_ext(fi.fname)) ||
             has_partial_core_ext(fi.fname)) {
-            cb(fi.fname, (uint32_t)fi.fsize, is_dir, ctx);
+            storage_timestamp_t modified = fatfs_timestamp(fi.fdate, fi.ftime);
+            cb(fi.fname, (uint32_t)fi.fsize, is_dir, &modified, ctx);
         }
     }
     f_closedir(&dir);

@@ -158,6 +158,13 @@ static void uart_quoted(const char *s)
     uart_cmd_puts("\"");
 }
 
+static void uart_status_line(const char *prefix, const char *status)
+{
+    uart_cmd_puts(prefix ? prefix : "");
+    uart_cmd_puts(status ? status : "");
+    uart_cmd_puts("\r\n");
+}
+
 static bool make_child_path(const char *dir, const char *name, char *out, size_t out_len)
 {
     if (!dir || !dir[0] || strcmp(dir, "/") == 0) {
@@ -180,18 +187,21 @@ static void core_list_context_commit(const char *dir)
     core_list_last_dir_valid = true;
 }
 
-static void list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+static void list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     numbered_list_ctx_t *lc = (numbered_list_ctx_t *)ctx;
     uint16_t number = lc ? lc->next_number++ : 0;
     char path[256];
+    char modified_text[24];
     bool have_path = make_child_path(lc ? lc->dir : "/", name, path, sizeof path);
     bool is_partial = is_partial_core_path(have_path ? path : name);
+    storage_format_timestamp(modified, modified_text, sizeof modified_text);
 
-    uart_cmd_printf("%3lu %s %lu %s\n",
+    uart_cmd_printf("%3lu %s %lu %s %s\n",
                     (unsigned long)number,
                     is_dir ? "DIR" : (is_partial ? "PARTIAL" : "CORE"),
                     (unsigned long)size,
+                    modified_text,
                     name);
 }
 
@@ -775,8 +785,8 @@ static void cmd_help(void)
         "+HELP: AT+GO64             enter BASIC command mode\n"
         "+HELP: GO64                enter BASIC command mode\n"
         "+HELP: AT+VERSION?         firmware version and transport status\n"
-        "+HELP: AT+CORELIST[=path]  list numbered .BIT/.COR/.M65J files and dirs\n"
-        "+HELP: AT+COREDETAIL[=path] detailed list with COR title/version/board\n"
+        "+HELP: AT+CORELIST[=path]  list numbered .BIT/.COR/.M65J files, dirs and dates\n"
+        "+HELP: AT+COREDETAIL[=path] detailed list with dates/COR title/version/board\n"
         "+HELP: AT+COREINFO=file    inspect core file\n"
         "+HELP: AT+CORETEST=file    read core payload from SD and discard\n"
         "+HELP: AT+JTAGLOAD=file|n  hijack JTAG and program core from SD\n"
@@ -964,17 +974,17 @@ static void cmd_remote(void)
 
 static void cmd_wifi(void)
 {
-    uart_cmd_printf("+WIFI: %s\r\n", remote_http_status());
-    uart_cmd_printf("+WIFIDIAG: %s\r\n", remote_http_wifi_diag());
+    uart_status_line("+WIFI: ", remote_http_status());
+    uart_status_line("+WIFIDIAG: ", remote_http_wifi_diag());
     at_ok();
 }
 
 static void cmd_wifi_probe(void)
 {
     bool scheduled = remote_http_wifi_probe_now();
-    uart_cmd_printf("+WIFIPROBE: scheduled=%lu %s\r\n",
-                    (unsigned long)(scheduled ? 1u : 0u),
-                    remote_http_wifi_diag());
+    uart_cmd_printf("+WIFIPROBE: scheduled=%lu ", (unsigned long)(scheduled ? 1u : 0u));
+    uart_cmd_puts(remote_http_wifi_diag());
+    uart_cmd_puts("\r\n");
     at_ok();
 }
 
@@ -990,9 +1000,9 @@ static void cmd_autofetch(char *arg, bool have_value)
         at_settings.autofetch = b ? 1 : 0;
         remote_http_autofetch_reset_schedule();
     }
-    uart_cmd_printf("OK AF override=%d %s\r\n",
-                    at_settings.autofetch,
-                    remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+    uart_cmd_printf("OK AF override=%d ", at_settings.autofetch);
+    uart_cmd_puts(remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+    uart_cmd_puts("\r\n");
 }
 
 static void cmd_fetch_interval(char *arg, bool have_value)
@@ -1008,9 +1018,9 @@ static void cmd_fetch_interval(char *arg, bool have_value)
         at_settings.fetch_interval_hours = (uint32_t)hours;
         remote_http_autofetch_reset_schedule();
     }
-    uart_cmd_printf("OK FI override_hours=%lu %s\r\n",
-                    (unsigned long)at_settings.fetch_interval_hours,
-                    remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+    uart_cmd_printf("OK FI override_hours=%lu ", (unsigned long)at_settings.fetch_interval_hours);
+    uart_cmd_puts(remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+    uart_cmd_puts("\r\n");
 }
 
 static void cmd_fetch_board(char *arg, bool have_value)
@@ -1027,9 +1037,10 @@ static void cmd_fetch_board(char *arg, bool have_value)
         }
         remote_http_autofetch_reset_schedule();
     }
-    uart_cmd_printf("OK FB override_board=%s %s\r\n",
-                    at_settings.fetch_board_rev ? core_board_label(at_settings.fetch_board_rev) : "remote",
-                    remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+    uart_cmd_printf("OK FB override_board=%s ",
+                    at_settings.fetch_board_rev ? core_board_label(at_settings.fetch_board_rev) : "remote");
+    uart_cmd_puts(remote_http_autofetch_status(at_settings.autofetch, at_settings.fetch_interval_hours, at_settings.fetch_board_rev));
+    uart_cmd_puts("\r\n");
 }
 
 static void cmd_machine(char *arg, bool have_value)
@@ -1064,10 +1075,10 @@ static void cmd_machine(char *arg, bool have_value)
 
 static void cmd_fetch_status(void)
 {
-    uart_cmd_printf("+FETCHSTATUS: %s\r\n",
-                    remote_http_autofetch_status(at_settings.autofetch,
-                                                 at_settings.fetch_interval_hours,
-                                                 at_settings.fetch_board_rev));
+    uart_status_line("+FETCHSTATUS: ",
+                     remote_http_autofetch_status(at_settings.autofetch,
+                                                  at_settings.fetch_interval_hours,
+                                                  at_settings.fetch_board_rev));
     at_ok();
 }
 
@@ -1089,17 +1100,17 @@ static void cmd_fetch_now(char *arg, bool have_value, bool query)
     bool started = remote_http_autofetch_start_now(at_settings.autofetch,
                                                   at_settings.fetch_interval_hours,
                                                   board);
-    uart_cmd_printf("+FETCHNOW: started=%lu %s\r\n",
-                    (unsigned long)(started ? 1u : 0u),
-                    remote_http_autofetch_status(at_settings.autofetch,
-                                                 at_settings.fetch_interval_hours,
-                                                 board));
+    uart_cmd_printf("+FETCHNOW: started=%lu ", (unsigned long)(started ? 1u : 0u));
+    uart_cmd_puts(remote_http_autofetch_status(at_settings.autofetch,
+                                               at_settings.fetch_interval_hours,
+                                               board));
+    uart_cmd_puts("\r\n");
     at_ok();
 }
 
 static void cmd_firmware_status(void)
 {
-    uart_cmd_printf("+FWSTATUS: %s\r\n", remote_http_firmware_status());
+    uart_status_line("+FWSTATUS: ", remote_http_firmware_status());
     at_ok();
 }
 
@@ -1119,7 +1130,7 @@ static void cmd_firmware_update(void)
 
 static void cmd_theme_status(void)
 {
-    uart_cmd_printf("+THEMESTATUS: %s\r\n", remote_http_theme_status());
+    uart_status_line("+THEMESTATUS: ", remote_http_theme_status());
     at_ok();
 }
 
@@ -1186,7 +1197,15 @@ static void cmd_list(char *arg)
     uart_cmd_puts("END\n");
 }
 
-static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+static void uart_modified_field(const storage_timestamp_t *modified)
+{
+    char modified_text[24];
+    storage_format_timestamp(modified, modified_text, sizeof modified_text);
+    uart_cmd_puts(" modified=");
+    uart_quoted(modified_text);
+}
+
+static void detail_list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     numbered_list_ctx_t *dl = (numbered_list_ctx_t *)ctx;
     uint16_t number = dl ? dl->next_number++ : 0;
@@ -1194,6 +1213,7 @@ static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *c
     if (!make_child_path(dl && dl->dir ? dl->dir : "/", name, path, sizeof path)) {
         uart_cmd_printf("+COREERR: index=%lu path-too-long name=", (unsigned long)number);
         uart_quoted(name);
+        uart_modified_field(modified);
         uart_cmd_puts("\n");
         return;
     }
@@ -1205,6 +1225,7 @@ static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *c
                         (unsigned long)number,
                         (unsigned long)size);
         uart_quoted(path);
+        uart_modified_field(modified);
         uart_cmd_puts("\n");
         return;
     }
@@ -1213,6 +1234,7 @@ static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *c
                         (unsigned long)number,
                         (unsigned long)size);
         uart_quoted(path);
+        uart_modified_field(modified);
         uart_cmd_puts(" status=\"download in progress\"\n");
         return;
     }
@@ -1223,6 +1245,7 @@ static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *c
                         (unsigned long)number,
                         (unsigned long)size);
         uart_quoted(path);
+        uart_modified_field(modified);
         uart_cmd_puts(" error=");
         uart_quoted(core_last_error());
         uart_cmd_puts("\n");
@@ -1240,6 +1263,7 @@ static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *c
                     (unsigned long)cf.payload_length,
                     (unsigned long)cf.expected_idcode);
     uart_quoted(path);
+    uart_modified_field(modified);
     uart_cmd_puts(" title=");
     uart_quoted(cf.title[0] ? cf.title : "");
     uart_cmd_puts(" version=");
@@ -1583,9 +1607,10 @@ static const char *path_basename(const char *path)
     return slash ? slash + 1 : path;
 }
 
-static void numbered_resolve_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+static void numbered_resolve_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
+    (void)modified;
     numbered_resolve_ctx_t *rc = (numbered_resolve_ctx_t *)ctx;
     if (!rc || rc->found) return;
 
@@ -1644,9 +1669,10 @@ typedef struct {
     bool folded_ambiguous;
 } bare_name_resolve_ctx_t;
 
-static void bare_name_resolve_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+static void bare_name_resolve_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
+    (void)modified;
     bare_name_resolve_ctx_t *bc = (bare_name_resolve_ctx_t *)ctx;
     if (!bc || !bc->name || is_dir) return;
 
@@ -1766,8 +1792,9 @@ typedef struct {
     uint8_t board_rev;
 } basic_list_ctx_t;
 
-static void basic_list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+static void basic_list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
+    (void)modified;
     basic_list_ctx_t *bl = (basic_list_ctx_t *)ctx;
     if (!is_dir && is_partial_core_path(name)) return;
     if (!is_dir && bl && (bl->board_rev == 3 || bl->board_rev == 6)) {
@@ -2045,13 +2072,13 @@ static void cmd_fetch(char *arg)
         return;
     }
     uart_cmd_printf("+DOWNLOAD: queued url=%s path=%s\n", url, dest);
-    uart_cmd_printf("+DOWNLOADSTATUS: %s\n", remote_http_download_status());
+    uart_status_line("+DOWNLOADSTATUS: ", remote_http_download_status());
     at_ok();
 }
 
 static void cmd_download_status(void)
 {
-    uart_cmd_printf("+DOWNLOADSTATUS: %s\r\n", remote_http_download_status());
+    uart_status_line("+DOWNLOADSTATUS: ", remote_http_download_status());
     at_ok();
 }
 

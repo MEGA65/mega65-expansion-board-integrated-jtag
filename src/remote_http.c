@@ -361,7 +361,7 @@ static bool remote_init_after_probe_pending;
 static uint32_t wifi_hardware_fault_stage;
 static uint32_t wifi_probe_attempts;
 static int wifi_init_rc = -9999;
-static char wifi_diag_buf[320];
+static char wifi_diag_buf[512];
 static wifi_assoc_state_t wifi_assoc_state = WIFI_ASSOC_OFF;
 static absolute_time_t wifi_assoc_deadline;
 static absolute_time_t wifi_assoc_retry_at;
@@ -406,7 +406,7 @@ static manifest_kind_t autofetch_pending_kind;
 static char autofetch_pending_version[48];
 static char autofetch_pending_build[64];
 static char autofetch_pending_name[48];
-static char autofetch_status_buf[320] = "autofetch=idle";
+static char autofetch_status_buf[512] = "autofetch=idle";
 static char pending_firmware_version[48];
 static char pending_firmware_build[64];
 static char pending_firmware_source[224];
@@ -415,13 +415,13 @@ static char pending_theme_name[48];
 static char pending_theme_version[48];
 static char pending_theme_source[224];
 static bool pending_theme_seen;
-static char firmware_status_buf[256] = "firmware=none";
-static char theme_status_buf[256] = "theme=none";
+static char firmware_status_buf[512] = "firmware=none";
+static char theme_status_buf[512] = "theme=none";
 static fetch_ctx_t download_fc;
 static download_job_t download_jobs[M65_DOWNLOAD_QUEUE_DEPTH];
 static int download_active_job = -1;
 static uint8_t download_next_slot;
-static char download_status_buf[320] = "downloads=idle";
+static char download_status_buf[512] = "downloads=idle";
 static bool autofetch_hash_active;
 static uint32_t autofetch_hash_done;
 static uint32_t autofetch_hash_size;
@@ -437,7 +437,7 @@ static bool favicon_cache_loaded;
 static void remote_log(uint8_t level, const char *fmt, ...)
 {
     if (remote_verbose < level) return;
-    char msg[384];
+    char msg[M65_UART_FORMAT_MAX];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof msg, fmt, ap);
@@ -611,11 +611,11 @@ static const char default_top[] =
     "<span>{WRITE_GRANT_MESSAGE}</span><span>Policy: {WRITE_GRANT_REQUIRED}</span></section>"
     "{FIRMWARE_UPDATE_PANEL}{THEME_INSTALL_PANEL}"
     "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a> <a class=\"fetch-now\" href=\"{FETCH_NOW_URL}\">Check for updated cores</a></nav>"
-    "<table><thead><tr><th>Core</th><th>Bytes</th><th>Actions</th></tr></thead><tbody>\n";
+    "<table><thead><tr><th>Core</th><th>Modified</th><th>Bytes</th><th>Actions</th></tr></thead><tbody>\n";
 static const char default_row[] =
     "<tr class=\"entry-row\" data-kind=\"{TYPE}\"><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
     "<a class=\"core-name\" href=\"{PRIMARY_URL}\">{FILENAME}</a><div class=\"meta\">{CORE_META}</div></td>"
-    "<td>{SIZE}</td><td>{ACTIONS}</td></tr>\n";
+    "<td>{MODIFIED}</td><td>{SIZE}</td><td>{ACTIONS}</td></tr>\n";
 static const char default_bottom[] =
     "</tbody></table><script>"
     "function launchCoreLink(){return true;}"
@@ -1678,9 +1678,10 @@ typedef struct {
     uint32_t count;
 } theme_scan_ctx_t;
 
-static void theme_scan_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+static void theme_scan_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
+    (void)modified;
     theme_scan_ctx_t *ts = (theme_scan_ctx_t *)ctx;
     if (!ts || is_dir || !safe_theme_package_name(name)) return;
     if (!ts->first[0]) snprintf(ts->first, sizeof ts->first, "%s", name);
@@ -1894,6 +1895,7 @@ static void substitution_value(const char *name,
                                const char *dir_path,
                                uint32_t size,
                                bool is_dir,
+                               const storage_timestamp_t *modified,
                                uint8_t board_rev,
                                char *out,
                                size_t out_len)
@@ -1903,9 +1905,11 @@ static void substitution_value(const char *name,
     char encoded_return[320];
     char js_name[256];
     char url[320];
+    char modified_text[24];
     char tmp[300];
     bool is_partial = !is_dir && is_partial_core_path(file_path);
     bool is_theme = !is_dir && has_theme_ext(file_path);
+    storage_format_timestamp(modified, modified_text, sizeof modified_text);
     if (ci_equal(name, "WRITE_GRANT_STATUS")) {
         if (!http_cfg.require_write_grant) snprintf(out, out_len, "not-required");
         else snprintf(out, out_len, "%s", write_gate_active() ? "active" : "inactive");
@@ -2026,6 +2030,19 @@ static void substitution_value(const char *name,
     } else if (ci_equal(name, "SIZE")) {
         if (is_dir) snprintf(out, out_len, "-");
         else snprintf(out, out_len, "%lu", (unsigned long)size);
+    } else if (ci_equal(name, "MODIFIED") || ci_equal(name, "DATETIME")) {
+        html_escape(modified_text, out, out_len);
+    } else if (ci_equal(name, "MODIFIED_DATE") || ci_equal(name, "DATE")) {
+        if (modified_text[0] == '-') snprintf(out, out_len, "-");
+        else {
+            char date[11];
+            memcpy(date, modified_text, 10);
+            date[10] = 0;
+            html_escape(date, out, out_len);
+        }
+    } else if (ci_equal(name, "MODIFIED_TIME") || ci_equal(name, "TIME")) {
+        if (modified_text[0] == '-') snprintf(out, out_len, "-");
+        else html_escape(modified_text + 11, out, out_len);
     } else if (ci_equal(name, "PRIMARY_LABEL")) {
         snprintf(out, out_len, "%s", is_dir ? "Open" : (is_partial ? "Downloading" : (is_theme ? "Set Theme" : "Launch Core")));
     } else if (ci_equal(name, "PRIMARY_URL")) {
@@ -2123,6 +2140,7 @@ static void template_feed_char(page_builder_t *pb,
                                const char *dir_path,
                                uint32_t size,
                                bool is_dir,
+                               const storage_timestamp_t *modified,
                                uint8_t board_rev)
 {
     if (!tp->in_placeholder) {
@@ -2141,8 +2159,8 @@ static void template_feed_char(page_builder_t *pb,
             return;
         }
         tp->name[tp->name_len] = 0;
-        char value[320];
-        substitution_value(tp->name, file_name, file_path, dir_path, size, is_dir, board_rev, value, sizeof value);
+        char value[512];
+        substitution_value(tp->name, file_name, file_path, dir_path, size, is_dir, modified, board_rev, value, sizeof value);
         page_append(pb, value);
         tp->in_placeholder = false;
         tp->name_len = 0;
@@ -2169,11 +2187,12 @@ static void append_substituted(page_builder_t *pb,
                                const char *dir_path,
                                uint32_t size,
                                bool is_dir,
+                               const storage_timestamp_t *modified,
                                uint8_t board_rev)
 {
     template_parser_t tp = {0};
     for (const char *p = tmpl; p && *p; p++) {
-        template_feed_char(pb, &tp, *p, file_name, file_path, dir_path, size, is_dir, board_rev);
+        template_feed_char(pb, &tp, *p, file_name, file_path, dir_path, size, is_dir, modified, board_rev);
     }
     template_finish(pb, &tp);
 }
@@ -2185,6 +2204,7 @@ static bool append_substituted_file(page_builder_t *pb,
                                     const char *dir_path,
                                     uint32_t size,
                                     bool is_dir,
+                                    const storage_timestamp_t *modified,
                                     uint8_t board_rev)
 {
     storage_file_t f = {0};
@@ -2201,7 +2221,7 @@ static bool append_substituted_file(page_builder_t *pb,
         }
         if (got == 0) break;
         for (size_t i = 0; i < got; i++) {
-            template_feed_char(pb, &tp, (char)chunk[i], file_name, file_path, dir_path, size, is_dir, board_rev);
+            template_feed_char(pb, &tp, (char)chunk[i], file_name, file_path, dir_path, size, is_dir, modified, board_rev);
         }
     }
     storage_close(&f);
@@ -2217,13 +2237,14 @@ static void append_template_or_fallback(page_builder_t *pb,
                                         const char *dir_path,
                                         uint32_t size,
                                         bool is_dir,
+                                        const storage_timestamp_t *modified,
                                         uint8_t board_rev)
 {
-    if (append_substituted_file(pb, path, file_name, file_path, dir_path, size, is_dir, board_rev)) return;
-    append_substituted(pb, fallback, file_name, file_path, dir_path, size, is_dir, board_rev);
+    if (append_substituted_file(pb, path, file_name, file_path, dir_path, size, is_dir, modified, board_rev)) return;
+    append_substituted(pb, fallback, file_name, file_path, dir_path, size, is_dir, modified, board_rev);
 }
 
-static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+static void index_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     index_list_ctx_t *il = (index_list_ctx_t *)ctx;
     if (il->pb->len + 512u >= il->pb->cap) {
@@ -2248,7 +2269,7 @@ static void index_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
         core_close(&cf);
         if (!match) return;
     }
-    append_substituted(il->pb, il->row_template, name, full_path, il->dir_path, size, is_dir, il->board_rev);
+    append_substituted(il->pb, il->row_template, name, full_path, il->dir_path, size, is_dir, modified, il->board_rev);
     il->rows++;
 }
 
@@ -2389,6 +2410,7 @@ static err_t send_busy_page(http_conn_t *c)
                        "/",
                        0,
                        false,
+                       NULL,
                        0);
     err_t ret = send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
     free(page_buf);
@@ -2597,7 +2619,7 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
 
     page_builder_t pb = { .buf = page_buf, .cap = M65_HTTP_PAGE_MAX };
     page_buf[0] = 0;
-    append_template_or_fallback(&pb, "WWW/index_top.html", default_top, NULL, NULL, dir_path, 0, false, board_rev);
+    append_template_or_fallback(&pb, "WWW/index_top.html", default_top, NULL, NULL, dir_path, 0, false, NULL, board_rev);
 
     index_list_ctx_t il = {
         .pb = &pb,
@@ -2606,12 +2628,12 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         .board_rev = board_rev,
     };
     if (!storage_list_cores(dir_path, index_cb, &il)) {
-        page_append(&pb, "<tr><td colspan=\"3\">SD list failed</td></tr>\n");
+        page_append(&pb, "<tr><td colspan=\"4\">SD list failed</td></tr>\n");
     }
     if (il.truncated) {
-        page_append(&pb, "<tr><td colspan=\"3\">List truncated</td></tr>\n");
+        page_append(&pb, "<tr><td colspan=\"4\">List truncated</td></tr>\n");
     }
-    append_template_or_fallback(&pb, "WWW/index_bottom.html", default_bottom, NULL, NULL, dir_path, 0, false, board_rev);
+    append_template_or_fallback(&pb, "WWW/index_bottom.html", default_bottom, NULL, NULL, dir_path, 0, false, NULL, board_rev);
     err_t ret = send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
     free(page_buf);
     return ret;
@@ -4114,9 +4136,10 @@ typedef struct {
 
 static void delete_partial_tree(const char *dir, uint32_t *deleted);
 
-static void delete_partial_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+static void delete_partial_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
+    (void)modified;
     partial_cleanup_ctx_t *pc = (partial_cleanup_ctx_t *)ctx;
     if (!pc || !name || !name[0]) return;
 
@@ -4840,7 +4863,7 @@ const char *remote_http_autofetch_status(int enabled_override, uint32_t interval
     uint8_t board_rev = effective_fetch_board(board_rev_override);
     const char *state = autofetch_status_buf[0] ? autofetch_status_buf : "autofetch=idle";
     uint32_t last_seconds = remote_http_autofetch_last_success_seconds();
-    static char buf[320];
+    static char buf[640];
     snprintf(buf, sizeof buf,
              "%s enabled=%lu interval_hours=%lu board=R%u last_success_seconds=%lu running=%lu",
              state,
@@ -4894,9 +4917,10 @@ typedef struct {
 
 static void delete_tree(const char *dir, bool delete_self, bool *ok);
 
-static void delete_tree_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+static void delete_tree_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
+    (void)modified;
     delete_tree_ctx_t *dt = (delete_tree_ctx_t *)ctx;
     if (!dt || !dt->ok || !name || !name[0]) return;
 
