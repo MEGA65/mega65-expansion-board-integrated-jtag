@@ -37,12 +37,23 @@ typedef enum {
 static void write_text_to_uart(const char *s)
 {
     bool prev_cr = false;
+    uint32_t chars_since_pause = 0;
     for (; *s; s++) {
         if (*s == '\n' && !prev_cr) {
             uart_putc_raw(M65_UART_ID, '\r');
+            chars_since_pause++;
         }
         uart_putc_raw(M65_UART_ID, *s);
+        chars_since_pause++;
         prev_cr = *s == '\r';
+#if M65_UART_TEXT_PACE_US > 0
+        if (*s == '\n' ||
+            (M65_UART_TEXT_PACE_CHARS != 0u && chars_since_pause >= M65_UART_TEXT_PACE_CHARS)) {
+            uart_tx_wait_blocking(M65_UART_ID);
+            sleep_us(M65_UART_TEXT_PACE_US);
+            chars_since_pause = 0;
+        }
+#endif
     }
 }
 
@@ -81,7 +92,29 @@ static void echo_input_char(uart_cmd_source_t src, char c)
     }
 }
 
-static line_feed_result_t feed_line_char(char c, char *buf, size_t buflen, size_t *pos, bool *last_was_cr)
+static void echo_erase_chars(uart_cmd_source_t src, size_t count)
+{
+    if (!command_echo_enabled) return;
+
+    static const char erase[] = "\b \b";
+    while (count--) {
+        if (src == UART_CMD_SRC_USB) {
+#if M65_ENABLE_USB_CDC
+            stdio_put_string(erase, 3, false, false);
+            fflush(stdout);
+#endif
+        } else {
+            uart_write_blocking(M65_UART_ID, (const uint8_t *)erase, 3);
+        }
+    }
+}
+
+static line_feed_result_t feed_line_char(uart_cmd_source_t src,
+                                         char c,
+                                         char *buf,
+                                         size_t buflen,
+                                         size_t *pos,
+                                         bool *last_was_cr)
 {
     if (c == '\n' && last_was_cr && *last_was_cr) {
         *last_was_cr = false;
@@ -93,10 +126,25 @@ static line_feed_result_t feed_line_char(char c, char *buf, size_t buflen, size_
     if (c == '\r' || c == '\n') {
         buf[*pos] = 0;
         *pos = 0;
+        echo_input_char(src, c);
         return LINE_FEED_READY;
+    }
+    if (c == '\b' || c == 0x7f) {
+        if (*pos) {
+            (*pos)--;
+            echo_erase_chars(src, 1);
+        }
+        return LINE_FEED_IGNORED;
+    }
+    if (c == 0x15) {
+        size_t erased = *pos;
+        *pos = 0;
+        echo_erase_chars(src, erased);
+        return LINE_FEED_IGNORED;
     }
     if (*pos + 1 < buflen) {
         buf[(*pos)++] = c;
+        echo_input_char(src, c);
     } else {
         // Overflow: drop the partial line. The eventual newline returns blank.
         *pos = 0;
@@ -115,8 +163,7 @@ bool uart_cmd_read_line(char *buf, size_t buflen)
 
     while (uart_is_readable(M65_UART_ID)) {
         char c = (char)uart_getc(M65_UART_ID);
-        line_feed_result_t r = feed_line_char(c, buf, buflen, &uart_pos, &uart_last_was_cr);
-        if (r != LINE_FEED_IGNORED) echo_input_char(UART_CMD_SRC_UART, c);
+        line_feed_result_t r = feed_line_char(UART_CMD_SRC_UART, c, buf, buflen, &uart_pos, &uart_last_was_cr);
         if (r == LINE_FEED_READY) {
             last_cmd_source = UART_CMD_SRC_UART;
             return true;
@@ -131,8 +178,7 @@ bool uart_cmd_read_line(char *buf, size_t buflen)
     int n = 0;
     while ((n = stdio_get_until(tmp, (int)sizeof tmp, get_absolute_time())) > 0) {
         for (int i = 0; i < n; i++) {
-            line_feed_result_t r = feed_line_char(tmp[i], buf, buflen, &usb_pos, &usb_last_was_cr);
-            if (r != LINE_FEED_IGNORED) echo_input_char(UART_CMD_SRC_USB, tmp[i]);
+            line_feed_result_t r = feed_line_char(UART_CMD_SRC_USB, tmp[i], buf, buflen, &usb_pos, &usb_last_was_cr);
             if (r == LINE_FEED_READY) {
                 last_cmd_source = UART_CMD_SRC_USB;
                 return true;

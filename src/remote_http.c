@@ -1581,6 +1581,15 @@ static void record_theme_candidate(const manifest_entry_t *entry)
     (void)write_text_file(M65_THEME_INFO_PATH, info);
 }
 
+static char *trim_ascii_in_place(char *s)
+{
+    if (!s) return s;
+    while (*s && isspace((unsigned char)*s)) s++;
+    char *e = s + strlen(s);
+    while (e > s && isspace((unsigned char)e[-1])) *--e = 0;
+    return s;
+}
+
 static void parse_info_line(char *line, char *key, size_t key_len, char *value, size_t value_len)
 {
     if (key_len) key[0] = 0;
@@ -1588,8 +1597,8 @@ static void parse_info_line(char *line, char *key, size_t key_len, char *value, 
     char *eq = strchr(line, '=');
     if (!eq) return;
     *eq++ = 0;
-    snprintf(key, key_len, "%s", line);
-    snprintf(value, value_len, "%s", eq);
+    snprintf(key, key_len, "%s", trim_ascii_in_place(line));
+    snprintf(value, value_len, "%s", trim_ascii_in_place(eq));
 }
 
 static void load_pending_info_file(const char *path,
@@ -1631,9 +1640,27 @@ static void load_pending_info_file(const char *path,
     }
 }
 
+static void clear_pending_firmware_candidate(void)
+{
+    pending_firmware_version[0] = 0;
+    pending_firmware_build[0] = 0;
+    pending_firmware_source[0] = 0;
+    pending_firmware_seen = false;
+}
+
+static bool pending_firmware_version_is_current(void)
+{
+    if (!pending_firmware_version[0]) return false;
+    return ci_equal(pending_firmware_version, M65_FIRMWARE_VERSION) ||
+           ci_equal(pending_firmware_version, M65_VERSION_STRING);
+}
+
 bool firmware_update_available(void)
 {
-    if (!storage_file_exists(M65_FIRMWARE_PACKAGE_PATH)) return false;
+    if (!storage_file_exists(M65_FIRMWARE_PACKAGE_PATH)) {
+        clear_pending_firmware_candidate();
+        return false;
+    }
     if (!pending_firmware_seen) {
         load_pending_info_file(M65_FIRMWARE_INFO_PATH,
                                pending_firmware_version, sizeof pending_firmware_version, "version",
@@ -1642,7 +1669,7 @@ bool firmware_update_available(void)
         pending_firmware_seen = pending_firmware_version[0] || pending_firmware_build[0] || pending_firmware_source[0];
     }
     if (pending_firmware_build[0]) return strcmp(pending_firmware_build, M65_BUILD_MARKER) != 0;
-    if (pending_firmware_version[0]) return strcmp(pending_firmware_version, M65_VERSION_STRING) != 0;
+    if (pending_firmware_version[0]) return !pending_firmware_version_is_current();
     return true;
 }
 

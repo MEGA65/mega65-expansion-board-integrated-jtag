@@ -43,13 +43,6 @@
 #endif
 
 #define AT_SETTINGS_PATH "AT_SETTINGS.cfg"
-#ifndef M65_CORE_LIST_INDEX_MAX
-#define M65_CORE_LIST_INDEX_MAX 128u
-#endif
-#ifndef M65_CORE_LIST_INDEX_PATH_POOL
-#define M65_CORE_LIST_INDEX_PATH_POOL 8192u
-#endif
-
 static bool sd_mounted = false;
 static remote_auth_config_t remote_cfg;
 
@@ -67,24 +60,23 @@ static absolute_time_t sd_hotplug_poll_at;
 static bool is_partial_core_path(const char *path);
 static bool make_child_path(const char *dir, const char *name, char *out, size_t out_len);
 
-typedef struct {
-    uint16_t number;
-    uint16_t path_off;
-    uint16_t path_len;
-    bool is_dir;
-    bool is_partial;
-} core_list_index_entry_t;
-
-static core_list_index_entry_t core_list_index[M65_CORE_LIST_INDEX_MAX];
-static char core_list_path_pool[M65_CORE_LIST_INDEX_PATH_POOL];
-static uint16_t core_list_index_count;
-static uint16_t core_list_path_pool_used;
-static bool core_list_index_valid;
+static char core_list_last_dir[256] = "/";
+static bool core_list_last_dir_valid;
 
 typedef struct {
     const char *dir;
     uint16_t next_number;
 } numbered_list_ctx_t;
+
+typedef struct {
+    const char *dir;
+    uint16_t target_number;
+    uint16_t next_number;
+    bool found;
+    bool found_is_dir;
+    bool found_is_partial;
+    char found_path[256];
+} numbered_resolve_ctx_t;
 
 typedef struct {
     int autofetch; // -1 = use mega65-jtag.cfg default, 0 = off, 1 = on
@@ -176,52 +168,16 @@ static bool make_child_path(const char *dir, const char *name, char *out, size_t
     return snprintf(out, out_len, "%s%s%s", dir, sep, name) < (int)out_len;
 }
 
-static void core_list_index_begin(void)
+static void core_list_context_clear(void)
 {
-    core_list_index_count = 0;
-    core_list_path_pool_used = 0;
-    core_list_index_valid = false;
+    core_list_last_dir_valid = false;
 }
 
-static void core_list_index_commit(void)
+static void core_list_context_commit(const char *dir)
 {
-    core_list_index_valid = true;
-}
-
-static const char *core_list_index_path(const core_list_index_entry_t *entry)
-{
-    if (!entry || entry->path_off >= core_list_path_pool_used) return "";
-    return core_list_path_pool + entry->path_off;
-}
-
-static bool core_list_index_add(uint16_t number, const char *dir, const char *name, bool is_dir, bool is_partial)
-{
-    if (core_list_index_count >= M65_CORE_LIST_INDEX_MAX) return false;
-
-    char path[256];
-    if (!make_child_path(dir, name, path, sizeof path)) return false;
-
-    size_t path_len = strlen(path);
-    if (path_len + 1u > sizeof core_list_path_pool - core_list_path_pool_used) return false;
-
-    core_list_index_entry_t *entry = &core_list_index[core_list_index_count++];
-    entry->number = number;
-    entry->path_off = core_list_path_pool_used;
-    entry->path_len = (uint16_t)path_len;
-    entry->is_dir = is_dir;
-    entry->is_partial = is_partial;
-    memcpy(core_list_path_pool + entry->path_off, path, path_len + 1u);
-    core_list_path_pool_used = (uint16_t)(core_list_path_pool_used + path_len + 1u);
-    return true;
-}
-
-static const core_list_index_entry_t *core_list_index_find(uint16_t number)
-{
-    if (!core_list_index_valid || number == 0) return NULL;
-    for (uint16_t i = 0; i < core_list_index_count; i++) {
-        if (core_list_index[i].number == number) return &core_list_index[i];
-    }
-    return NULL;
+    if (!dir || !dir[0]) dir = "/";
+    snprintf(core_list_last_dir, sizeof core_list_last_dir, "%s", dir);
+    core_list_last_dir_valid = true;
 }
 
 static void list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
@@ -231,10 +187,6 @@ static void list_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
     char path[256];
     bool have_path = make_child_path(lc ? lc->dir : "/", name, path, sizeof path);
     bool is_partial = is_partial_core_path(have_path ? path : name);
-
-    if (number) {
-        (void)core_list_index_add(number, lc ? lc->dir : "/", name, is_dir, is_partial);
-    }
 
     uart_cmd_printf("%3lu %s %lu %s\n",
                     (unsigned long)number,
@@ -550,6 +502,7 @@ static bool at_command_preserves_autofetch(const char *arg)
         n++;
     }
     tmp[n] = 0;
+    while (isspace((unsigned char)arg[n])) n++;
     bool query_only = arg[n] == '?' || arg[n] == 0;
     if (!query_only && arg[n] != '=') return false;
 
@@ -1223,13 +1176,13 @@ static void cmd_list(char *arg)
         .dir = path,
         .next_number = 1,
     };
-    core_list_index_begin();
+    core_list_context_clear();
     if (!storage_list_cores(path, list_cb, &ctx)) {
-        core_list_index_begin();
+        core_list_context_clear();
         uart_cmd_printf("ERR L %s\n", storage_last_error());
         return;
     }
-    core_list_index_commit();
+    core_list_context_commit(path);
     uart_cmd_puts("END\n");
 }
 
@@ -1246,9 +1199,6 @@ static void detail_list_cb(const char *name, uint32_t size, bool is_dir, void *c
     }
 
     bool is_partial = is_partial_core_path(path);
-    if (number) {
-        (void)core_list_index_add(number, dl && dl->dir ? dl->dir : "/", name, is_dir, is_partial);
-    }
 
     if (is_dir) {
         uart_cmd_printf("+COREDIR: index=%lu size=%lu path=",
@@ -1310,13 +1260,13 @@ static void cmd_detail_list(char *arg)
         .dir = path,
         .next_number = 1,
     };
-    core_list_index_begin();
+    core_list_context_clear();
     if (!storage_list_cores(path, detail_list_cb, &ctx)) {
-        core_list_index_begin();
+        core_list_context_clear();
         uart_cmd_printf("ERR LD %s\n", storage_last_error());
         return;
     }
-    core_list_index_commit();
+    core_list_context_commit(path);
     uart_cmd_puts("END\n");
 }
 
@@ -1633,57 +1583,123 @@ static const char *path_basename(const char *path)
     return slash ? slash + 1 : path;
 }
 
-static const char *core_list_resolve_bare_name(const char *name)
+static void numbered_resolve_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
 {
-    if (!core_list_index_valid || !name || !name[0]) return NULL;
-    if (strchr(name, '/') || strchr(name, '\\')) return NULL;
+    (void)size;
+    numbered_resolve_ctx_t *rc = (numbered_resolve_ctx_t *)ctx;
+    if (!rc || rc->found) return;
 
-    const char *folded_match = NULL;
-    bool folded_ambiguous = false;
+    uint16_t number = rc->next_number++;
+    if (number != rc->target_number) return;
 
-    for (uint16_t i = 0; i < core_list_index_count; i++) {
-        const core_list_index_entry_t *entry = &core_list_index[i];
-        if (entry->is_dir || entry->is_partial) continue;
+    char path[256];
+    if (!make_child_path(rc->dir ? rc->dir : "/", name, path, sizeof path)) return;
 
-        const char *path = core_list_index_path(entry);
-        const char *base = path_basename(path);
-        if (strcmp(base, name) == 0) return path;
-        if (ci_equal(base, name)) {
-            if (folded_match && strcmp(folded_match, path) != 0) {
-                folded_ambiguous = true;
-            } else {
-                folded_match = path;
-            }
-        }
+    rc->found = true;
+    rc->found_is_dir = is_dir;
+    rc->found_is_partial = is_partial_core_path(path);
+    snprintf(rc->found_path, sizeof rc->found_path, "%s", path);
+}
+
+static bool core_list_resolve_number(uint16_t number, char *path_out, size_t path_out_len)
+{
+    if (!core_list_last_dir_valid) {
+        uart_cmd_puts("ERR P no numbered core list; run AT+CORELIST first\n");
+        return false;
     }
 
-    return folded_ambiguous ? NULL : folded_match;
+    numbered_resolve_ctx_t ctx = {
+        .dir = core_list_last_dir,
+        .target_number = number,
+        .next_number = 1,
+    };
+
+    if (!storage_list_cores(core_list_last_dir, numbered_resolve_cb, &ctx)) {
+        uart_cmd_printf("ERR P cannot rescan %s: %s\n", core_list_last_dir, storage_last_error());
+        return false;
+    }
+    if (!ctx.found) {
+        uart_cmd_printf("ERR P no core list entry %lu in %s\n",
+                        (unsigned long)number,
+                        core_list_last_dir);
+        return false;
+    }
+    if (ctx.found_is_dir) {
+        uart_cmd_printf("ERR P core list entry %lu is a directory\n", (unsigned long)number);
+        return false;
+    }
+    if (ctx.found_is_partial) {
+        uart_cmd_printf("ERR P core list entry %lu is a partial download\n", (unsigned long)number);
+        return false;
+    }
+    snprintf(path_out, path_out_len, "%s", ctx.found_path);
+    return true;
+}
+
+typedef struct {
+    const char *dir;
+    const char *name;
+    char exact_path[256];
+    char folded_path[256];
+    bool folded_ambiguous;
+} bare_name_resolve_ctx_t;
+
+static void bare_name_resolve_cb(const char *name, uint32_t size, bool is_dir, void *ctx)
+{
+    (void)size;
+    bare_name_resolve_ctx_t *bc = (bare_name_resolve_ctx_t *)ctx;
+    if (!bc || !bc->name || is_dir) return;
+
+    char path[256];
+    if (!make_child_path(bc->dir ? bc->dir : "/", name, path, sizeof path)) return;
+    if (is_partial_core_path(path)) return;
+
+    const char *base = path_basename(path);
+    if (strcmp(base, bc->name) == 0) {
+        snprintf(bc->exact_path, sizeof bc->exact_path, "%s", path);
+        return;
+    }
+    if (ci_equal(base, bc->name)) {
+        if (bc->folded_path[0] && strcmp(bc->folded_path, path) != 0) {
+            bc->folded_ambiguous = true;
+        } else {
+            snprintf(bc->folded_path, sizeof bc->folded_path, "%s", path);
+        }
+    }
+}
+
+static const char *core_list_resolve_bare_name(const char *name)
+{
+    static char resolved_path[256];
+    resolved_path[0] = 0;
+
+    if (!core_list_last_dir_valid || !name || !name[0]) return NULL;
+    if (strchr(name, '/') || strchr(name, '\\')) return NULL;
+
+    bare_name_resolve_ctx_t ctx = {
+        .dir = core_list_last_dir,
+        .name = name,
+    };
+    if (!storage_list_cores(core_list_last_dir, bare_name_resolve_cb, &ctx)) return NULL;
+
+    if (ctx.exact_path[0]) {
+        snprintf(resolved_path, sizeof resolved_path, "%s", ctx.exact_path);
+        return resolved_path;
+    }
+    if (!ctx.folded_ambiguous && ctx.folded_path[0]) {
+        snprintf(resolved_path, sizeof resolved_path, "%s", ctx.folded_path);
+        return resolved_path;
+    }
+    return NULL;
 }
 
 static bool resolve_program_target(char *name, const char **path_out)
 {
+    static char numbered_path[256];
     uint16_t number = 0;
     if (parse_core_list_number(name, &number)) {
-        if (!core_list_index_valid) {
-            uart_cmd_puts("ERR P no numbered core list; run AT+CORELIST first\n");
-            return false;
-        }
-
-        const core_list_index_entry_t *entry = core_list_index_find(number);
-        if (!entry) {
-            uart_cmd_printf("ERR P no core list entry %lu\n", (unsigned long)number);
-            return false;
-        }
-        if (entry->is_dir) {
-            uart_cmd_printf("ERR P core list entry %lu is a directory\n", (unsigned long)number);
-            return false;
-        }
-        if (entry->is_partial) {
-            uart_cmd_printf("ERR P core list entry %lu is a partial download\n", (unsigned long)number);
-            return false;
-        }
-
-        *path_out = core_list_index_path(entry);
+        if (!core_list_resolve_number(number, numbered_path, sizeof numbered_path)) return false;
+        *path_out = numbered_path;
         return true;
     }
 
@@ -2165,11 +2181,40 @@ static void dispatch_at(char *arg)
     char *cmd = arg + 1;
     char *value = strchr(cmd, '=');
     char *query = strchr(cmd, '?');
-    char *cmd_end = value ? value : query;
-    if (!cmd_end) cmd_end = cmd + strlen(cmd);
+    char *space = NULL;
+    for (char *p = cmd; *p; p++) {
+        if (isspace((unsigned char)*p)) {
+            space = p;
+            break;
+        }
+    }
+    char *cmd_end = cmd + strlen(cmd);
+    if (value && value < cmd_end) cmd_end = value;
+    if (query && query < cmd_end) cmd_end = query;
+    if (space && space < cmd_end) cmd_end = space;
     char saved = *cmd_end;
     *cmd_end = 0;
-    char *param = value ? trim_line(value + 1) : (char *)"";
+    cmd = trim_line(cmd);
+
+    bool have_value = saved == '=';
+    bool have_query = saved == '?';
+    char *param = (char *)"";
+    if (saved) {
+        char *tail = trim_line(cmd_end + 1);
+        if (saved == '=') {
+            param = tail;
+        } else if (saved == '?') {
+            have_query = true;
+        } else if (*tail == '=') {
+            have_value = true;
+            param = trim_line(tail + 1);
+        } else if (*tail == '?') {
+            have_query = true;
+        } else if (*tail) {
+            have_value = true;
+            param = tail;
+        }
+    }
 
     if (ci_equal(cmd, "HELP")) {
         cmd_help();
@@ -2200,11 +2245,11 @@ static void dispatch_at(char *arg)
     } else if (ci_equal(cmd, "DOWNLOADREAD") || ci_equal(cmd, "READ")) {
         cmd_read_download(param);
     } else if (ci_equal(cmd, "AUTOFETCH")) {
-        cmd_autofetch(param, value != NULL);
+        cmd_autofetch(param, have_value);
     } else if (ci_equal(cmd, "FETCHSTATUS") || ci_equal(cmd, "AUTOFETCHSTATUS") || ci_equal(cmd, "AFSTATUS")) {
         cmd_fetch_status();
     } else if (ci_equal(cmd, "FETCHNOW") || ci_equal(cmd, "AUTOFETCHNOW") || ci_equal(cmd, "AFNOW")) {
-        cmd_fetch_now(param, value != NULL, query != NULL);
+        cmd_fetch_now(param, have_value, have_query);
     } else if (ci_equal(cmd, "FWSTATUS") || ci_equal(cmd, "FIRMWARESTATUS")) {
         cmd_firmware_status();
     } else if (ci_equal(cmd, "FWUPDATE") || ci_equal(cmd, "FIRMWAREUPDATE")) {
@@ -2214,14 +2259,14 @@ static void dispatch_at(char *arg)
     } else if (ci_equal(cmd, "THEMEINSTALL") || ci_equal(cmd, "WEBTHEMEINSTALL")) {
         cmd_theme_install();
     } else if (ci_equal(cmd, "FETCHINTERVAL")) {
-        cmd_fetch_interval(param, value != NULL);
+        cmd_fetch_interval(param, have_value);
     } else if (ci_equal(cmd, "FETCHBOARD")) {
-        cmd_fetch_board(param, value != NULL);
+        cmd_fetch_board(param, have_value);
     } else if (ci_equal(cmd, "VERBOSE") || ci_equal(cmd, "WIFIVERBOSE") || ci_equal(cmd, "DEBUG")) {
-        cmd_verbose(param, value != NULL);
+        cmd_verbose(param, have_value);
     } else if (ci_equal(cmd, "MACHINE") || ci_equal(cmd, "MACHINENAME") ||
                ci_equal(cmd, "NAME") || ci_equal(cmd, "IDENTITY")) {
-        cmd_machine(param, value != NULL);
+        cmd_machine(param, have_value);
     } else if (ci_equal(cmd, "WRITEGRANT") || ci_equal(cmd, "AUTH")) {
         cmd_authority();
     } else if (ci_equal(cmd, "REMOTE")) {

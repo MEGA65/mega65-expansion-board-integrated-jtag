@@ -152,7 +152,8 @@ Replies are currently broadcast to both ports. This is intentional and keeps MEG
 The command set is AT-style by default and remains experimental. Command names,
 responses, fields, and error text may change while the firmware and utilities
 are still at v0.1. Commands may be terminated with either CR or LF. Text replies
-use CR+LF line endings, and command echo defaults to enabled.
+use CR+LF line endings, and command echo defaults to enabled. Backspace/Delete
+erase the previous input byte, and Ctrl-U clears the current input line.
 
 ```text
 AT                         modem attention check
@@ -217,8 +218,9 @@ python3 tools/m65j.py /dev/ttyACM0 AT+JTAGLOAD=/cores/mega65r6.cor
 python3 tools/m65j.py /dev/ttyACM0 AT+JTAGLOAD=1
 ```
 
-The numeric `AT+JTAGLOAD` form uses the last successful `AT+CORELIST` or
-`AT+COREDETAIL` result, preserving the exact FAT directory entry name.
+The numeric `AT+JTAGLOAD` form rescans the directory from the last successful
+`AT+CORELIST` or `AT+COREDETAIL` and loads the row with the requested number,
+preserving the exact FAT directory entry name.
 
 Set `M65_ENABLE_LEGACY_UART_COMMANDS=1` at compile time only if you need the
 early bring-up one-letter protocol. `tools/m65j.py` still translates the

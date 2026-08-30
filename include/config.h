@@ -15,6 +15,15 @@
 #define M65_UART_TX_PIN      0u
 #define M65_UART_RX_PIN      1u
 
+// Text replies are paced on the hardware UART so shallow receivers can keep
+// up with long AT output such as AT+HELP. Binary transfers are not paced here.
+#ifndef M65_UART_TEXT_PACE_US
+#define M65_UART_TEXT_PACE_US 1000u
+#endif
+#ifndef M65_UART_TEXT_PACE_CHARS
+#define M65_UART_TEXT_PACE_CHARS 96u
+#endif
+
 // Also accept commands on the Pico's native USB CDC serial port.
 // CMake enables pico_stdio_usb(); this switch controls the command parser use.
 #define M65_ENABLE_USB_CDC   1
@@ -146,7 +155,8 @@
 #define M65_PICO_BOARD_NAME "unknown"
 #endif
 
-#define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG v0.1"
+#define M65_FIRMWARE_VERSION "v0.1"
+#define M65_VERSION_STRING   "MEGA65 Expansion Board Integrated JTAG " M65_FIRMWARE_VERSION
 #ifndef M65_BUILD_MARKER
 #define M65_BUILD_MARKER     "unknown-build"
 #endif

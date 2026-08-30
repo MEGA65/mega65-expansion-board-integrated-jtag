@@ -1977,7 +1977,7 @@ def serial_preferred_even_with_web_config(argv):
         return True
     if upper in {
         "?", "V", "L", "LIST", "DIR", "LS", "LL", "DETAIL", "COREDETAIL",
-        "CORELS", "I", "T", "P", "S", "N", "W", "F", "R", "A", "D",
+        "CORELS", "I", "T", "P", "LOAD", "PROGRAM", "JTAGLOAD", "S", "N", "W", "F", "R", "A", "D",
         "J", "X", "H", "M", "VERSION", "VER", "IDENTIFY", "ABOUT",
         "WIFI", "HTTP", "SDCARD", "SDSTATUS", "DOWNLOADSTATUS", "DLSTATUS",
         "FWSTATUS", "FIRMWARESTATUS", "THEMESTATUS", "WEBTHEMESTATUS",
