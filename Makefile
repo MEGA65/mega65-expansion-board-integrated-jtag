@@ -51,6 +51,9 @@ CMAKE_ELF := $(BUILD_DIR)/$(CMAKE_TARGET).elf
 FACTORY_UF2 := $(BUILD_DIR)/$(PROJECT)-factory.uf2
 FACTORY_APP_BIN := $(FACTORY_BUILD_DIR)/$(CMAKE_TARGET).bin
 FACTORY_BOOTLOADER_BIN := $(FACTORY_BUILD_DIR)/m65_factory_bootloader.bin
+ifeq ($(PICO_BOARD), pico2_w)
+FACTORY_MCU_TYPE:=--pico2-w
+endif
 UPLOAD_UF2 ?= $(FACTORY_UF2)
 M65_BOOTLOADER_SLOT0_OFFSET ?= 0x10000
 M65_BOOTLOADER_SLOT_SIZE ?= 0xF0000
@@ -142,6 +145,7 @@ help:
 	@echo "  MIRROR_FIRMWARE=...    Firmware image staged into mirror; default factory UF2"
 	@echo "  MIRROR_EXTRA_THEMES=... Extra local .m65jtheme/.tar files to publish under THEMES/"
 	@echo "  PICO_MOUNT=...         Mount point for upload-uf2, if autodetect fails"
+	@echo "  PICO_BOARD=...         Set to pico2_w to support that board"
 	@echo
 	@echo "Examples:"
 	@echo "  make deps"
@@ -233,7 +237,8 @@ factory: configure-factory
 		--app "$(FACTORY_APP_BIN)" \
 		--output "$(FACTORY_UF2)" \
 		--app-offset "$(M65_BOOTLOADER_SLOT0_OFFSET)" \
-		--app-size "$(M65_BOOTLOADER_SLOT_SIZE)"
+		--app-size "$(M65_BOOTLOADER_SLOT_SIZE)" \
+		$(FACTORY_MCU_TYPE)
 	@echo
 	@echo "Built: $(FACTORY_UF2)"
 
