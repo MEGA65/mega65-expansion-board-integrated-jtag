@@ -20,8 +20,12 @@
 
 #define XIP_BASE_ADDR 0x10000000u
 #define SRAM_BASE_ADDR 0x20000000u
-#define SRAM_END_ADDR  0x20042000u
-#define PICO_BOOT2_LEN 0x100u
+#define SRAM_END_ADDR  SRAM_END          /* from the SDK: 0x20042000 on RP2040, 0x20082000 on RP2350 */
+#if PICO_RP2040
+#define PICO_BOOT2_LEN 0x100u            /* RP2040 images start with 256-byte boot2 */
+#else
+#define PICO_BOOT2_LEN 0x0u              /* RP2350 images start with the vector table */
+#endif
 #define DIAG_UART_ID uart0
 #define DIAG_UART_TX_PIN 0u
 #define DIAG_UART_RX_PIN 1u
@@ -167,18 +171,27 @@ static void reboot_to_slot(uint32_t slot_base)
     *((volatile uint32_t *)0xe000e010) = 0;
 
     // Disable all NVIC interrupts and clear pending
-    *((volatile uint32_t *)0xe000e180) = 0xFFFFFFFF; // ICER
-    *((volatile uint32_t *)0xe000e280) = 0xFFFFFFFF; // ICPR
+    *((volatile uint32_t *)0xe000e180) = 0xFFFFFFFF; // ICER0
+    *((volatile uint32_t *)0xe000e280) = 0xFFFFFFFF; // ICPR0
+    #if !PICO_RP2040
+    *((volatile uint32_t *)0xe000e184) = 0xFFFFFFFF; // ICER1 (RP2350 has >32 IRQs)
+    *((volatile uint32_t *)0xe000e284) = 0xFFFFFFFF; // ICPR1
+    #endif
 
     // Set VTOR to the application vector table
     *((volatile uint32_t *)0xe000ed08) = (uint32_t)vectors;
+    __asm volatile ("dsb\nisb\n" ::: "memory");
 
     // Set SP and jump to the application's reset handler
+    #if !PICO_RP2040
+    // Cortex-M33: clear the bootloader's stack limit before switching stacks
+    __asm volatile ("msr msplim, %0\n" :: "r" (0u));
+    #endif
     __asm volatile (
         "msr msp, %0\n"
         "bx %1\n"
         :
-        : "r" (initial_sp), "r" (reset) // Use the original reset address with thumb bit
+        : "r" (initial_sp), "r" (reset)
     );
 
     for (;;) {
