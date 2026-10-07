@@ -51,6 +51,19 @@ typedef enum {
     CMD_MODE_BASIC,
 } command_mode_t;
 
+typedef enum {
+    lsIdle,         // No core list in progress
+    lsListing,      // Core list
+    lsListingBuf,   // Core list, and an entry in the buffer
+    lsDetail,       // Detailed core list
+    lsDetailBuf,    // Detailed core list, and an entry in the buffer
+} list_state_t;
+
+typedef struct {
+    char dir[M65_UART_FORMAT_MAX];
+    uint16_t next_number;
+} numbered_list_ctx_t;
+
 static command_mode_t command_mode = CMD_MODE_AT;
 static bool usb_reconnect_pending = false;
 static absolute_time_t usb_reconnect_at;
@@ -63,10 +76,13 @@ static bool make_child_path(const char *dir, const char *name, char *out, size_t
 static char core_list_last_dir[256] = "/";
 static bool core_list_last_dir_valid;
 
-typedef struct {
-    const char *dir;
-    uint16_t next_number;
-} numbered_list_ctx_t;
+static list_state_t list_state;
+static int16_t list_bytes_returned;
+static int16_t max_list_bytes;
+static char list_buffer[M65_UART_FORMAT_MAX];
+static char *list_buffer_ptr;
+static uint16_t list_buffer_remain;
+numbered_list_ctx_t list_ctx;
 
 typedef struct {
     const char *dir;
@@ -187,7 +203,7 @@ static void core_list_context_commit(const char *dir)
     core_list_last_dir_valid = true;
 }
 
-static void list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+static bool list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     numbered_list_ctx_t *lc = (numbered_list_ctx_t *)ctx;
     uint16_t number = lc ? lc->next_number++ : 0;
@@ -197,12 +213,30 @@ static void list_cb(const char *name, uint32_t size, bool is_dir, const storage_
     bool is_partial = is_partial_core_path(have_path ? path : name);
     storage_format_timestamp(modified, modified_text, sizeof modified_text);
 
-    uart_cmd_printf("%3lu %s %lu %s %s\n",
-                    (unsigned long)number,
-                    is_dir ? "DIR" : (is_partial ? "PARTIAL" : "CORE"),
-                    (unsigned long)size,
-                    modified_text,
-                    name);
+    char tmp[M65_UART_FORMAT_MAX];
+    int tmpsize = snprintf(tmp, sizeof(tmp), "%3lu %s %lu %s %s\n",
+        (unsigned long)number,
+        is_dir ? "DIR" : (is_partial ? "PARTIAL" : "CORE"),
+        (unsigned long)size,
+        modified_text,
+        name);
+    if ((max_list_bytes > 0) && (list_bytes_returned + tmpsize > max_list_bytes)) {
+        if (tmpsize < max_list_bytes) {
+            // If the item can fit in the buffer, send it the next time
+            memset(list_buffer, 0, M65_UART_FORMAT_MAX);
+            memcpy(list_buffer, tmp, tmpsize);
+            list_buffer_ptr = list_buffer;
+            list_buffer_remain = tmpsize;
+            list_state = lsListingBuf;
+        } else {
+            list_state = lsListing;
+        }
+        return false;
+    }
+    list_bytes_returned += tmpsize;
+    uart_cmd_printf("%s", tmp);
+    list_state = lsIdle;
+    return true;
 }
 
 static uint8_t core_effective_board(const core_file_t *cf, const char *path)
@@ -789,6 +823,8 @@ static void cmd_help(void)
         "+HELP: AT+COREDETAIL[=path] detailed list with dates/COR title/version/board\n"
         "+HELP: AT+COREINFO=file    inspect core file\n"
         "+HELP: AT+CORETEST=file    read core payload from SD and discard\n"
+        "+HELP: AT+COREMAX=bytes    set number of bytes to be returned from list/detail\n"
+        "+HELP: AT+COREMORE         continue most recent list/detail operation\n"
         "+HELP: AT+JTAGLOAD=file|n  hijack JTAG and program core from SD\n"
         "+HELP: AT+JTAGSTREAM=len id stream raw Xilinx payload over serial\n"
         "+HELP: AT+TESTSINK=len     receive/discard bytes; serial throughput test\n"
@@ -1023,6 +1059,20 @@ static void cmd_fetch_interval(char *arg, bool have_value)
     uart_cmd_puts("\r\n");
 }
 
+static void cmd_set_core_max(char *arg, bool have_value)
+{
+    if (have_value) {
+        char *end = NULL;
+        unsigned long byte_max = strtoul(arg, &end, 10);
+        if (*end || ((byte_max != 0) && (byte_max < 64)) || byte_max > 256) {
+            at_error("MAX BYTES 64 TO 256");
+            return;
+        }
+        max_list_bytes = byte_max;
+    }
+    uart_cmd_printf("OK BYTE MAX=%u\r\n", max_list_bytes);
+}
+
 static void cmd_fetch_board(char *arg, bool have_value)
 {
     if (have_value) {
@@ -1179,119 +1229,242 @@ static void cmd_mount(void)
 
 static void cmd_list(char *arg)
 {
+    if (list_state != lsIdle) {
+        uart_cmd_printf("ERR L IN PROGRESS\n");
+        return;
+    }
+    list_bytes_returned = 0;
+
     if (!ensure_mount()) return;
     char *path = unquote_filename(arg);
     if (!path[0]) path = "/";
+    strncpy(list_ctx.dir, path, M65_UART_FORMAT_MAX);
+    list_ctx.dir[M65_UART_FORMAT_MAX - 1] = 0;
+    list_ctx.next_number = 1;
+
     uart_cmd_printf("OK L %s\n", path);
-    numbered_list_ctx_t ctx = {
-        .dir = path,
-        .next_number = 1,
-    };
     core_list_context_clear();
-    if (!storage_list_cores(path, list_cb, &ctx)) {
+    list_result_t list_result;
+    list_result = storage_list_cores(path, list_cb, &list_ctx, false);
+    if (lrFailed == list_result) {
         core_list_context_clear();
         uart_cmd_printf("ERR L %s\n", storage_last_error());
         return;
+    } else if (lrSuccess == list_result) {
+        core_list_context_commit(path);
+        uart_cmd_puts("END\n");
+    } else if (lrFull == list_result) {
+        uart_cmd_printf("CONT L\n", list_state, list_bytes_returned, max_list_bytes);
     }
-    core_list_context_commit(path);
-    uart_cmd_puts("END\n");
 }
 
-static void uart_modified_field(const storage_timestamp_t *modified)
+static const char *quote_str(char *dst, size_t dstsz, const char *s)
 {
-    char modified_text[24];
-    storage_format_timestamp(modified, modified_text, sizeof modified_text);
-    uart_cmd_puts(" modified=");
-    uart_quoted(modified_text);
+    size_t n = 0;
+    if (dstsz < 3) { if (dstsz) dst[0] = '\0'; return dst; }
+    dst[n++] = '"';
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        char esc[5];
+        size_t len;
+        if (c == '"' || c == '\\') { esc[0] = '\\'; esc[1] = (char)c; len = 2; }
+        else if (c >= 32u && c < 127u) { esc[0] = (char)c; len = 1; }
+        else len = (size_t)snprintf(esc, sizeof esc, "\\x%02x", (unsigned)c);
+        if (n + len + 2 > dstsz) break;     // leave room for closing quote + NUL
+        memcpy(dst + n, esc, len);
+        n += len;
+    }
+    dst[n++] = '"';
+    dst[n] = '\0';
+    return dst;
 }
 
-static void detail_list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+static bool send_list_buffer(void) {
+    bool is_done;
+    char send_string[M65_UART_FORMAT_MAX];
+    char *terminator;
+    uint16_t max_chars_to_send = max_list_bytes - list_bytes_returned;
+    uint16_t chars_to_send;
+    if (list_buffer_remain > max_chars_to_send) {
+        chars_to_send = max_chars_to_send;
+        terminator = "\\\n";
+        is_done = false;
+    } else {
+        chars_to_send = list_buffer_remain;
+        terminator = "";
+        is_done = true;
+    }
+    memcpy(send_string, list_buffer_ptr, chars_to_send);
+    list_buffer_ptr += chars_to_send;
+    list_buffer_remain -= chars_to_send;
+    send_string[chars_to_send] = 0;
+    uart_cmd_printf("%s%s", send_string, terminator);
+    return is_done;
+}
+
+static bool detail_list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     numbered_list_ctx_t *dl = (numbered_list_ctx_t *)ctx;
-    uint16_t number = dl ? dl->next_number++ : 0;
+    unsigned long number = dl ? dl->next_number++ : 0;
     char path[256];
+    char qpath[64];
+    char modified_text[24];
+    char tmp[M65_UART_FORMAT_MAX];
+    int tmpsize;
+    storage_format_timestamp(modified, modified_text, sizeof modified_text);
+
     if (!make_child_path(dl && dl->dir ? dl->dir : "/", name, path, sizeof path)) {
-        uart_cmd_printf("+COREERR: index=%lu path-too-long name=", (unsigned long)number);
-        uart_quoted(name);
-        uart_modified_field(modified);
-        uart_cmd_puts("\n");
-        return;
+        tmpsize = snprintf(tmp, sizeof tmp, "+COREERR: index=%lu path-too-long name=%s modified=\"%s\"\n",
+                           number, quote_str(qpath, sizeof qpath, name), modified_text);
+    } else {
+        quote_str(qpath, sizeof qpath, path);
+
+        if (is_dir) {
+            tmpsize = snprintf(tmp, sizeof tmp, "+COREDIR: index=%lu size=%lu path=%s modified=\"%s\"\n",
+                               number, (unsigned long)size, qpath, modified_text);
+        } else if (is_partial_core_path(path)) {
+            tmpsize = snprintf(tmp, sizeof tmp, "+COREPARTIAL: index=%lu size=%lu path=%s modified=\"%s\" status=\"download in progress\"\n",
+                               number, (unsigned long)size, qpath, modified_text);
+        } else {
+            core_file_t cf;
+            if (!core_open(&cf, path)) {
+                char qerr[96];
+                tmpsize = snprintf(tmp, sizeof tmp, "+COREERR: index=%lu size=%lu path=%s modified=\"%s\" error=%s\n",
+                                   number, (unsigned long)size, qpath, modified_text,
+                                   quote_str(qerr, sizeof qerr, core_last_error()));
+            } else {
+                char qtitle[2 * sizeof cf.title + 2];
+                char qversion[2 * sizeof cf.version + 2];
+                char qmodel[2 * sizeof cf.model + 2];
+                uint8_t board = core_effective_board(&cf, path);
+                tmpsize = snprintf(tmp, sizeof tmp,
+                                   "+COREDETAIL: index=%lu size=%lu kind=%s board=%s board_id=%lu payload_offset=%lu payload_length=%lu "
+                                   "expected_idcode=%08lx path=%s modified=\"%s\" title=%s version=%s model=%s model_id=%lu\n",
+                                   number, (unsigned long)size,
+                                   core_kind_name(cf.kind), core_board_label(board), (unsigned long)board,
+                                   (unsigned long)cf.payload_offset, (unsigned long)cf.payload_length,
+                                   (unsigned long)cf.expected_idcode,
+                                   qpath, modified_text,
+                                   quote_str(qtitle, sizeof qtitle, cf.title),
+                                   quote_str(qversion, sizeof qversion, cf.version),
+                                   quote_str(qmodel, sizeof qmodel, cf.model),
+                                   (unsigned long)cf.model_id);
+                core_close(&cf);
+            }
+        }
     }
 
-    bool is_partial = is_partial_core_path(path);
+    if (tmpsize >= M65_UART_FORMAT_MAX) tmpsize = M65_UART_FORMAT_MAX - 1;  // truncated
 
-    if (is_dir) {
-        uart_cmd_printf("+COREDIR: index=%lu size=%lu path=",
-                        (unsigned long)number,
-                        (unsigned long)size);
-        uart_quoted(path);
-        uart_modified_field(modified);
-        uart_cmd_puts("\n");
-        return;
+    if ((max_list_bytes > 0) && (list_bytes_returned + tmpsize > max_list_bytes)) {
+        memset(list_buffer, 0, M65_UART_FORMAT_MAX);
+        memcpy(list_buffer, tmp, tmpsize);
+        list_buffer_ptr = list_buffer;
+        list_buffer_remain = tmpsize;
+        if (send_list_buffer()) {
+            list_state = lsDetail;
+        } else {
+            list_state = lsDetailBuf;
+        }
+        return false;
     }
-    if (is_partial) {
-        uart_cmd_printf("+COREPARTIAL: index=%lu size=%lu path=",
-                        (unsigned long)number,
-                        (unsigned long)size);
-        uart_quoted(path);
-        uart_modified_field(modified);
-        uart_cmd_puts(" status=\"download in progress\"\n");
-        return;
-    }
-
-    core_file_t cf;
-    if (!core_open(&cf, path)) {
-        uart_cmd_printf("+COREERR: index=%lu size=%lu path=",
-                        (unsigned long)number,
-                        (unsigned long)size);
-        uart_quoted(path);
-        uart_modified_field(modified);
-        uart_cmd_puts(" error=");
-        uart_quoted(core_last_error());
-        uart_cmd_puts("\n");
-        return;
-    }
-
-    uint8_t board = core_effective_board(&cf, path);
-    uart_cmd_printf("+COREDETAIL: index=%lu size=%lu kind=%s board=%s board_id=%lu payload_offset=%lu payload_length=%lu expected_idcode=%08lx path=",
-                    (unsigned long)number,
-                    (unsigned long)size,
-                    core_kind_name(cf.kind),
-                    core_board_label(board),
-                    (unsigned long)board,
-                    (unsigned long)cf.payload_offset,
-                    (unsigned long)cf.payload_length,
-                    (unsigned long)cf.expected_idcode);
-    uart_quoted(path);
-    uart_modified_field(modified);
-    uart_cmd_puts(" title=");
-    uart_quoted(cf.title[0] ? cf.title : "");
-    uart_cmd_puts(" version=");
-    uart_quoted(cf.version[0] ? cf.version : "");
-    uart_cmd_puts(" model=");
-    uart_quoted(cf.model[0] ? cf.model : "");
-    uart_cmd_printf(" model_id=%lu\n", (unsigned long)cf.model_id);
-    core_close(&cf);
+    list_bytes_returned += tmpsize;
+    uart_cmd_puts(tmp);
+    list_state = lsIdle;
+    return true;
 }
 
 static void cmd_detail_list(char *arg)
 {
+    if (list_state != lsIdle) {
+        if ((list_state == lsDetail) || (list_state == lsDetailBuf)) {
+            uart_cmd_printf("ERR LD IN PROGRESS\n");
+        } else {
+            uart_cmd_printf("ERR L IN PROGRESS\n");
+        }
+        return;
+    }
+    list_bytes_returned = 0;
+
     if (!ensure_mount()) return;
     char *path = unquote_filename(arg);
     if (!path[0]) path = "/";
     uart_cmd_printf("OK LD %s\n", path);
-    numbered_list_ctx_t ctx = {
-        .dir = path,
-        .next_number = 1,
-    };
+    strncpy(list_ctx.dir, path, M65_UART_FORMAT_MAX);
+    list_ctx.dir[M65_UART_FORMAT_MAX - 1] = 0;
+    list_ctx.next_number = 1;
+
     core_list_context_clear();
-    if (!storage_list_cores(path, detail_list_cb, &ctx)) {
+    list_result_t list_result = storage_list_cores(path, detail_list_cb, &list_ctx, false);
+    if (lrFailed == list_result) {
         core_list_context_clear();
         uart_cmd_printf("ERR LD %s\n", storage_last_error());
         return;
+    } else if (lrSuccess == list_result) {
+        core_list_context_commit(path);
+        uart_cmd_puts("END\n");
+    } else if (lrFull == list_result) {
+        uart_cmd_printf("CONT LD\n", list_state, list_bytes_returned, max_list_bytes);
     }
-    core_list_context_commit(path);
-    uart_cmd_puts("END\n");
+}
+
+static void cmd_continue_list(char *arg)
+{
+    if (list_state == lsIdle) {
+        uart_cmd_printf("ERR NO LIST\n");
+        return;
+    }
+    list_bytes_returned = 0;
+
+    core_list_context_clear();
+    list_result_t list_result;
+    switch (list_state) {
+        case lsListingBuf:
+            uart_cmd_printf("OK L %s\n", list_ctx.dir);
+            if (send_list_buffer()) {
+                list_state = lsListing;
+            } else {
+                list_state = lsListingBuf;
+            }
+            list_result = storage_list_cores(list_ctx.dir, list_cb, &list_ctx, true);;
+            break;
+        case lsListing:
+            uart_cmd_printf("OK L %s\n", list_ctx.dir);
+            list_result = storage_list_cores(list_ctx.dir, list_cb, &list_ctx, true);
+            break;
+        case lsDetailBuf:
+            uart_cmd_printf("OK LD %s\n", list_ctx.dir);
+            if (send_list_buffer()) {
+                list_state = lsDetail;
+            } else {
+                list_state = lsDetailBuf;
+            }
+            list_result = lrFull;
+            break;
+        case lsDetail:
+            uart_cmd_printf("OK LD %s\n", list_ctx.dir);
+            list_result = storage_list_cores(list_ctx.dir, detail_list_cb, &list_ctx, true);
+            break;
+    }
+    if (lrFailed == list_result) {
+        core_list_context_clear();
+        if ((list_state == lsDetail) || (list_state == lsDetailBuf)) {
+            uart_cmd_printf("ERR LD %s\n", storage_last_error());
+        } else {
+            uart_cmd_printf("ERR L %s\n", storage_last_error());
+        }
+        return;
+    } else if (lrSuccess == list_result) {
+        core_list_context_commit(list_ctx.dir);
+        list_state = lsIdle;
+        uart_cmd_puts("END\n");
+    } else if (lrFull == list_result) {
+        if ((list_state == lsDetail) || (list_state == lsDetailBuf)) {
+            uart_cmd_printf("CONT LD\n");
+        } else {
+            uart_cmd_printf("CONT L\n");
+        }
+    }
 }
 
 static void cmd_info(char *arg)
@@ -1607,23 +1780,24 @@ static const char *path_basename(const char *path)
     return slash ? slash + 1 : path;
 }
 
-static void numbered_resolve_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+static bool numbered_resolve_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
     (void)modified;
     numbered_resolve_ctx_t *rc = (numbered_resolve_ctx_t *)ctx;
-    if (!rc || rc->found) return;
+    if (!rc || rc->found) return true;
 
     uint16_t number = rc->next_number++;
-    if (number != rc->target_number) return;
+    if (number != rc->target_number) return true;
 
     char path[256];
-    if (!make_child_path(rc->dir ? rc->dir : "/", name, path, sizeof path)) return;
+    if (!make_child_path(rc->dir ? rc->dir : "/", name, path, sizeof path)) return true;
 
     rc->found = true;
     rc->found_is_dir = is_dir;
     rc->found_is_partial = is_partial_core_path(path);
     snprintf(rc->found_path, sizeof rc->found_path, "%s", path);
+    return true;
 }
 
 static bool core_list_resolve_number(uint16_t number, char *path_out, size_t path_out_len)
@@ -1639,7 +1813,7 @@ static bool core_list_resolve_number(uint16_t number, char *path_out, size_t pat
         .next_number = 1,
     };
 
-    if (!storage_list_cores(core_list_last_dir, numbered_resolve_cb, &ctx)) {
+    if (!storage_list_cores(core_list_last_dir, numbered_resolve_cb, &ctx, false)) {
         uart_cmd_printf("ERR P cannot rescan %s: %s\n", core_list_last_dir, storage_last_error());
         return false;
     }
@@ -1669,21 +1843,21 @@ typedef struct {
     bool folded_ambiguous;
 } bare_name_resolve_ctx_t;
 
-static void bare_name_resolve_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+static bool bare_name_resolve_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
     (void)modified;
     bare_name_resolve_ctx_t *bc = (bare_name_resolve_ctx_t *)ctx;
-    if (!bc || !bc->name || is_dir) return;
+    if (!bc || !bc->name || is_dir) return true;
 
     char path[256];
-    if (!make_child_path(bc->dir ? bc->dir : "/", name, path, sizeof path)) return;
-    if (is_partial_core_path(path)) return;
+    if (!make_child_path(bc->dir ? bc->dir : "/", name, path, sizeof path)) return true;
+    if (is_partial_core_path(path)) return true;
 
     const char *base = path_basename(path);
     if (strcmp(base, bc->name) == 0) {
         snprintf(bc->exact_path, sizeof bc->exact_path, "%s", path);
-        return;
+        return true;
     }
     if (ci_equal(base, bc->name)) {
         if (bc->folded_path[0] && strcmp(bc->folded_path, path) != 0) {
@@ -1692,6 +1866,7 @@ static void bare_name_resolve_cb(const char *name, uint32_t size, bool is_dir, c
             snprintf(bc->folded_path, sizeof bc->folded_path, "%s", path);
         }
     }
+    return true;
 }
 
 static const char *core_list_resolve_bare_name(const char *name)
@@ -1706,7 +1881,7 @@ static const char *core_list_resolve_bare_name(const char *name)
         .dir = core_list_last_dir,
         .name = name,
     };
-    if (!storage_list_cores(core_list_last_dir, bare_name_resolve_cb, &ctx)) return NULL;
+    if (!storage_list_cores(core_list_last_dir, bare_name_resolve_cb, &ctx, false)) return NULL;
 
     if (ctx.exact_path[0]) {
         snprintf(resolved_path, sizeof resolved_path, "%s", ctx.exact_path);
@@ -1792,23 +1967,24 @@ typedef struct {
     uint8_t board_rev;
 } basic_list_ctx_t;
 
-static void basic_list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+static bool basic_list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)modified;
     basic_list_ctx_t *bl = (basic_list_ctx_t *)ctx;
-    if (!is_dir && is_partial_core_path(name)) return;
+    if (!is_dir && is_partial_core_path(name)) return true;
     if (!is_dir && bl && (bl->board_rev == 3 || bl->board_rev == 6)) {
         core_file_t cf;
-        if (!core_open(&cf, name)) return;
+        if (!core_open(&cf, name)) return true;
         bool match = core_matches_board(&cf, name, bl->board_rev);
         core_close(&cf);
-        if (!match) return;
+        if (!match) return true;
     }
 
     uart_cmd_printf("%5lu \"%s\" %s\r\n",
                     (unsigned long)((size + 255u) / 256u),
                     name,
                     is_dir ? "DIR" : "PRG");
+    return true;
 }
 
 static void basic_load_directory(uint8_t board_rev)
@@ -1820,7 +1996,7 @@ static void basic_load_directory(uint8_t board_rev)
 
     uart_cmd_puts("SEARCHING FOR $\r\nLOADING\r\n");
     basic_list_ctx_t ctx = { .board_rev = board_rev };
-    if (!storage_list_cores("/", basic_list_cb, &ctx)) {
+    if (!storage_list_cores("/", basic_list_cb, &ctx, false)) {
         basic_error("FILE NOT FOUND");
         return;
     }
@@ -2257,6 +2433,10 @@ static void dispatch_at(char *arg)
         cmd_info(param);
     } else if (ci_equal(cmd, "CORETEST") || ci_equal(cmd, "TESTREAD")) {
         cmd_test_read(param);
+    } else if (ci_equal(cmd, "COREMORE")) {
+        cmd_continue_list(param);
+    } else if (ci_equal(cmd, "COREMAX")) {
+        cmd_set_core_max(param, have_value);
     } else if (ci_equal(cmd, "JTAGLOAD") || ci_equal(cmd, "PROGRAM") || ci_equal(cmd, "LOAD")) {
         cmd_program(param);
     } else if (ci_equal(cmd, "JTAGSTREAM") || ci_equal(cmd, "STREAM")) {
@@ -2400,6 +2580,9 @@ int main(void)
 
     absolute_time_t remote_init_at = make_timeout_time_ms(M65_REMOTE_INIT_DELAY_MS);
     sd_hotplug_poll_at = make_timeout_time_ms(M65_SD_HOTPLUG_POLL_MS);
+
+    list_state = lsIdle;
+    max_list_bytes = 0;
 
     char line[256];
     for (;;) {

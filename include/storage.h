@@ -18,7 +18,13 @@ typedef struct {
     uint8_t second;
 } storage_timestamp_t;
 
-typedef void (*storage_list_cb_t)(const char *name,
+typedef enum {
+    lrFailed,   // List encountered an error
+    lrSuccess,  // List succeeded and is finished
+    lrFull,     // List filled the available buffer
+} list_result_t;
+
+typedef bool (*storage_list_cb_t)(const char *name,
                                   uint32_t size,
                                   bool is_dir,
                                   const storage_timestamp_t *modified,
@@ -42,8 +48,8 @@ void storage_close(storage_file_t *f);
 bool storage_delete(const char *path);
 bool storage_rename(const char *old_path, const char *new_path);
 bool storage_mkdir(const char *path);
-bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx);
-bool storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx);
+list_result_t storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues);
+list_result_t storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues);
 void storage_format_timestamp(const storage_timestamp_t *ts, char *out, size_t out_len);
 
 void storage_sd_probe(void);

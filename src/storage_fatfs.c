@@ -8,6 +8,7 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
+#include "uart_cmd.h"
 
 // This file expects a FatFs diskio layer to be provided by your chosen Pico SD
 // driver. The common carlk3/no-OS-FatFS-SD-SPI-RPi-Pico project provides ff.h,
@@ -330,38 +331,44 @@ bool storage_mkdir(const char *path)
     return true;
 }
 
-static bool storage_list_filtered(const char *path, storage_list_cb_t cb, void *ctx, bool cores_only)
+static list_result_t storage_list_filtered(const char *path, storage_list_cb_t cb, void *ctx, bool cores_only, bool listing_continues)
 {
-    DIR dir;
+    static DIR dir;
     FILINFO fi;
     const char *p = (path && path[0]) ? path : "/";
-    FRESULT fr = f_opendir(&dir, p);
-    if (fr != FR_OK) { set_err("f_opendir", fr); return false; }
+    if (!listing_continues) {
+        FRESULT fr = f_opendir(&dir, p);
+        if (fr != FR_OK) { set_err("f_opendir", fr); return lrFailed; }
+    }
+
     bool in_theme_dir = ext_equal_ci_local(p, M65_THEME_DIR_PATH) ||
                         (p[0] == '/' && ext_equal_ci_local(p + 1, M65_THEME_DIR_PATH));
 
     for (;;) {
-        fr = f_readdir(&dir, &fi);
-        if (fr != FR_OK) { set_err("f_readdir", fr); f_closedir(&dir); return false; }
+        FRESULT fr = f_readdir(&dir, &fi);
+        if (fr != FR_OK) { set_err("f_readdir", fr); f_closedir(&dir); return lrFailed; }
         if (fi.fname[0] == 0) break;
         bool is_dir = (fi.fattrib & AM_DIR) != 0;
         if (!cores_only || is_dir || has_core_ext(fi.fname) ||
             (in_theme_dir && has_theme_ext(fi.fname)) ||
             has_partial_core_ext(fi.fname)) {
             storage_timestamp_t modified = fatfs_timestamp(fi.fdate, fi.ftime);
-            cb(fi.fname, (uint32_t)fi.fsize, is_dir, &modified, ctx);
+            if (!cb(fi.fname, (uint32_t)fi.fsize, is_dir, &modified, ctx)) {
+                return lrFull;
+            }
+
         }
     }
     f_closedir(&dir);
-    return true;
+    return lrSuccess;
 }
 
-bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx)
+list_result_t storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues)
 {
-    return storage_list_filtered(path, cb, ctx, true);
+    return storage_list_filtered(path, cb, ctx, true, listing_continues);
 }
 
-bool storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx)
+list_result_t storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues)
 {
-    return storage_list_filtered(path, cb, ctx, false);
+    return storage_list_filtered(path, cb, ctx, false, listing_continues);
 }

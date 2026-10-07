@@ -11,7 +11,7 @@
 // The firmware also listens on Pico USB CDC by default, so this UART is optional
 // for PC control but useful for MEGA65-side/native control.
 #define M65_UART_ID          uart0
-#define M65_UART_BAUD        2000000u
+#define M65_UART_BAUD        115200u
 #define M65_UART_TX_PIN      0u
 #define M65_UART_RX_PIN      1u
 
