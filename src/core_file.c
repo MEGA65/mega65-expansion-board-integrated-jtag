@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "uart_cmd.h"
 
 static char last_err[128];
 

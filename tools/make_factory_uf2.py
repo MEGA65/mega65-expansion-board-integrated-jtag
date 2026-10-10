@@ -11,6 +11,7 @@ UF2_MAGIC_START1 = 0x9E5D5157
 UF2_MAGIC_END = 0x0AB16F30
 UF2_FLAG_FAMILY_ID_PRESENT = 0x00002000
 UF2_FAMILY_RP2040 = 0xE48BFF56
+UF2_FAMILY_RP2350 = 0xE48BFF59
 XIP_BASE = 0x10000000
 BLOCK_PAYLOAD = 256
 
@@ -59,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bootloader-size", default="0x10000", type=parse_int)
     ap.add_argument("--app-offset", default="0x10000", type=parse_int)
     ap.add_argument("--app-size", default="0xF0000", type=parse_int)
+    ap.add_argument("--pico2-w", action="store_true")
     args = ap.parse_args(argv)
 
     bootloader = args.bootloader.read_bytes()
@@ -89,7 +91,10 @@ def main(argv: list[str] | None = None) -> int:
     regions: list[tuple[int, bytes]] = [(XIP_BASE, bytes(image))]
     blocks = iter_blocks(regions)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    write_uf2(args.output, blocks, UF2_FAMILY_RP2040)
+    if (args.pico2_w):
+        write_uf2(args.output, blocks, UF2_FAMILY_RP2350)
+    else:
+        write_uf2(args.output, blocks, UF2_FAMILY_RP2040)
     print(
         f"Wrote {args.output}: bootloader={len(bootloader)} bytes "
         f"pad={args.app_offset - len(bootloader)} bytes app={len(app)} bytes blocks={len(blocks)}"

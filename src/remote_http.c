@@ -1678,20 +1678,21 @@ typedef struct {
     uint32_t count;
 } theme_scan_ctx_t;
 
-static void theme_scan_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+static bool theme_scan_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
     (void)modified;
     theme_scan_ctx_t *ts = (theme_scan_ctx_t *)ctx;
-    if (!ts || is_dir || !safe_theme_package_name(name)) return;
+    if (!ts || is_dir || !safe_theme_package_name(name)) return true;
     if (!ts->first[0]) snprintf(ts->first, sizeof ts->first, "%s", name);
     ts->count++;
+    return true;
 }
 
 static uint32_t theme_scan(theme_scan_ctx_t *out)
 {
     theme_scan_ctx_t ts = {0};
-    (void)storage_list_dir(M65_THEME_DIR_PATH, theme_scan_cb, &ts);
+    (void)storage_list_dir(M65_THEME_DIR_PATH, theme_scan_cb, &ts, false);
     if (out) *out = ts;
     return ts.count;
 }
@@ -2244,33 +2245,34 @@ static void append_template_or_fallback(page_builder_t *pb,
     append_substituted(pb, fallback, file_name, file_path, dir_path, size, is_dir, modified, board_rev);
 }
 
-static void index_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+static bool index_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     index_list_ctx_t *il = (index_list_ctx_t *)ctx;
     if (il->pb->len + 512u >= il->pb->cap) {
         il->truncated = true;
-        return;
+        return true;
     }
-    if (is_dir && ci_equal(name, "WWW")) return;
+    if (is_dir && ci_equal(name, "WWW")) return true;
     if (il->rows >= M65_HTTP_INDEX_MAX_ROWS) {
         il->truncated = true;
-        return;
+        return true;
     }
 
     char full_path[256];
-    if (!make_child_path(il->dir_path, name, full_path, sizeof full_path)) return;
+    if (!make_child_path(il->dir_path, name, full_path, sizeof full_path)) return true;
 
     bool is_partial = !is_dir && is_partial_core_path(full_path);
     bool is_theme = !is_dir && has_theme_ext(full_path);
     if (!is_dir && !is_partial && !is_theme && (il->board_rev == 3 || il->board_rev == 6)) {
         core_file_t cf;
-        if (!core_open(&cf, full_path)) return;
+        if (!core_open(&cf, full_path)) return true;
         bool match = core_matches_board(&cf, full_path, il->board_rev);
         core_close(&cf);
-        if (!match) return;
+        if (!match) return true;
     }
     append_substituted(il->pb, il->row_template, name, full_path, il->dir_path, size, is_dir, modified, il->board_rev);
     il->rows++;
+    return true;
 }
 
 static err_t http_close(http_conn_t *c)
@@ -2627,7 +2629,7 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         .dir_path = dir_path,
         .board_rev = board_rev,
     };
-    if (!storage_list_cores(dir_path, index_cb, &il)) {
+    if (!storage_list_cores(dir_path, index_cb, &il, false)) {
         page_append(&pb, "<tr><td colspan=\"4\">SD list failed</td></tr>\n");
     }
     if (il.truncated) {
@@ -4136,20 +4138,21 @@ typedef struct {
 
 static void delete_partial_tree(const char *dir, uint32_t *deleted);
 
-static void delete_partial_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+static bool delete_partial_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
     (void)modified;
     partial_cleanup_ctx_t *pc = (partial_cleanup_ctx_t *)ctx;
-    if (!pc || !name || !name[0]) return;
+    if (!pc || !name || !name[0]) return true;
 
     char path[256];
-    if (!make_child_path(pc->dir, name, path, sizeof path)) return;
+    if (!make_child_path(pc->dir, name, path, sizeof path)) return true;
     if (is_dir) {
         if (!ci_equal(name, "WWW")) delete_partial_tree(path, &pc->deleted);
-        return;
+        return true;
     }
     if (is_partial_core_path(path) && storage_delete(path)) pc->deleted++;
+    return true;
 }
 
 static void delete_partial_tree(const char *dir, uint32_t *deleted)
@@ -4158,7 +4161,7 @@ static void delete_partial_tree(const char *dir, uint32_t *deleted)
         .dir = (dir && dir[0]) ? dir : "/",
         .deleted = deleted ? *deleted : 0,
     };
-    storage_list_cores(ctx.dir, delete_partial_cb, &ctx);
+    storage_list_cores(ctx.dir, delete_partial_cb, &ctx, false);
     if (deleted) *deleted = ctx.deleted;
 }
 
@@ -4917,23 +4920,24 @@ typedef struct {
 
 static void delete_tree(const char *dir, bool delete_self, bool *ok);
 
-static void delete_tree_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+static bool delete_tree_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     (void)size;
     (void)modified;
     delete_tree_ctx_t *dt = (delete_tree_ctx_t *)ctx;
-    if (!dt || !dt->ok || !name || !name[0]) return;
+    if (!dt || !dt->ok || !name || !name[0]) return true;
 
     char path[256];
     if (!make_child_path(dt->dir, name, path, sizeof path)) {
         dt->ok = false;
-        return;
+        return true;
     }
     if (is_dir) {
         delete_tree(path, true, &dt->ok);
     } else if (!storage_delete(path)) {
         dt->ok = false;
     }
+    return true;
 }
 
 static void delete_tree(const char *dir, bool delete_self, bool *ok)
@@ -4943,7 +4947,7 @@ static void delete_tree(const char *dir, bool delete_self, bool *ok)
         .dir = (dir && dir[0]) ? dir : "/",
         .ok = true,
     };
-    if (!storage_list_dir(ctx.dir, delete_tree_cb, &ctx)) {
+    if (!storage_list_dir(ctx.dir, delete_tree_cb, &ctx, false)) {
         ctx.ok = false;
     }
     if (ctx.ok && delete_self && !storage_delete(ctx.dir)) {

@@ -126,6 +126,7 @@ target_link_libraries(pico_m65jtag
     hardware_watchdog
     hardware_sync
     pico_mbedtls_crypto
+    pico_aon_timer
 )
 
 if(M65_ENABLE_WIFI_REMOTE)
@@ -185,6 +186,7 @@ if(M65_USE_FATFS)
         message(FATAL_ERROR "FatFs backend was added, but no known CMake target was exported. Expected FatFs_SPI.")
     endif()
 
+
     get_target_property(FATFS_SPI_SOURCES ${FATFS_SPI_TARGET} INTERFACE_SOURCES)
     if(FATFS_SPI_SOURCES)
         list(REMOVE_ITEM FATFS_SPI_SOURCES
@@ -192,6 +194,24 @@ if(M65_USE_FATFS)
             "${FATFS_SPI_CMAKE_DIR}/sd_driver/spi.c"
         )
         set_target_properties(${FATFS_SPI_TARGET} PROPERTIES INTERFACE_SOURCES "${FATFS_SPI_SOURCES}")
+    endif()
+
+    if (NOT PICO_RP2040)
+        if(FATFS_SPI_SOURCES)
+            list(REMOVE_ITEM FATFS_SPI_SOURCES
+                "${FATFS_SPI_CMAKE_DIR}/src/rtc.c"
+            )
+            set_target_properties(${FATFS_SPI_TARGET} PROPERTIES INTERFACE_SOURCES "${FATFS_SPI_SOURCES}")
+        endif()
+        target_sources(pico_m65jtag PRIVATE src/rtc_rp2350.c)
+
+        get_target_property(FATFS_SPI_LIBS ${FATFS_SPI_TARGET} INTERFACE_LINK_LIBRARIES)
+        if(FATFS_SPI_LIBS)
+            list(REMOVE_ITEM FATFS_SPI_LIBS
+                hardware_rtc
+            )
+            set_target_properties(${FATFS_SPI_TARGET} PROPERTIES INTERFACE_LINK_LIBRARIES "${FATFS_SPI_LIBS}")
+        endif()
     endif()
 
     target_link_libraries(pico_m65jtag ${FATFS_SPI_TARGET})
