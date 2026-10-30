@@ -9,7 +9,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
+import urllib.request
+import urllib.response
 import zipfile
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,6 +40,86 @@ def zip_bytes(files):
         for name, data in files.items():
             archive.writestr(name, data)
     return buffer.getvalue()
+
+
+class FilehostAuthTests(unittest.TestCase):
+    def setUp(self):
+        test = self
+
+        class FilehostServer(urllib.request.HTTPSHandler):
+            def https_open(self, request):
+                test.assertEqual(urllib.parse.urlsplit(request.full_url).hostname, "files.mega65.org")
+                headers = Message()
+                if request.get_header("X-requested-with") != "XMLHttpRequest":
+                    result = {"state": "NOTOK", "message": "Invalid request"}
+                elif request.full_url.endswith("/login.php"):
+                    fields = urllib.parse.parse_qs(request.data.decode())
+                    test.assertEqual(fields, {
+                        "logindata[username]": ["test@example.invalid"],
+                        "logindata[password]": ["test-password&=+"],
+                    })
+                    headers["Set-Cookie"] = "PHPSESSID=test-session; Path=/; Secure; HttpOnly"
+                    result = test.login_result
+                else:
+                    test.assertEqual(request.full_url, "https://files.mega65.org/php/readfiledetail.php")
+                    test.assertEqual(request.get_header("Cookie"), "PHPSESSID=test-session")
+                    test.assertEqual(urllib.parse.parse_qs(request.data.decode()), {"fileid": [FILE_ID]})
+                    result = [{"state": "OK", "location": ARCHIVE_URL, "filename": "cores.zip"}]
+                response = urllib.response.addinfourl(
+                    io.BytesIO(json.dumps(result).encode()), headers, request.full_url, 200,
+                )
+                response.msg = "OK"
+                return response
+
+        self.login_result = {"state": "OK"}
+        build_opener = urllib.request.build_opener
+        transport = FilehostServer()
+        opener = build_opener(transport, urllib.request.ProxyHandler({}))
+        patches = [
+            patch("urllib.request.build_opener", side_effect=lambda *handlers: build_opener(
+                transport, urllib.request.ProxyHandler({}), *handlers,
+            )),
+            patch("urllib.request.urlopen", side_effect=opener.open),
+            patch.object(m65j, "parse_filehost_config", return_value=({
+                "filehost_user": "test@example.invalid", "filehost_password": "test-password&=+",
+            }, Path("test.config"))),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_configured_login_and_file_details_follow_filehost_protocol(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            cookie = m65j.load_cookie(m65j.argparse.Namespace(cookie=None, cookie_file=None))
+        self.assertEqual(cookie, "PHPSESSID=test-session")
+        candidates, error = m65j.filehost_detail_candidates(FILE_ID, cookie)
+        self.assertIsNone(error)
+        self.assertEqual([candidate.url for candidate in candidates], [ARCHIVE_URL])
+
+    def test_rejected_login_does_not_return_the_anonymous_session(self):
+        self.login_result = {"state": "NOTOK", "message": "Invalid credentials"}
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            cookie = m65j.load_cookie(m65j.argparse.Namespace(cookie=None, cookie_file=None))
+        self.assertIsNone(cookie)
+        self.assertIn("Invalid credentials", diagnostics.getvalue())
+        self.assertNotIn("test-password", diagnostics.getvalue())
+
+    def test_session_cookie_is_scoped_to_filehost_and_not_forwarded_on_redirects(self):
+        for url, expected in (
+            ("https://files.mega65.org/download.zip", "PHPSESSID=test-session"),
+            ("https://www.files.mega65.org/download.zip", "PHPSESSID=test-session"),
+            (CATALOGUE, None),
+            ("https://files.mega65.org.example.invalid/download.zip", None),
+        ):
+            for request in (m65j.request(url, "PHPSESSID=test-session"),
+                            m65j.request_with_data(url, {}, "PHPSESSID=test-session")):
+                with self.subTest(url=url, method=request.get_method()):
+                    self.assertEqual(request.get_header("Cookie"), expected)
+                    redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+                        request, None, 302, "Found", {}, ARCHIVE_URL,
+                    )
+                    self.assertIsNone(redirected.get_header("Cookie"))
 
 
 class MirrorTests(unittest.TestCase):

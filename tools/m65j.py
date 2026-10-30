@@ -1209,14 +1209,20 @@ def clean_text(s: str) -> str:
     return " ".join(html.unescape(TAG_RE.sub(" ", s)).split())
 
 
+def add_filehost_cookie(req: urllib.request.Request, cookie: str | None) -> urllib.request.Request:
+    if cookie and urllib.parse.urlsplit(req.full_url).hostname in FILEHOST_ROOTS:
+        # Catalogue pages and external download hosts must not receive the session.
+        # Keep it out of headers that urllib copies to redirected requests, too.
+        req.add_unredirected_header("Cookie", cookie)
+    return req
+
+
 def request(url: str, cookie: str | None = None, method: str = "GET") -> urllib.request.Request:
     headers = {
         "User-Agent": "mega65-altcore-fetch/1.0",
         "Accept": "*/*",
     }
-    if cookie:
-        headers["Cookie"] = cookie
-    return urllib.request.Request(url, headers=headers, method=method)
+    return add_filehost_cookie(urllib.request.Request(url, headers=headers, method=method), cookie)
 
 
 def request_with_data(url: str, fields: dict[str, str], cookie: str | None = None) -> urllib.request.Request:
@@ -1226,10 +1232,10 @@ def request_with_data(url: str, fields: dict[str, str], cookie: str | None = Non
         "Accept": "*/*",
         "Content-Type": "application/x-www-form-urlencoded",
         "Content-Length": str(len(data)),
+        # The filehost rejects POST requests that do not identify as AJAX.
+        "X-Requested-With": "XMLHttpRequest",
     }
-    if cookie:
-        headers["Cookie"] = cookie
-    return urllib.request.Request(url, data=data, headers=headers, method="POST")
+    return add_filehost_cookie(urllib.request.Request(url, data=data, headers=headers, method="POST"), cookie)
 
 
 def fetch_bytes(url: str, cookie: str | None = None, timeout: float = 10.0) -> tuple[bytes, str, str]:
@@ -2388,6 +2394,7 @@ def login_filehost(user: str, password: str, cfg_path: Path | None) -> str | Non
             "User-Agent": "mega65-altcore-fetch/1.0",
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
         },
         method="POST",
     )
