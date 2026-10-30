@@ -352,7 +352,12 @@ tools/m65j.py -s /dev/ttyACM0 push local.bit
 ```
 
 `tools/m65j.py` is the single supported host utility; it contains the signing,
-serial, web, mirror, and populate code in one file. It reads `.m65j.config`
+serial, web, mirror, and populate code as ordinary Python functions in one file,
+so it can be copied on its own and debugged directly. Host-side regression tests
+run with `python3 -m unittest discover -s tools -p 'test_m65j.py' -v` and use
+local fixtures; signing tests also use OpenSSL.
+
+The client reads `.m65j.config`
 from the current directory first, then
 `~/.m65j.config`. Use `serial=` for the USB TTY, `url=` for the HTTP
 interface, or `machine=` for a named board:

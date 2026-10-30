@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
+"""Self-contained MEGA65 JTAG client for signing, serial, HTTP, and mirrors."""
+
+from __future__ import annotations
+
 import argparse
 import base64
 import concurrent.futures
 import hashlib
+import html
+import http.cookiejar
+import io
 import ipaddress
+import json
 import os
 import re
+import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
-import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-import zlib
+import zipfile
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
@@ -44,343 +54,31 @@ P256_SPKI_PREFIX = bytes.fromhex(
     "3059301306072a8648ce3d020106082a8648ce3d030107034200"
 )
 
+# Alternate-core catalogue and mirror artifact names.
+ALTCORE_PAGES = [
+    "https://kugelblitz360.github.io/m65-altcores/computer-cores.html",
+    "https://kugelblitz360.github.io/m65-altcores/arcade-cores.html",
+    "https://kugelblitz360.github.io/m65-altcores/game-console-cores.html",
+]
+FILEHOST_ROOTS = {"files.mega65.org", "www.files.mega65.org"}
+FILEHOST_ID_RE = re.compile(
+    r"https?://files\.mega65\.org/(?:html/main\.php)?\??[^\"' <>\n]*\bid=([0-9a-fA-F-]{36})",
+    re.I,
+)
+HREF_RE = re.compile(r"""href=["']([^"']+)["']""", re.I)
+HEADING_RE = re.compile(r"<h([23])[^>]*>(.*?)</h\1>", re.I | re.S)
+TAG_RE = re.compile(r"<[^>]+>")
+ALLOWED_DOWNLOAD_EXTS = (".zip", ".bit", ".cor", ".core", ".m65j")
+CORE_FILE_EXTS = (".bit", ".cor", ".core", ".m65j")
+COR_MAGIC = b"MEGA65BITSTREAM0"
+PUBLIC_FIRMWARE_FILENAME = "mega65-pico-jtag.uf2"
+OTA_FIRMWARE_FILENAME = "mega65-integrated-jtag-firmware.uf2"
+SDCARD_BOOTSTRAP_FILENAME = "sdcard-files.zip"
+SDCARD_BOOTSTRAP_ALL_CORES_FILENAME = "sdcard-files-all-cores.zip"
+
+
 CLI_SERIAL_DEVICE = None
 CLI_WEB_URL = None
-
-
-# m65j.py is intentionally self-contained.  The mirror/populate implementation
-# is embedded here so users can copy this one file without also copying helper
-# modules.
-_EMBEDDED_DOWNLOAD_ALTCORES_B64 = (
-    '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'
-)
-_ALTCORE_NS = None
-
-
-def embedded_altcore_bless_core(path, board, args):
-    board_id = "6" if board == "r6" else "3" if board == "r3" else "0"
-    cmd = [
-        "--bless",
-        "--board",
-        board_id,
-        "--name",
-        Path(path).name,
-        "-o",
-        str(path),
-    ]
-    if getattr(args, "key", None):
-        cmd.extend(["--key", str(args.key)])
-    if getattr(args, "key_name", None):
-        cmd.extend(["--key-name", str(args.key_name)])
-    if getattr(args, "yes", False):
-        cmd.append("--yes")
-    if getattr(args, "blank_filename", False):
-        cmd.append("--blank-filename")
-    cmd.append(str(path))
-    rc = signing_main(cmd)
-    return "blessed" if rc == 0 else f"bless failed: exit {rc}"
-
-
-def embedded_altcore_main(argv):
-    global _ALTCORE_NS
-    if _ALTCORE_NS is None:
-        import types
-
-        source = zlib.decompress(base64.b64decode(_EMBEDDED_DOWNLOAD_ALTCORES_B64)).decode("utf-8")
-        module_name = "m65j_embedded_download_altcores"
-        module = types.ModuleType(module_name)
-        module.__file__ = __file__
-        sys.modules[module_name] = module
-        ns = module.__dict__
-        exec(compile(source, "<m65j-embedded-download-altcores>", "exec"), ns)
-        ns["bless_core"] = embedded_altcore_bless_core
-        _ALTCORE_NS = ns
-    return _ALTCORE_NS["main"](argv)
 
 
 def load_serial_module():
@@ -1450,8 +1148,1445 @@ def signing_main(argv):
     return 0
 
 
-def latest_main(argv):
-    return embedded_altcore_main(argv)
+# Alternate-core catalogue and downloads.
+
+
+def sdcard_bootstrap_board_cores_filename(board: str) -> str:
+    return f"sdcard-files-{board.lower()}-cores.zip"
+
+
+@dataclass
+class CoreRef:
+    title: str
+    filehost_id: str
+    url: str
+    source_page: str
+    board_hint: str
+
+
+@dataclass
+class DownloadResult:
+    title: str
+    filehost_id: str
+    archive_url: str | None
+    extracted: str | None
+    status: str
+
+
+@dataclass
+class DownloadCandidate:
+    url: str
+    filename: str | None = None
+    source: str = "link"
+
+
+@dataclass
+class ManifestArtifact:
+    kind: str
+    path: Path
+    rel: str
+    version: str = ""
+    build: str = ""
+    name: str = ""
+
+
+def core_file_paths(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in CORE_FILE_EXTS
+    )
+
+
+def strip_signature_trailer(data: bytes) -> bytes:
+    if len(data) >= TRAILER_LEN and data[-TRAILER_LEN:-TRAILER_LEN + len(MAGIC)] == MAGIC:
+        return data[:-TRAILER_LEN]
+    return data
+
+
+def clean_text(s: str) -> str:
+    return " ".join(html.unescape(TAG_RE.sub(" ", s)).split())
+
+
+def request(url: str, cookie: str | None = None, method: str = "GET") -> urllib.request.Request:
+    headers = {
+        "User-Agent": "mega65-altcore-fetch/1.0",
+        "Accept": "*/*",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    return urllib.request.Request(url, headers=headers, method=method)
+
+
+def request_with_data(url: str, fields: dict[str, str], cookie: str | None = None) -> urllib.request.Request:
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    headers = {
+        "User-Agent": "mega65-altcore-fetch/1.0",
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": str(len(data)),
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    return urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+
+def fetch_bytes(url: str, cookie: str | None = None, timeout: float = 10.0) -> tuple[bytes, str, str]:
+    with urllib.request.urlopen(request(url, cookie), timeout=timeout) as resp:
+        data = resp.read()
+        ctype = resp.headers.get("Content-Type", "")
+        final_url = resp.geturl()
+    return data, ctype, final_url
+
+
+def post_json(url: str, fields: dict[str, str], cookie: str | None = None, timeout: float = 10.0):
+    with urllib.request.urlopen(request_with_data(url, fields, cookie), timeout=timeout) as resp:
+        data = resp.read()
+    return json.loads(data.decode("utf-8", errors="replace"))
+
+
+def fetch_text(url: str, cookie: str | None = None) -> str:
+    data, ctype, _ = fetch_bytes(url, cookie)
+    charset = "utf-8"
+    m = re.search(r"charset=([^;\s]+)", ctype, re.I)
+    if m:
+        charset = m.group(1)
+    return data.decode(charset, errors="replace")
+
+
+def nearest_heading(headings: list[tuple[int, str]], pos: int) -> str:
+    title = "unknown-core"
+    for hpos, text in headings:
+        if hpos > pos:
+            break
+        title = text
+    return title
+
+
+def board_hint_from_context(context: str) -> str:
+    text = clean_text(context).lower()
+    has_r3 = bool(re.search(r"\br3\b|r3-only|r3 only|rev(?:ision)?\s*3", text))
+    has_r6 = bool(re.search(r"\br6\b|r6-only|r6 only|rev(?:ision)?\s*6", text))
+    if has_r3 and not has_r6:
+        return "r3"
+    if has_r6 and not has_r3:
+        return "r6"
+    if has_r3 and has_r6:
+        return "both"
+    return "unknown"
+
+
+def board_label(board_id: int) -> str:
+    if board_id == 3:
+        return "r3"
+    if board_id == 6:
+        return "r6"
+    return "unknown"
+
+
+def expand_source_pages(pages: list[str] | None) -> list[str]:
+    if not pages:
+        return ALTCORE_PAGES
+    expanded: list[str] = []
+    for page in pages:
+        parsed = urllib.parse.urlparse(page)
+        if parsed.netloc.lower() in FILEHOST_ROOTS and parsed.path in ("", "/") and not parsed.query:
+            expanded.extend(ALTCORE_PAGES)
+        else:
+            expanded.append(page)
+    return expanded
+
+
+def scrape_altcore_refs(cookie: str | None = None, pages: list[str] | None = None) -> list[CoreRef]:
+    refs: list[CoreRef] = []
+    seen: set[tuple[str, str]] = set()
+    for page in expand_source_pages(pages):
+        text = fetch_text(page, cookie)
+        headings = [(m.start(), clean_text(m.group(2))) for m in HEADING_RE.finditer(text)]
+        for m in FILEHOST_ID_RE.finditer(text):
+            file_id = m.group(1).lower()
+            href = m.group(0)
+            title = nearest_heading(headings, m.start())
+            context = text[max(0, m.start() - 400) : min(len(text), m.end() + 180)]
+            hint = board_hint_from_context(context)
+            key = (file_id, hint)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(CoreRef(title=title, filehost_id=file_id, url=href, source_page=page, board_hint=hint))
+    return refs
+
+
+def allowed_download_ext(value: str | None) -> str | None:
+    if not value:
+        return None
+    parsed = urllib.parse.urlparse(html.unescape(value))
+    path = urllib.parse.unquote(parsed.path or value)
+    lower = path.lower()
+    for ext in ALLOWED_DOWNLOAD_EXTS:
+        if lower.endswith(ext):
+            return ext
+    return None
+
+
+def safe_download_filename(name: str | None, fallback_url: str, default: str) -> str:
+    candidate = name or Path(urllib.parse.unquote(urllib.parse.urlparse(fallback_url).path)).name or default
+    candidate = Path(candidate).name
+    candidate = re.sub(r"[^A-Za-z0-9._ -]+", "-", candidate).strip(" .-_")
+    if not candidate:
+        candidate = default
+    ext = allowed_download_ext(candidate)
+    if ext == ".core":
+        candidate = f"{Path(candidate).stem}.cor"
+    return candidate
+
+
+def filehost_detail_candidates(file_id: str, cookie: str | None, verbose: bool = False) -> tuple[list[DownloadCandidate], str | None]:
+    url = "https://files.mega65.org/php/readfiledetail.php"
+    try:
+        rows = post_json(url, {"fileid": file_id}, cookie)
+    except Exception as exc:  # noqa: BLE001
+        return [], f"filehost detail failed: {exc}"
+
+    if not isinstance(rows, list) or not rows:
+        return [], "filehost detail returned no rows"
+
+    candidates: list[DownloadCandidate] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        state = str(row.get("state", ""))
+        if state and state != "OK":
+            return [], f"filehost detail state={state}: {row.get('message', '')}"
+        location = str(row.get("location") or "")
+        filename = str(row.get("filename") or "")
+        if not location:
+            continue
+        if not (allowed_download_ext(filename) or allowed_download_ext(location)):
+            if verbose:
+                print(f"  detail ignored non-core filename/location: {filename or location}", flush=True)
+            continue
+        candidates.append(DownloadCandidate(
+            urllib.parse.urljoin("https://files.mega65.org/html/filedetail.php", html.unescape(location)),
+            filename=filename or None,
+            source="readfiledetail",
+        ))
+    return candidates, None if candidates else "filehost detail returned no .zip/.cor/.core/.bit location"
+
+
+def candidate_archive_urls(file_id: str, page_html: str, page_url: str) -> list[DownloadCandidate]:
+    urls: list[DownloadCandidate] = []
+    for href in HREF_RE.findall(page_html):
+        absolute = urllib.parse.urljoin(page_url, html.unescape(href))
+        if allowed_download_ext(absolute):
+            urls.append(DownloadCandidate(absolute, source="html-link"))
+
+    deduped: list[DownloadCandidate] = []
+    seen: set[str] = set()
+    for candidate in urls:
+        if candidate.url not in seen:
+            seen.add(candidate.url)
+            deduped.append(candidate)
+    return deduped
+
+
+def looks_like_zip(data: bytes, ctype: str, url: str) -> bool:
+    if data.startswith(b"PK\x03\x04") or data.startswith(b"PK\x05\x06"):
+        return True
+    lower = (ctype + " " + url).lower()
+    return "zip" in lower and not data.lstrip().lower().startswith(b"<!doctype html")
+
+
+def looks_like_html(data: bytes, ctype: str) -> bool:
+    return "html" in ctype.lower() or data[:512].lstrip().lower().startswith((b"<!doctype html", b"<html"))
+
+
+def write_download_as_archive(cache_dir: Path,
+                              ref: CoreRef,
+                              data: bytes,
+                              final_url: str,
+                              filename_hint: str | None) -> Path:
+    name = safe_name(ref.title) or ref.filehost_id
+    if looks_like_zip(data, "", final_url) or allowed_download_ext(filename_hint) == ".zip" or allowed_download_ext(final_url) == ".zip":
+        archive = cache_dir / f"{name}-{ref.filehost_id}.zip"
+        archive.write_bytes(data)
+        return archive
+
+    member = safe_download_filename(filename_hint, final_url, f"{name}.cor")
+    archive = cache_dir / f"{name}-{ref.filehost_id}-direct.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(member, data)
+    return archive
+
+
+def dedupe_candidates(candidates: list[DownloadCandidate]) -> list[DownloadCandidate]:
+    deduped: list[DownloadCandidate] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate.url in seen:
+            continue
+        seen.add(candidate.url)
+        deduped.append(candidate)
+    return deduped
+
+
+def try_download_candidates(ref: CoreRef,
+                            cache_dir: Path,
+                            cookie: str | None,
+                            candidates: list[DownloadCandidate],
+                            verbose: bool = False) -> tuple[Path | None, str | None]:
+    deduped = dedupe_candidates(candidates)
+    for idx, candidate in enumerate(deduped, 1):
+        try:
+            if verbose:
+                label = f" ({candidate.source})" if candidate.source else ""
+                print(f"  download candidate {idx}/{len(deduped)}{label}: {candidate.url}", flush=True)
+            data, ctype, final_url = fetch_bytes(candidate.url, cookie)
+        except Exception as exc:  # noqa: BLE001
+            if verbose:
+                print(f"    failed: {exc}", flush=True)
+            continue
+
+        ext = allowed_download_ext(candidate.filename) or allowed_download_ext(final_url) or allowed_download_ext(candidate.url)
+        if not ext:
+            if verbose:
+                print(f"    skipped: URL/filename has no .zip/.cor/.core/.bit extension", flush=True)
+            continue
+        if looks_like_html(data, ctype):
+            if verbose:
+                print(f"    not a core archive/file: {ctype or 'unknown content-type'} {final_url}", flush=True)
+            continue
+        archive = write_download_as_archive(cache_dir, ref, data, final_url, candidate.filename)
+        return archive, final_url
+    return None, None
+
+
+def prefetch_filehost_details(refs: list[CoreRef],
+                              cookie: str | None,
+                              workers: int,
+                              quiet: bool = False) -> dict[str, tuple[list[DownloadCandidate], str | None]]:
+    unique_refs: list[CoreRef] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if ref.filehost_id in seen:
+            continue
+        seen.add(ref.filehost_id)
+        unique_refs.append(ref)
+    if not unique_refs:
+        return {}
+    workers = max(1, min(workers, len(unique_refs)))
+    if workers <= 1:
+        return {
+            ref.filehost_id: filehost_detail_candidates(ref.filehost_id, cookie, verbose=False)
+            for ref in unique_refs
+        }
+
+    if not quiet:
+        print(f"Prefetching filehost details for {len(unique_refs)} refs with {workers} workers...", flush=True)
+    out: dict[str, tuple[list[DownloadCandidate], str | None]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(filehost_detail_candidates, ref.filehost_id, cookie, False): ref
+            for ref in unique_refs
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            ref = futures[fut]
+            try:
+                out[ref.filehost_id] = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                out[ref.filehost_id] = ([], f"filehost detail failed: {exc}")
+    return out
+
+
+def download_archive_for_ref(ref: CoreRef,
+                             cache_dir: Path,
+                             cookie: str | None,
+                             verbose: bool = False,
+                             detail: tuple[list[DownloadCandidate], str | None] | None = None) -> tuple[Path | None, str | None, str]:
+    page_url = f"https://files.mega65.org/?id={ref.filehost_id}"
+    if detail is None:
+        candidates, detail_status = filehost_detail_candidates(ref.filehost_id, cookie, verbose=verbose)
+    else:
+        candidates, detail_status = detail
+    archive, final_url = try_download_candidates(ref, cache_dir, cookie, candidates, verbose=verbose)
+    if archive:
+        return archive, final_url, "downloaded"
+
+    page_html = ""
+    try:
+        if verbose:
+            print(f"  catalogue fallback: {page_url}", flush=True)
+        page_html = fetch_text(page_url, cookie)
+    except Exception as exc:  # noqa: BLE001
+        return None, None, detail_status or f"filehost page failed: {exc}"
+
+    archive, final_url = try_download_candidates(
+        ref,
+        cache_dir,
+        cookie,
+        candidate_archive_urls(ref.filehost_id, page_html, page_url),
+        verbose=verbose,
+    )
+    if archive:
+        return archive, final_url, "downloaded"
+
+    if "Username or email address" in page_html or "Enter the code" in page_html:
+        return None, None, "filehost login/code required; set filehost_cookie or filehost_user/password in .m65j.config"
+    return None, None, detail_status or "no downloadable .zip/.cor/.core/.bit link found"
+
+
+# Core selection and extraction.
+
+
+def safe_name(name: str) -> str:
+    name = name.strip().lower()
+    name = re.sub(r"[^a-z0-9._-]+", "-", name)
+    name = re.sub(r"-+", "-", name).strip("-._")
+    return name[:80]
+
+
+def safe_artifact_filename(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name)
+    name = re.sub(r"-+", "-", name).strip("-._")
+    return name[:120]
+
+
+def canonical_base_name(title: str, member_name: str) -> str:
+    candidates = [title, Path(member_name.split("::")[-1]).stem]
+    for candidate in candidates:
+        name = safe_name(candidate)
+        if not name or name == "unknown-core":
+            continue
+        name = re.sub(r"[._]+", "-", name)
+        name = re.sub(r"(?i)(^|-)(mega65)?r[36]($|-)", "-", name)
+        name = re.sub(r"(?i)(^|-)(rev|revision)-?[36]($|-)", "-", name)
+        name = re.sub(r"(?i)(^|-)(stable|unstable|nightly|release|released|latest)($|-)", "-", name)
+        name = re.sub(r"(?i)(^|-)(build|built|b|rel)-?\d+[a-z0-9-]*($|-)", "-", name)
+        name = re.sub(r"(?i)(^|-)v(?:er|ersion)?-?\d+(?:-\d+){0,4}[a-z]?($|-)", "-", name)
+        name = re.sub(r"(?i)(^|-)\d+(?:-\d+){1,4}($|-)", "-", name)
+        name = re.sub(r"(?i)(^|-)20\d{2}-?[01]\d-?[0-3]\d($|-)", "-", name)
+        name = re.sub(r"-+", "-", name).strip("-._")
+        if name:
+            return name[:80]
+    return "core"
+
+
+def canonical_core_filename(title: str, board: str, member_name: str) -> str:
+    ext = Path(member_name.split("::")[-1]).suffix.lower()
+    if ext == ".core":
+        ext = ".cor"
+    if ext not in CORE_FILE_EXTS:
+        ext = ".cor"
+    base = canonical_base_name(title, member_name)
+    board_suffix = f"-{board.lower()}"
+    if not base.endswith(board_suffix):
+        base += board_suffix
+    return f"{base}{ext}"
+
+
+def board_hint_present(text: str, board: str) -> bool:
+    return bool(
+        re.search(rf"(^|[^a-z0-9]){board}([^a-z0-9]|$)|rev(?:ision)?[_ -]*{board[-1]}", text) or
+        f"mega65{board}" in text
+    )
+
+
+def fixed_header_string(data: bytes, off: int, length: int = 32) -> str:
+    raw = data[off:off + length].split(b"\x00", 1)[0]
+    return raw.decode("ascii", errors="replace").strip()
+
+
+def cor_header_info(data: bytes) -> tuple[int, str, str, str]:
+    if len(data) < 0x71 or data[:16] != COR_MAGIC:
+        return 0, "", "", ""
+    title = fixed_header_string(data, 0x10)
+    version = fixed_header_string(data, 0x30)
+    model = fixed_header_string(data, 0x50)
+    return data[0x70], title, version, model
+
+
+def core_board_from_data(path: str, data: bytes) -> tuple[int, str]:
+    ext = Path(path.split("::")[-1]).suffix.lower()
+    if ext not in (".cor", ".core"):
+        return 0, ""
+    model_id, _title, _version, model = cor_header_info(data)
+    if model_id in (3, 6):
+        return model_id, model
+    lower_model = model.lower()
+    if board_hint_present(lower_model, "r3") and not board_hint_present(lower_model, "r6"):
+        return 3, model
+    if board_hint_present(lower_model, "r6") and not board_hint_present(lower_model, "r3"):
+        return 6, model
+    return 0, model
+
+
+def core_score(path: str, data: bytes, board: str, single: bool) -> int:
+    lower = path.lower()
+    leaf = Path(path.split("::")[-1]).name.lower()
+    other = "r6" if board == "r3" else "r3"
+    wanted_id = 3 if board == "r3" else 6
+    actual_id, _model = core_board_from_data(path, data)
+    score = 0
+    if single:
+        score += 3
+
+    if actual_id:
+        score += 200 if actual_id == wanted_id else -200
+
+    leaf_has_board = board_hint_present(leaf, board)
+    leaf_has_other = board_hint_present(leaf, other)
+    path_has_board = board_hint_present(lower, board)
+    path_has_other = board_hint_present(lower, other)
+
+    if leaf_has_board:
+        score += 30
+    elif path_has_board and not path_has_other:
+        score += 12
+    elif path_has_board:
+        score += 4
+
+    if leaf_has_other:
+        score -= 80
+    elif path_has_other and not path_has_board:
+        score -= 40
+
+    if "mega65" in lower:
+        score += 2
+    if lower.endswith(".cor"):
+        score += 6
+    if lower.endswith(".bit"):
+        score += 1
+    return score
+
+
+def core_member_detail(path: str, data: bytes) -> str:
+    actual_id, title, version, model = cor_header_info(data)
+    parts: list[str] = []
+    if title:
+        parts.append(f"title={title}")
+    if version:
+        parts.append(f"version={version}")
+    if actual_id:
+        parts.append(f"cor_model={board_label(actual_id).upper()}")
+    if model:
+        parts.append(f"model={model}")
+    return " ".join(parts)
+
+
+def iter_core_members(zf: zipfile.ZipFile, prefix: str = ""):
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = prefix + info.filename
+        lower = info.filename.lower()
+        if any(lower.endswith(ext) for ext in CORE_FILE_EXTS):
+            yield name, zf.read(info)
+        elif lower.endswith(".zip"):
+            nested_data = zf.read(info)
+            try:
+                with zipfile.ZipFile(io.BytesIO(nested_data)) as nested:
+                    yield from iter_core_members(nested, prefix=name + "::")
+            except zipfile.BadZipFile:
+                continue
+
+
+def iter_archive_files(zf: zipfile.ZipFile, prefix: str = ""):
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = prefix + info.filename
+        yield name
+        if info.filename.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(zf.read(info))) as nested:
+                    yield from iter_archive_files(nested, prefix=name + "::")
+            except zipfile.BadZipFile:
+                continue
+
+
+def format_archive_file_list(names: list[str], max_entries: int = 120) -> str:
+    if not names:
+        return "zip contains no regular files"
+    shown = names[:max_entries]
+    lines = ["zip contains:"]
+    lines.extend(f"  {name}" for name in shown)
+    if len(names) > len(shown):
+        lines.append(f"  ... {len(names) - len(shown)} more")
+    return "\n".join(lines)
+
+
+def has_core_file_ext(path: Path | str) -> bool:
+    return Path(str(path)).suffix.lower() in CORE_FILE_EXTS
+
+
+def iter_extra_core_files(items: list[str]) -> list[Path]:
+    found: list[Path] = []
+    for item in items or []:
+        p = Path(item)
+        if not p.exists():
+            raise SystemExit(f"extra core does not exist: {p}")
+        if p.is_dir():
+            found.extend(
+                child
+                for child in sorted(p.rglob("*"))
+                if child.is_file() and has_core_file_ext(child)
+            )
+        elif p.is_file():
+            if not has_core_file_ext(p):
+                raise SystemExit(f"extra core is not .bit/.cor/.core/.m65j: {p}")
+            found.append(p)
+        else:
+            raise SystemExit(f"extra core path is not a file or directory: {p}")
+
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for p in found:
+        key = p.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def extra_core_boards(path: Path, data: bytes, boards: list[str]) -> list[str]:
+    payload = strip_signature_trailer(data)
+    model_id, _model = core_board_from_data(path.name, payload)
+    if model_id in (3, 6):
+        wanted = [f"r{model_id}"]
+    else:
+        lower = path.name.lower()
+        has_r3 = board_hint_present(lower, "r3")
+        has_r6 = board_hint_present(lower, "r6")
+        if has_r3 and not has_r6:
+            wanted = ["r3"]
+        elif has_r6 and not has_r3:
+            wanted = ["r6"]
+        else:
+            wanted = list(boards)
+            if len(boards) > 1:
+                print(f"NOTE extra {path}: no board hint; including in R3 and R6 manifests")
+    return [b for b in wanted if b in boards]
+
+
+def copy_extra_core(src: Path,
+                    out_dir: Path,
+                    board: str,
+                    args: argparse.Namespace) -> tuple[Path | None, str]:
+    data = src.read_bytes()
+    payload = strip_signature_trailer(data)
+    _model_id, title, _version, _model = cor_header_info(payload)
+    if args.preserve_filenames:
+        base = safe_name(src.name)
+        if not base or not has_core_file_ext(base):
+            base = canonical_core_filename(title or src.stem, board, src.name)
+    else:
+        base = canonical_core_filename(title or src.stem, board, src.name)
+
+    dest = out_dir / base
+    write_data = payload if args.bless else data
+    existed_before = dest.exists()
+    if dest.exists():
+        old_payload = strip_signature_trailer(dest.read_bytes())
+        if old_payload == payload:
+            return dest, "unchanged"
+        if not args.overwrite:
+            return dest, "changed; use --overwrite to replace"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if write_data == data:
+        shutil.copy2(src, dest)
+    else:
+        dest.write_bytes(write_data)
+    detail = core_member_detail(src.name, payload)
+    if detail:
+        detail = f" ({detail})"
+    return dest, f"{'updated' if existed_before else 'included'} {src}{detail}"
+
+
+def extract_board_core(archive: Path, out_dir: Path, title: str, board: str, overwrite: bool, preserve_filenames: bool) -> tuple[Path | None, str]:
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            cores = list(iter_core_members(zf))
+            archive_files = list(iter_archive_files(zf))
+    except zipfile.BadZipFile:
+        return None, "bad zip"
+
+    if not cores:
+        return None, "no .cor/.bit files in zip\n" + format_archive_file_list(archive_files)
+
+    scored = sorted(
+        ((core_score(name, data, board, len(cores) == 1), name, data) for name, data in cores),
+        reverse=True,
+    )
+    score, member_name, data = scored[0]
+    if score < 0:
+        return None, f"no {board.upper()} .cor/.bit candidate\n" + format_archive_file_list(archive_files)
+
+    if preserve_filenames:
+        base = safe_name(Path(member_name.split("::")[-1]).name)
+        if not (base.endswith(".bit") or base.endswith(".cor")):
+            base += ".cor"
+        if not base or base in (".bit", ".cor"):
+            base = canonical_core_filename(title, board, member_name)
+    else:
+        base = canonical_core_filename(title, board, member_name)
+    dest = out_dir / base
+    existed_before = dest.exists()
+    if dest.exists():
+        old_payload = strip_signature_trailer(dest.read_bytes())
+        if old_payload == data:
+            return dest, "unchanged"
+        if not overwrite:
+            return dest, "changed; use --overwrite to replace"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    detail = core_member_detail(member_name, data)
+    if detail:
+        detail = f" ({detail})"
+    return dest, f"{'updated' if existed_before else 'extracted'} {member_name}{detail}"
+
+
+def bless_core(path, board, args):
+    board_id = "6" if board == "r6" else "3" if board == "r3" else "0"
+    cmd = [
+        "--bless",
+        "--board",
+        board_id,
+        "--name",
+        Path(path).name,
+        "-o",
+        str(path),
+    ]
+    if getattr(args, "key", None):
+        cmd.extend(["--key", str(args.key)])
+    if getattr(args, "key_name", None):
+        cmd.extend(["--key-name", str(args.key_name)])
+    if getattr(args, "yes", False):
+        cmd.append("--yes")
+    if getattr(args, "blank_filename", False):
+        cmd.append("--blank-filename")
+    cmd.append(str(path))
+    rc = signing_main(cmd)
+    return "blessed" if rc == 0 else f"bless failed: exit {rc}"
+
+
+
+def bless_paths(paths: list[Path], board: str, args: argparse.Namespace) -> None:
+    paths = sorted(dict.fromkeys(paths))
+    if not paths:
+        print(f"No {board.upper()} files to bless.")
+        return
+    for idx, path in enumerate(paths, 1):
+        print(f"Blessing {idx}/{len(paths)}: {path}", flush=True)
+        status = bless_core(path, board, args)
+        print(f"BLESS {path}: {status}")
+
+
+# Mirror artifacts, manifests, and SD-card bundles.
+
+
+def copy_artifact(src: str | None, dest: Path, overwrite: bool) -> Path | None:
+    if not src:
+        return None
+    source = Path(src)
+    if not source.exists() or not source.is_file():
+        raise SystemExit(f"artifact does not exist: {source}")
+    if source.resolve() == dest.resolve():
+        return dest
+    if dest.exists() and not overwrite:
+        old_payload = strip_signature_trailer(dest.read_bytes())
+        new_payload = strip_signature_trailer(source.read_bytes())
+        if old_payload != new_payload:
+            raise SystemExit(f"artifact would overwrite changed file; use --overwrite: {dest}")
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, dest)
+    return dest
+
+
+def copy_public_firmware(src: str | None, dest: Path, overwrite: bool) -> Path | None:
+    if not src:
+        return None
+    source = Path(src)
+    if not source.exists() or not source.is_file():
+        raise SystemExit(f"firmware artifact does not exist: {source}")
+    data = strip_signature_trailer(source.read_bytes())
+    if dest.exists() and dest.read_bytes() == data:
+        return dest
+    if dest.exists() and not overwrite:
+        raise SystemExit(f"plain firmware download would overwrite changed file; use --overwrite: {dest}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return dest
+
+
+def stage_manifest_artifacts(out_dir: Path, args: argparse.Namespace, boards: list[str]) -> list[ManifestArtifact]:
+    artifacts: list[ManifestArtifact] = []
+    copy_public_firmware(
+        args.firmware,
+        out_dir / PUBLIC_FIRMWARE_FILENAME,
+        args.overwrite,
+    )
+    firmware = copy_artifact(
+        args.firmware,
+        out_dir / OTA_FIRMWARE_FILENAME,
+        args.overwrite,
+    )
+    if firmware:
+        artifacts.append(ManifestArtifact(
+            kind="firmware",
+            path=firmware,
+            rel=firmware.relative_to(out_dir).as_posix(),
+            version=args.firmware_version or "",
+            build=args.firmware_build or "",
+        ))
+
+    themes = args.theme or []
+    for idx, theme_src in enumerate(themes, 1):
+        src_path = Path(theme_src)
+        suffix = src_path.suffix.lower()
+        if suffix not in (".m65jtheme", ".tar"):
+            raise SystemExit(f"theme artifact must be .m65jtheme or .tar: {src_path}")
+        dest_name = safe_artifact_filename(src_path.name)
+        if not dest_name:
+            raise SystemExit(f"cannot derive safe theme filename from: {src_path}")
+        theme = copy_artifact(
+            theme_src,
+            out_dir / "THEMES" / dest_name,
+            args.overwrite,
+        )
+        if theme:
+            artifacts.append(ManifestArtifact(
+                kind="theme",
+                path=theme,
+                rel=theme.relative_to(out_dir).as_posix(),
+                version=args.theme_version or "",
+                name=(args.theme_name if idx == 1 and args.theme_name else src_path.stem),
+            ))
+
+    if args.bless:
+        board_for_signature = boards[0] if boards else "r6"
+        for artifact in artifacts:
+            print(f"Blessing {artifact.kind}: {artifact.path}", flush=True)
+            status = bless_core(artifact.path, board_for_signature, args)
+            print(f"BLESS {artifact.path}: {status}")
+    return artifacts
+
+
+def artifact_attrs(artifact: ManifestArtifact) -> str:
+    attrs: list[str] = []
+    if artifact.version:
+        attrs.append(f"version={artifact.version}")
+    if artifact.build:
+        attrs.append(f"build={artifact.build}")
+    if artifact.name:
+        attrs.append(f"name={artifact.name}")
+    return (" " + " ".join(attrs)) if attrs else ""
+
+
+def manifest_row_for_path(out_dir: Path, path: Path, kind: str, rel: str, attrs: str = "") -> str:
+    transfer_data = path.read_bytes()
+    payload_data = strip_signature_trailer(transfer_data)
+    return (
+        f"{kind} "
+        f"{hashlib.sha256(payload_data).hexdigest()} "
+        f"{hashlib.sha256(transfer_data).hexdigest()}  "
+        f"{rel}{attrs}\n"
+    )
+
+
+def write_hash_file(out_dir: Path,
+                    hash_file: str,
+                    board: str,
+                    channel: str,
+                    paths: list[Path] | None = None,
+                    artifacts: list[ManifestArtifact] | None = None) -> Path | None:
+    if not hash_file:
+        return None
+
+    body_lines: list[str] = []
+    for path in sorted(dict.fromkeys(paths if paths is not None else core_file_paths(out_dir))):
+        rel = path.relative_to(out_dir).as_posix()
+        body_lines.append(manifest_row_for_path(out_dir, path, "core", rel))
+
+    for artifact in artifacts or []:
+        body_lines.append(manifest_row_for_path(
+            out_dir,
+            artifact.path,
+            artifact.kind,
+            artifact.rel,
+            artifact_attrs(artifact),
+        ))
+    aggregate = hashlib.sha256("".join(body_lines).encode("utf-8")).hexdigest()
+
+    dest = Path(hash_file)
+    if not dest.is_absolute():
+        dest = out_dir / dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("w", encoding="utf-8") as f:
+        f.write("# m65j mirror hash list v3\n")
+        f.write(f"# channel={channel}\n")
+        f.write(f"# board={board.upper()}\n")
+        f.write(f"# aggregate_sha256={aggregate}\n")
+        f.write("# format: <type> <payload-sha256> <transfer-sha256>  <relative-filename> [key=value...]\n")
+        f.write("# payload-sha256 hashes the SD-stored file after signature stripping\n")
+        f.write("# transfer-sha256 hashes the exact HTTP object, including any signature trailer\n")
+        for line in body_lines:
+            f.write(line)
+    return dest
+
+
+def link_href(path: str) -> str:
+    return urllib.parse.quote(path, safe="/._-")
+
+
+def human_core_name_from_path(path: Path) -> str:
+    stem = path.stem
+    stem = re.sub(r"[-_.]?r[36]$", "", stem, flags=re.I)
+    stem = stem.replace("_", " ").replace("-", " ")
+    return " ".join(part for part in stem.split()) or path.name
+
+
+def mirror_core_info(path: Path) -> tuple[str, str]:
+    try:
+        with path.open("rb") as f:
+            head = f.read(256)
+    except OSError:
+        return human_core_name_from_path(path), ""
+    _model_id, title, version, _model = cor_header_info(head)
+    return title or human_core_name_from_path(path), version
+
+
+def write_mirror_css(out_dir: Path) -> Path:
+    css = """\
+:root {
+  color-scheme: dark;
+  --bg: #080b10;
+  --panel: #111720;
+  --panel-2: #171f2b;
+  --line: #2d3a4c;
+  --text: #eef3f7;
+  --muted: #a7b3c1;
+  --accent: #68d391;
+  --accent-2: #ffd34d;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: radial-gradient(circle at top, #1c2734 0, var(--bg) 44rem);
+  color: var(--text);
+}
+a { color: var(--accent); }
+.wrap { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 56px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 28px; }
+.logo { width: 320px; max-width: 55vw; height: auto; image-rendering: auto; }
+h1 { font-size: clamp(2rem, 5vw, 4rem); margin: 0; line-height: 1; }
+h2 { margin: 34px 0 14px; font-size: 1.35rem; }
+p { color: var(--muted); line-height: 1.55; }
+.hero { border: 1px solid var(--line); background: rgba(17, 23, 32, 0.88); padding: 22px; }
+.download { display: inline-block; margin-top: 12px; padding: 12px 16px; background: var(--accent); color: #07100b; text-decoration: none; font-weight: 800; }
+.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.step, .note { border: 1px solid var(--line); background: var(--panel); padding: 16px; min-height: 150px; }
+.step svg { width: 100%; height: 86px; margin-bottom: 10px; }
+.step strong { display: block; margin-bottom: 6px; }
+code { color: #ffffff; background: #202a38; padding: 2px 5px; }
+table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); }
+th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }
+th { color: #ffffff; background: var(--panel-2); }
+td.board { min-width: 160px; }
+.version { color: var(--accent-2); font-size: 0.9rem; margin-top: 3px; }
+.empty { color: #687586; }
+ul { color: var(--muted); line-height: 1.65; }
+@media (max-width: 760px) {
+  header, .steps { display: block; }
+  .step { margin-bottom: 12px; }
+  table { font-size: 0.92rem; }
+  th, td { padding: 8px; }
+}
+"""
+    path = out_dir / "mirror.css"
+    path.write_text(css, encoding="utf-8")
+    return path
+
+
+def step_svg(kind: str) -> str:
+    if kind == "bootsel":
+        return """<svg viewBox="0 0 260 90" aria-hidden="true"><rect x="35" y="18" width="190" height="54" rx="8" fill="#1c2734" stroke="#56657a" stroke-width="3"/><rect x="55" y="30" width="38" height="30" rx="5" fill="#2f3b4d"/><circle cx="174" cy="45" r="15" fill="#68d391"/><text x="130" y="51" fill="#eef3f7" font-size="15" text-anchor="middle">BOOTSEL</text></svg>"""
+    if kind == "uf2":
+        return """<svg viewBox="0 0 260 90" aria-hidden="true"><rect x="40" y="18" width="66" height="54" rx="6" fill="#273142" stroke="#56657a" stroke-width="3"/><path d="M170 22h38l20 20v30h-58z" fill="#273142" stroke="#ffd34d" stroke-width="3"/><path d="M208 22v20h20" fill="none" stroke="#ffd34d" stroke-width="3"/><path d="M112 45h44" stroke="#68d391" stroke-width="6"/><path d="M146 32l14 13-14 13" fill="none" stroke="#68d391" stroke-width="6"/></svg>"""
+    return """<svg viewBox="0 0 260 90" aria-hidden="true"><rect x="60" y="16" width="140" height="58" rx="6" fill="#273142" stroke="#56657a" stroke-width="3"/><rect x="75" y="30" width="110" height="10" fill="#68d391"/><rect x="75" y="49" width="78" height="10" fill="#ffd34d"/><text x="130" y="84" fill="#a7b3c1" font-size="13" text-anchor="middle">FAT SD</text></svg>"""
+
+
+def zip_add_file(zf: zipfile.ZipFile, source: Path, arcname: str, seen: set[str]) -> None:
+    if not source.exists() or not source.is_file():
+        return
+    arc = arcname.replace("\\", "/").lstrip("/")
+    if not arc or arc in seen:
+        return
+    seen.add(arc)
+    zf.write(source, arc)
+
+
+def zip_add_tree(zf: zipfile.ZipFile, root: Path, prefix: str, seen: set[str]) -> None:
+    if not root.exists() or not root.is_dir():
+        return
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        rel = path.relative_to(root).as_posix()
+        zip_add_file(zf, path, f"{prefix.rstrip('/')}/{rel}", seen)
+
+
+def write_one_sdcard_zip(out_dir: Path,
+                         dest: Path,
+                         channel_slug: str,
+                         boards: list[str],
+                         core_paths: list[Path] | None = None,
+                         include_manifests: bool = False) -> Path:
+    seen: set[str] = set()
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        cfg = out_dir / "mega65-jtag.cfg.example"
+        zip_add_file(zf, cfg, "mega65-jtag.cfg", seen)
+        zip_add_tree(zf, out_dir / "WWW", "WWW", seen)
+        zip_add_tree(zf, out_dir / "THEMES", "THEMES", seen)
+        for path in sorted(dict.fromkeys(core_paths or [])):
+            if path.exists() and path.is_file():
+                zip_add_file(zf, path, path.relative_to(out_dir).as_posix(), seen)
+        if include_manifests:
+            for board in boards:
+                manifest = out_dir / f"{channel_slug}-{board}.sha256"
+                zip_add_file(zf, manifest, manifest.name, seen)
+    return dest
+
+
+def write_sdcard_zips(out_dir: Path,
+                      channel: str,
+                      boards: list[str],
+                      manifest_paths: dict[str, list[Path]]) -> tuple[Path, dict[str, Path], Path]:
+    channel_slug = safe_name(channel) or "stable"
+    all_core_paths: list[Path] = []
+    for paths in manifest_paths.values():
+        all_core_paths.extend(paths)
+
+    minimal = write_one_sdcard_zip(
+        out_dir,
+        out_dir / SDCARD_BOOTSTRAP_FILENAME,
+        channel_slug,
+        boards,
+        None,
+    )
+    board_zips: dict[str, Path] = {}
+    for board in boards:
+        board_zips[board] = write_one_sdcard_zip(
+            out_dir,
+            out_dir / sdcard_bootstrap_board_cores_filename(board),
+            channel_slug,
+            [board],
+            manifest_paths.get(board, []),
+            True,
+        )
+    all_cores = write_one_sdcard_zip(
+        out_dir,
+        out_dir / SDCARD_BOOTSTRAP_ALL_CORES_FILENAME,
+        channel_slug,
+        boards,
+        all_core_paths,
+        True,
+    )
+    return minimal, board_zips, all_cores
+
+
+def write_mirror_index(out_dir: Path,
+                       channel: str,
+                       boards: list[str],
+                       manifest_paths: dict[str, list[Path]],
+                       artifacts: list[ManifestArtifact],
+                       args: argparse.Namespace) -> Path:
+    write_mirror_css(out_dir)
+    public_fw = out_dir / PUBLIC_FIRMWARE_FILENAME
+    logo = out_dir / "WWW" / "mega65_320x64.png"
+    cfg_example = out_dir / "mega65-jtag.cfg.example"
+    rows: dict[str, dict[str, tuple[Path, str]]] = {}
+    names: dict[str, str] = {}
+    for board, paths in manifest_paths.items():
+        for path in sorted(dict.fromkeys(paths)):
+            title, version = mirror_core_info(path)
+            key = re.sub(r"\s+", " ", title).strip().lower() or human_core_name_from_path(path).lower()
+            rows.setdefault(key, {})[board] = (path, version)
+            names[key] = title or human_core_name_from_path(path)
+
+    board_headers = "".join(f"<th>{html.escape(board.upper())}</th>" for board in boards)
+    table_rows: list[str] = []
+    for key in sorted(rows, key=lambda k: names.get(k, k).lower()):
+        cells = [f"<td>{html.escape(names.get(key, key))}</td>"]
+        for board in boards:
+            entry = rows[key].get(board)
+            if not entry:
+                cells.append('<td class="board empty">not offered</td>')
+                continue
+            path, version = entry
+            rel = path.relative_to(out_dir).as_posix()
+            label = html.escape(path.name)
+            version_html = f'<div class="version">{html.escape(version)}</div>' if version else ""
+            cells.append(f'<td class="board"><a href="{link_href(rel)}">{label}</a>{version_html}</td>')
+        table_rows.append("<tr>" + "".join(cells) + "</tr>")
+    if not table_rows:
+        table_rows.append(f'<tr><td colspan="{len(boards) + 1}" class="empty">No cores were staged.</td></tr>')
+
+    artifact_items: list[str] = []
+    for artifact in artifacts:
+        rel = artifact.path.relative_to(out_dir).as_posix()
+        label = artifact.kind
+        if artifact.kind == "firmware":
+            label = "signed OTA firmware package"
+        elif artifact.kind == "theme":
+            label = f"theme: {artifact.name or artifact.path.stem}"
+        artifact_items.append(f'<li><a href="{link_href(rel)}">{html.escape(rel)}</a> ({html.escape(label)})</li>')
+    artifact_html = "\n".join(artifact_items) if artifact_items else "<li>No firmware or theme artifacts staged.</li>"
+    channel_slug = safe_name(channel) or "stable"
+    manifest_links = "\n".join(
+        f'<li><a href="{link_href(f"{channel_slug}-{board}.sha256")}">{html.escape(f"{channel_slug}-{board}.sha256")}</a></li>'
+        for board in boards
+    )
+
+    logo_html = f'<img class="logo" src="{link_href("WWW/mega65_320x64.png")}" alt="MEGA65">' if logo.exists() else "<h1>MEGA65</h1>"
+    fw_link = (f'<a class="download" href="{link_href(PUBLIC_FIRMWARE_FILENAME)}">Download {html.escape(PUBLIC_FIRMWARE_FILENAME)}</a>'
+               if public_fw.exists() else '<span class="empty">No plain UF2 firmware image was staged.</span>')
+    cfg_line = (f'<a href="{link_href("mega65-jtag.cfg.example")}">mega65-jtag.cfg.example</a>'
+                if cfg_example.exists() else '<code>mega65-jtag.cfg</code> from the firmware repository')
+    starter_zip = out_dir / SDCARD_BOOTSTRAP_FILENAME
+    all_cores_zip = out_dir / SDCARD_BOOTSTRAP_ALL_CORES_FILENAME
+    sd_zip_links: list[str] = []
+    if starter_zip.exists():
+        sd_zip_links.append(
+            f'<a class="download" href="{link_href(SDCARD_BOOTSTRAP_FILENAME)}">Download SD starter ZIP</a>'
+        )
+    for board in boards:
+        board_zip_name = sdcard_bootstrap_board_cores_filename(board)
+        if (out_dir / board_zip_name).exists():
+            sd_zip_links.append(
+                f'<a class="download" href="{link_href(board_zip_name)}">Download SD ZIP with {html.escape(board.upper())} cores</a>'
+            )
+    if all_cores_zip.exists():
+        sd_zip_links.append(
+            f'<a class="download" href="{link_href(SDCARD_BOOTSTRAP_ALL_CORES_FILENAME)}">Download SD ZIP with all cores</a>'
+        )
+    sd_zip_html = " ".join(sd_zip_links)
+    firmware_version = args.firmware_version or "v0.1"
+    firmware_build = args.firmware_build or "unknown build"
+
+    html_text = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MEGA65 Integrated JTAG Mirror</title>
+  <link rel="stylesheet" href="mirror.css">
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      {logo_html}
+      <div>
+        <h1>Integrated JTAG Mirror</h1>
+        <p>Experimental firmware, web theme packages, signed update manifests, and MEGA65 core files.</p>
+      </div>
+    </header>
+
+    <section class="hero">
+      <h2>Firmware</h2>
+      <p>Initial install image: {html.escape(firmware_version)} build {html.escape(firmware_build)}. This UF2 is plain, without the m65j signature trailer, for copying to a Pico in BOOTSEL mode.</p>
+      {fw_link}
+    </section>
+
+    <h2>Install On A Fresh Pico</h2>
+    <section class="steps">
+      <div class="step">{step_svg("bootsel")}<strong>1. Enter BOOTSEL</strong><p>Hold the Pico BOOTSEL button while plugging in USB. A drive named <code>RPI-RP2</code> should appear.</p></div>
+      <div class="step">{step_svg("uf2")}<strong>2. Copy the UF2</strong><p>Copy <code>{html.escape(PUBLIC_FIRMWARE_FILENAME)}</code> to that drive. The Pico reboots into the MEGA65 JTAG firmware.</p></div>
+      <div class="step">{step_svg("sd")}<strong>3. Prepare SD</strong><p>Use a FAT formatted SD card. Copy the web files and config below, then edit WiFi and mirror settings.</p></div>
+    </section>
+
+    <h2>Fresh SD Card Contents</h2>
+    <section class="note">
+      <p>{sd_zip_html}</p>
+      <ul>
+        <li>Copy <code>WWW/</code> to the SD-card root for the default web interface.</li>
+        <li>Copy {cfg_line} to the SD-card root as <code>mega65-jtag.cfg</code>, then set <code>ssid</code>, <code>psk</code>, allow rules, and <code>fetch_base_url</code>.</li>
+        <li>Copy <code>THEMES/</code> if you want selectable web themes on the device.</li>
+        <li><code>{html.escape(SDCARD_BOOTSTRAP_FILENAME)}</code> contains the config, default web files, and theme packages.</li>
+        <li><code>sdcard-files-rX-cores.zip</code> contains the same files plus cores and the signed manifest for one board revision.</li>
+        <li><code>{html.escape(SDCARD_BOOTSTRAP_ALL_CORES_FILENAME)}</code> contains the same files plus all cores and signed manifests for every board revision in this mirror.</li>
+        <li>Either copy the wanted core files and signed manifests now, use the all-cores ZIP, or configure WiFi and run <code>AT+FETCHNOW</code> / "Check for updated cores".</li>
+      </ul>
+    </section>
+
+    <h2>Signed Manifests</h2>
+    <section class="note">
+      <ul>
+        {manifest_links}
+      </ul>
+      <p>Devices verify these signed manifests before fetching cores, firmware packages, or themes.</p>
+    </section>
+
+    <h2>Artifacts</h2>
+    <section class="note">
+      <ul>
+        {artifact_html}
+      </ul>
+    </section>
+
+    <h2>Offered Cores</h2>
+    <table>
+      <thead><tr><th>Core</th>{board_headers}</tr></thead>
+      <tbody>
+        {"".join(table_rows)}
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>
+"""
+    path = out_dir / "index.html"
+    path.write_text(html_text, encoding="utf-8")
+    return path
+
+
+# Filehost authentication.
+
+
+def parse_filehost_config() -> tuple[dict[str, str], Path | None]:
+    # Keep the filehost's first-file lookup separate from merged device settings.
+    for path in (Path(".m65j.config"), Path.home() / ".m65j.config"):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        cfg: dict[str, str] = {}
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            cfg[key.strip().lower()] = value.strip()
+        return cfg, path
+    return {}, None
+
+
+def login_filehost(user: str, password: str, cfg_path: Path | None) -> str | None:
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    data = urllib.parse.urlencode({
+        "logindata[username]": user,
+        "logindata[password]": password,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://files.mega65.org/php/login.php",
+        data=data,
+        headers={
+            "User-Agent": "mega65-altcore-fetch/1.0",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        },
+        method="POST",
+    )
+    try:
+        with opener.open(req, timeout=10.0) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        print(f"NOTE filehost login failed: {exc}", file=sys.stderr)
+        return None
+
+    try:
+        result = json.loads(body)
+    except json.JSONDecodeError:
+        print("NOTE filehost login did not return JSON; use filehost_cookie instead.", file=sys.stderr)
+        return None
+    if result.get("state") != "OK":
+        msg = result.get("message") or result.get("state") or "not accepted"
+        print(f"NOTE filehost login failed: {msg}", file=sys.stderr)
+        return None
+
+    cookies = [f"{c.name}={c.value}" for c in jar]
+    if not cookies:
+        print("NOTE filehost login succeeded but returned no cookies; use filehost_cookie instead.", file=sys.stderr)
+        return None
+    where = f" from {cfg_path}" if cfg_path else ""
+    print(f"Using files.mega65.org login credentials{where}.", file=sys.stderr)
+    return "; ".join(cookies)
+
+
+def load_cookie(args: argparse.Namespace) -> str | None:
+    if args.cookie:
+        return args.cookie.strip()
+    if args.cookie_file:
+        return Path(args.cookie_file).read_text(encoding="utf-8").strip()
+    cfg, path = parse_filehost_config()
+    cookie = cfg.get("filehost_cookie") or cfg.get("mega65_cookie") or cfg.get("files_mega65_cookie")
+    if cookie:
+        return cookie
+    user = cfg.get("filehost_user") or cfg.get("mega65_user") or cfg.get("files_mega65_user")
+    password = cfg.get("filehost_password") or cfg.get("mega65_password") or cfg.get("files_mega65_password")
+    if user and password:
+        return login_filehost(user, password, path)
+    if user or password:
+        print(f"NOTE {path} has incomplete filehost credentials; set both filehost_user and filehost_password.", file=sys.stderr)
+    return None
+
+
+# Mirror command entry points.
+
+
+def latest_main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        description="Download MEGA65 alternate-core archives and extract board-specific .cor/.bit files.",
+    )
+    ap.add_argument("--board", choices=["r3", "r6", "all"], required=True, help="MEGA65 board revision to extract")
+    ap.add_argument("--output", default="sdcard/cores", help="directory for extracted .cor/.bit files")
+    ap.add_argument("--cache", default=".cache/altcores", help="directory for downloaded zip archives")
+    ap.add_argument("--cookie", help="raw Cookie header for files.mega65.org if login is required")
+    ap.add_argument("--cookie-file", help="file containing a raw Cookie header")
+    ap.add_argument("--source-url", action="append", default=[],
+                    help="alternate catalogue URL to scrape; files.mega65.org aliases the default alt-core pages; repeatable")
+    ap.add_argument("--keep-zips", action="store_true", help="keep downloaded zip archives in --cache")
+    ap.add_argument("--overwrite", action="store_true", help="overwrite existing extracted .bit files")
+    ap.add_argument("--dry-run", action="store_true", help="only list discovered filehost IDs")
+    ap.add_argument("--limit", type=int, default=0, help="limit number of discovered refs processed")
+    ap.add_argument("--manifest", default="", help="write JSON result manifest")
+    ap.add_argument("--channel", required=True, help="mirror channel label, e.g. stable, unstable, nightly")
+    ap.add_argument("--bless", action="store_true", help="append m65j signed trailer to every extracted/offered core file")
+    ap.add_argument("--key", help="explicit P-256 EC private key PEM for --bless")
+    ap.add_argument("--key-name", default="default", help="named key under ~/.m65jtag/keys for --bless")
+    ap.add_argument("--yes", action="store_true", help="create the selected signing key without prompting")
+    ap.add_argument("--blank-filename", action="store_true", help="with --bless, do not bind signatures to filenames")
+    ap.add_argument("--hash-file", default=None, help="write per-file hash list; default is <channel>-rX.sha256 in output dir")
+    ap.add_argument("--no-hash-file", action="store_true", help="do not write a channel hash list")
+    ap.add_argument("--preserve-filenames", action="store_true", help="use archive member filenames instead of canonical <title>-<board> names")
+    ap.add_argument("--firmware", help="signed or unsigned firmware artifact to publish under the fixed OTA filename")
+    ap.add_argument("--firmware-version", default="", help="firmware version label to advertise in the manifest")
+    ap.add_argument("--firmware-build", default="", help="firmware build marker to advertise in the manifest")
+    ap.add_argument("--theme", action="append", default=[],
+                    help="uncompressed tar theme package to publish under THEMES/; repeatable")
+    ap.add_argument("--theme-name", default="theme", help="theme display name to advertise in the manifest")
+    ap.add_argument("--theme-version", default="", help="theme version label to advertise in the manifest")
+    ap.add_argument("--extra-core", action="append", default=[],
+                    help="local .bit/.cor/.core/.m65j file or directory to include in the mirror; repeatable")
+    ap.add_argument("--quiet", action="store_true", help="suppress progress chatter")
+    ap.add_argument("--detail-workers", type=int, default=8,
+                    help="parallel filehost JSON detail fetches before serial downloads; 1 disables")
+    args = ap.parse_args(argv)
+    return build_mirror(args, ap)
+
+
+def build_mirror(args: argparse.Namespace, ap: argparse.ArgumentParser) -> int:
+    """Build a mirror from parsed latest, mirror, or populate options."""
+    if args.board == "all" and args.hash_file:
+        ap.error("--hash-file cannot be used with --board all; manifests are <channel>-r3.sha256 and <channel>-r6.sha256")
+
+    cookie = load_cookie(args)
+    refs = scrape_altcore_refs(cookie, args.source_url or None)
+    if args.limit:
+        refs = refs[: args.limit]
+
+    board = args.board.lower()
+    boards = ["r3", "r6"] if board == "all" else [board]
+    wanted = [
+        ref for ref in refs
+        if board == "all" or ref.board_hint in ("unknown", "both", board)
+    ]
+
+    board_label_text = "R3/R6" if board == "all" else board.upper()
+    print(f"Discovered {len(refs)} filehost refs, {len(wanted)} applicable to {board_label_text}.")
+    for ref in wanted:
+        print(f"{ref.filehost_id} {ref.board_hint:7} {ref.title}")
+    if args.dry_run:
+        return 0
+
+    out_dir = Path(args.output)
+    cache_root = Path(args.cache)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="altcores-") if not args.keep_zips else None
+    cache_dir = Path(tmp_ctx.name) if tmp_ctx else cache_root
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[DownloadResult] = []
+    manifest_paths: dict[str, list[Path]] = {b: [] for b in boards}
+    detail_cache = prefetch_filehost_details(wanted, cookie, args.detail_workers, quiet=args.quiet)
+    try:
+        total = len(wanted)
+        for idx, ref in enumerate(wanted, 1):
+            if not args.quiet:
+                print(f"\n[{idx}/{total}] {ref.title} ({ref.filehost_id}, hint={ref.board_hint})", flush=True)
+            archive, archive_url, status = download_archive_for_ref(
+                ref,
+                cache_dir,
+                cookie,
+                verbose=not args.quiet,
+                detail=detail_cache.get(ref.filehost_id),
+            )
+            if not archive:
+                print(f"SKIP {ref.title}: {status}")
+                results.append(DownloadResult(ref.title, ref.filehost_id, archive_url, None, status))
+                continue
+            if not args.quiet:
+                print(f"  archive: {archive}", flush=True)
+            if args.keep_zips and archive.parent != cache_root:
+                shutil.copy2(archive, cache_root / archive.name)
+            for one_board in boards:
+                if ref.board_hint not in ("unknown", "both", one_board):
+                    continue
+                dest, extract_status = extract_board_core(archive, out_dir, ref.title, one_board, args.overwrite, args.preserve_filenames)
+                label = f"{ref.title} [{one_board.upper()}]" if board == "all" else ref.title
+                print(f"{'OK' if dest else 'SKIP'} {label}: {extract_status}")
+                if dest:
+                    manifest_paths[one_board].append(dest)
+                results.append(DownloadResult(label, ref.filehost_id, archive_url, str(dest) if dest else None, extract_status))
+    finally:
+        if tmp_ctx:
+            tmp_ctx.cleanup()
+
+    for extra in iter_extra_core_files(args.extra_core):
+        data = extra.read_bytes()
+        extra_boards = extra_core_boards(extra, data, boards)
+        if not extra_boards:
+            print(f"SKIP extra {extra}: board does not match {board_label_text}")
+            results.append(DownloadResult(f"extra {extra.name}", "local-extra", str(extra), None, "board does not match"))
+            continue
+        for one_board in extra_boards:
+            dest, extra_status = copy_extra_core(extra, out_dir, one_board, args)
+            label = f"{extra.name} [{one_board.upper()}]" if board == "all" else extra.name
+            print(f"{'OK' if dest else 'SKIP'} extra {label}: {extra_status}")
+            if dest:
+                manifest_paths[one_board].append(dest)
+            results.append(DownloadResult(label, "local-extra", str(extra), str(dest) if dest else None, extra_status))
+
+    if args.manifest:
+        Path(args.manifest).write_text(json.dumps([asdict(r) for r in results], indent=2), encoding="utf-8")
+    if args.bless:
+        for one_board in boards:
+            bless_paths(manifest_paths[one_board], one_board, args)
+    artifacts = stage_manifest_artifacts(out_dir, args, boards)
+    if not args.no_hash_file:
+        for one_board in boards:
+            hash_name = args.hash_file or f"{safe_name(args.channel) or 'stable'}-{one_board}.sha256"
+            hash_path = write_hash_file(out_dir, hash_name, one_board, args.channel, manifest_paths[one_board], artifacts)
+            if hash_path:
+                print(f"Wrote hash file: {hash_path} ({len(manifest_paths[one_board])} cores, {len(artifacts)} artifacts)")
+                if args.bless:
+                    status = bless_core(hash_path, one_board, args)
+                    print(f"BLESS {hash_path}: {status}")
+    sd_zip, sd_board_zips, sd_all_zip = write_sdcard_zips(out_dir, args.channel, boards, manifest_paths)
+    print(f"Wrote SD card ZIP: {sd_zip}")
+    for one_board in boards:
+        if one_board in sd_board_zips:
+            print(f"Wrote SD card {one_board.upper()} cores ZIP: {sd_board_zips[one_board]}")
+    print(f"Wrote SD card all-cores ZIP: {sd_all_zip}")
+    index_path = write_mirror_index(out_dir, args.channel, boards, manifest_paths, artifacts, args)
+    print(f"Wrote mirror index: {index_path}")
+    for one_board in boards:
+        print(f"SUMMARY {one_board.upper()}: manifest_core_entries={len(manifest_paths[one_board])} artifacts={len(artifacts)}")
+    return 0
 
 
 def normalize_board_for_mirror(board):
@@ -1527,7 +2662,7 @@ def resolve_mirror_positionals(ap, items):
 
 def add_mirror_options(ap, populate=False):
     ap.add_argument("--board", choices=("r3", "r6", "3", "6", "all"), required=True, help="MEGA65 board revision, or all")
-    ap.add_argument("--source-url", dest="option_source_url", action="append", default=[],
+    ap.add_argument("--source-url", action="append", default=[],
                     help="alternate catalogue URL to scrape; files.mega65.org aliases the default alt-core pages; repeatable")
     ap.add_argument("--cache", default=".cache/altcores", help="directory for downloaded zip archives")
     ap.add_argument("--cookie", help="raw Cookie header for files.mega65.org if login is required")
@@ -1565,49 +2700,6 @@ def add_mirror_options(ap, populate=False):
         ap.add_argument("--dry-run", action="store_true", help="only list discovered filehost IDs")
 
 
-def downloader_args_from(ns, output, release_type, source_urls, bless):
-    args = [
-        "--board", normalize_board_for_mirror(ns.board),
-        "--output", str(output),
-        "--cache", ns.cache,
-        "--channel", release_type,
-    ]
-    for attr in (
-        "cookie", "cookie_file", "manifest", "key", "key_name", "hash_file", "detail_workers",
-        "firmware", "firmware_version", "firmware_build", "theme_name", "theme_version",
-    ):
-        value = getattr(ns, attr, None)
-        if value is not None and value != "":
-            args.extend([f"--{attr.replace('_', '-')}", str(value)])
-    for url in [*getattr(ns, "option_source_url", []), *source_urls]:
-        args.extend(["--source-url", url])
-    for extra in getattr(ns, "extra_core", []) or []:
-        args.extend(["--extra-core", str(extra)])
-    for theme in getattr(ns, "theme", []) or []:
-        args.extend(["--theme", str(theme)])
-    if ns.keep_zips:
-        args.append("--keep-zips")
-    if ns.overwrite:
-        args.append("--overwrite")
-    if ns.limit:
-        args.extend(["--limit", str(ns.limit)])
-    if bless:
-        args.append("--bless")
-    if getattr(ns, "yes", False):
-        args.append("--yes")
-    if getattr(ns, "blank_filename", False):
-        args.append("--blank-filename")
-    if getattr(ns, "no_hash_file", False):
-        args.append("--no-hash-file")
-    if getattr(ns, "preserve_filenames", False):
-        args.append("--preserve-filenames")
-    if getattr(ns, "dry_run", False):
-        args.append("--dry-run")
-    if getattr(ns, "quiet", False):
-        args.append("--quiet")
-    return args
-
-
 def mirror_main(argv):
     ap = argparse.ArgumentParser(
         prog="m65j.py mirror",
@@ -1635,8 +2727,11 @@ def mirror_main(argv):
     add_mirror_options(ap, populate=False)
     ns = ap.parse_args(argv)
     release_type, output, source_urls = resolve_mirror_positionals(ap, ns.items)
-    args = downloader_args_from(ns, output, release_type, source_urls, ns.bless)
-    return embedded_altcore_main(args)
+    ns.board = normalize_board_for_mirror(ns.board)
+    ns.output = output
+    ns.channel = release_type
+    ns.source_url.extend(source_urls)
+    return build_mirror(ns, ap)
 
 
 def read_hash_manifest(path):
@@ -1695,8 +2790,13 @@ def populate_main(argv):
 
     try:
         bless = not ns.no_bless
-        args = downloader_args_from(ns, out_dir, ns.release_type, ns.source_urls, bless)
-        rc = embedded_altcore_main(args)
+        ns.board = normalize_board_for_mirror(ns.board)
+        ns.output = out_dir
+        ns.channel = ns.release_type
+        ns.source_url.extend(ns.source_urls)
+        ns.bless = bless
+        ns.dry_run = False
+        rc = build_mirror(ns, ap)
         if rc != 0:
             return rc
 
