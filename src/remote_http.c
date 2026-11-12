@@ -130,6 +130,7 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
 }
 void remote_http_autofetch_reset_schedule(void) {}
 void remote_http_autofetch_cancel(const char *reason) { (void)reason; }
+void remote_http_sd_removed(void) {}
 bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
 {
     (void)enabled_override;
@@ -341,6 +342,7 @@ typedef struct {
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len);
 static int find_header_end(const char *buf, size_t len, size_t *end_len);
 static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms);
+static void download_cancel_all(const char *reason);
 static bool autofetch_start_manifest(uint8_t board_rev);
 static void close_http_listener(void);
 static bool ensure_parent_dirs(const char *path);
@@ -2602,6 +2604,92 @@ static err_t send_theme_install(http_conn_t *c)
     return send_redirect(c, location);
 }
 
+// Built into the firmware (not WWW/app.js) so it works whatever is, or isn't,
+// on the card. Polls /sd-state and shows a reload banner when the card changes.
+// Polling continues after the banner appears so its text tracks a remove ->
+// insert sequence. The server handles one connection at a time, so polling pauses briefly after
+// any click/submit to keep the user's own request from colliding with a poll.
+static const char sd_watch_script_fmt[] =
+    "<script>(function(){"
+    "var g='%lu',b=null,quietUntil=0;"
+    "function quiet(){quietUntil=Date.now()+8000;}"
+    "document.addEventListener('click',quiet,true);"
+    "document.addEventListener('submit',quiet,true);"
+    "function show(present){"
+    "if(!b){b=document.createElement('div');b.setAttribute('role','status');"
+    "b.style.cssText='position:fixed;left:0;right:0;top:0;z-index:9999;padding:10px 16px;"
+    "background:#ffd34d;color:#111;font:600 14px Arial,sans-serif;text-align:center;cursor:pointer';"
+    "b.onclick=function(){location.reload();};document.body.appendChild(b);}"
+    "b.textContent=(present?'SD card changed':'SD card removed')+' \\u2014 click to reload';}"
+    "function poll(){"
+    "if(document.hidden||Date.now()<quietUntil)return;"
+    "var x=new XMLHttpRequest();x.open('GET','/sd-state',true);x.timeout=4000;"
+    "x.onload=function(){if(x.status!==200)return;"
+    "var m=/gen=(\\d+)/.exec(x.responseText);"
+    "if(m&&m[1]!==g)show(/present=1/.test(x.responseText));};"
+    "x.send();}"
+    "setInterval(poll,3000);"
+    "})();</script>\n";
+
+static void page_insert_before_body_end(page_builder_t *pb, const char *snippet)
+{
+    size_t n = strlen(snippet);
+    if (pb->len + n + 1u > pb->cap) return;
+    char *at = NULL;
+    for (char *p = pb->buf; (p = strstr(p, "</")) != NULL; p += 2) {
+        if (strncasecmp(p, "</body", 6) == 0) at = p;
+    }
+    if (!at) {
+        page_append(pb, snippet);
+        return;
+    }
+    size_t off = (size_t)(at - pb->buf);
+    memmove(pb->buf + off + n, pb->buf + off, pb->len - off + 1u);
+    memcpy(pb->buf + off, snippet, n);
+    pb->len += n;
+}
+
+static err_t send_sd_state(http_conn_t *c)
+{
+    if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
+        return send_error(c, 403, "Forbidden", "remote IP is not authorised");
+    }
+    char body[64];
+    snprintf(body, sizeof body, "present=%u mounted=%u gen=%lu\n",
+             storage_sd_card_present() ? 1u : 0u,
+             storage_is_mounted() ? 1u : 0u,
+             (unsigned long)storage_media_generation());
+    return send_response(c, 200, "OK", "text/plain", body);
+}
+
+// Explain why the core list is empty, in terms the user can act on.
+static void index_append_sd_problem(page_builder_t *pb, const char *dir_path)
+{
+    char err[160];
+    char dir[224];
+    char row[640];
+    html_escape(storage_last_error(), err, sizeof err);
+    html_escape(dir_path, dir, sizeof dir);
+
+    if (!storage_sd_card_present()) {
+        snprintf(row, sizeof row,
+                 "<tr><td colspan=\"4\"><strong>No SD card inserted.</strong>"
+                 "<div class=\"meta\">Insert a card with your cores on it. "
+                 "This page will offer to reload once the card is detected.</div></td></tr>\n");
+    } else if (!storage_is_mounted()) {
+        snprintf(row, sizeof row,
+                 "<tr><td colspan=\"4\"><strong>The SD card can't be read.</strong>"
+                 "<div class=\"meta\">Check that it is pushed fully into the slot and formatted "
+                 "as FAT32 or exFAT. Details: %s</div></td></tr>\n", err);
+    } else {
+        snprintf(row, sizeof row,
+                 "<tr><td colspan=\"4\"><strong>Couldn't read the folder %s.</strong>"
+                 "<div class=\"meta\">It may have been removed or renamed. Details: %s</div></td></tr>\n",
+                 dir, err);
+    }
+    page_append(pb, row);
+}
+
 static err_t send_index(http_conn_t *c, uint8_t board_rev)
 {
     if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
@@ -2621,6 +2709,10 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
 
     page_builder_t pb = { .buf = page_buf, .cap = M65_HTTP_PAGE_MAX };
     page_buf[0] = 0;
+    // A card that was just inserted may not be mounted by the main loop yet.
+    if (storage_sd_card_present() && !storage_is_mounted()) (void)storage_mount();
+    // Sample before reading the card so a change mid-build still shows the banner.
+    uint32_t gen_at_listing = storage_media_generation();
     append_template_or_fallback(&pb, "WWW/index_top.html", default_top, NULL, NULL, dir_path, 0, false, NULL, board_rev);
 
     index_list_ctx_t il = {
@@ -2629,13 +2721,16 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         .dir_path = dir_path,
         .board_rev = board_rev,
     };
-    if (!storage_list_cores(dir_path, index_cb, &il, false)) {
-        page_append(&pb, "<tr><td colspan=\"4\">SD list failed</td></tr>\n");
+    if (!storage_is_mounted() || !storage_list_cores(dir_path, index_cb, &il, false)) {
+        index_append_sd_problem(&pb, dir_path);
     }
     if (il.truncated) {
         page_append(&pb, "<tr><td colspan=\"4\">List truncated</td></tr>\n");
     }
     append_template_or_fallback(&pb, "WWW/index_bottom.html", default_bottom, NULL, NULL, dir_path, 0, false, NULL, board_rev);
+    char sd_watch[sizeof sd_watch_script_fmt + 16];
+    snprintf(sd_watch, sizeof sd_watch, sd_watch_script_fmt, (unsigned long)gen_at_listing);
+    page_insert_before_body_end(&pb, sd_watch);
     err_t ret = send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
     free(page_buf);
     return ret;
@@ -3091,6 +3186,10 @@ static err_t parse_headers(http_conn_t *c)
     if ((ci_equal(c->method, "GET") || ci_equal(c->method, "PUT")) &&
         ci_equal(target_path, "/theme/install")) {
         return send_theme_install(c);
+    }
+
+    if (ci_equal(c->method, "GET") && ci_equal(target_path, "/sd-state")) {
+        return send_sd_state(c);
     }
 
     if (autofetch_web_busy() && ci_equal(c->method, "GET") &&
@@ -4206,6 +4305,23 @@ static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms)
 void remote_http_autofetch_cancel(const char *reason)
 {
     autofetch_cancel(reason ? reason : "operator activity", 900000u);
+}
+
+void remote_http_sd_removed(void)
+{
+    // Abort everything that writes to SD *now*, while no card is mounted.
+    // Their cleanup deletes temp files by path; if it ran later, after a new
+    // card was mounted, it would delete same-named files on the new card.
+    // (storage_mount() refuses to mount until this has run.)
+    http_conn_t *c = &http_conn;
+    if (c->in_use && c->pcb && c->state == HTTP_RECV_BODY &&
+        (c->put_op == HTTP_PUT_FILE || c->jtag_spool)) {
+        (void)send_error(c, 503, "Service Unavailable", "sd card removed during upload");
+    }
+    download_cancel_all("sd card removed");
+    if (autofetch_running || autofetch_state != AUTOFETCH_IDLE) {
+        autofetch_cancel("sd card removed", 60000u);
+    }
 }
 
 bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
@@ -5425,8 +5541,61 @@ static void remote_http_poll_wifi_join(void)
     }
 }
 
+// Last config successfully read from SD. Wi-Fi recovery and SD hot-swap use
+// it so a missing card never takes down a network that was already configured.
+static bool http_cfg_loaded;
+
+static bool wifi_link_settings_equal(const remote_auth_config_t *a, const remote_auth_config_t *b)
+{
+    return a->http_enabled == b->http_enabled &&
+           a->dhcp == b->dhcp &&
+           a->http_port == b->http_port &&
+           a->static_ip == b->static_ip &&
+           a->netmask == b->netmask &&
+           a->gateway == b->gateway &&
+           strcmp(a->wifi_ssid, b->wifi_ssid) == 0 &&
+           strcmp(a->wifi_psk, b->wifi_psk) == 0;
+}
+
+static void download_cancel_all(const char *reason)
+{
+    if (download_active_job >= 0 && download_active_job < (int)M65_DOWNLOAD_QUEUE_DEPTH) {
+        signed_file_receive_abort(&download_fc.signed_rx);
+        fetch_close(&download_fc, true);
+        storage_delete(download_fc.tmp_path);
+    }
+    for (unsigned i = 0; i < M65_DOWNLOAD_QUEUE_DEPTH; ++i) {
+        download_job_t *job = &download_jobs[i];
+        if (job->state == DOWNLOAD_JOB_QUEUED || job->state == DOWNLOAD_JOB_RUNNING) {
+            job->state = DOWNLOAD_JOB_FAILED;
+            snprintf(job->err, sizeof job->err, "%s", reason);
+        }
+    }
+    download_active_job = -1;
+    download_refresh_status();
+}
+
+// Take the network fully down so the reported state matches reality: no
+// association, no listener, no in-flight transfers, no recovery retries.
+static void wifi_shutdown(const char *reason)
+{
+    if (http_conn.in_use) (void)http_close(&http_conn);
+    close_http_listener();
+    download_cancel_all("wifi disabled by config");
+    if (autofetch_running || autofetch_state != AUTOFETCH_IDLE) {
+        autofetch_cancel("wifi disabled by config", 0u);
+    }
+    if (cyw43_is_ready) cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+    http_is_active = false;
+    wifi_assoc_state = WIFI_ASSOC_OFF;
+    wifi_noip_timer_active = false;
+    wifi_clear_recover();
+    snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 %s", reason);
+}
+
 void remote_http_init(void)
 {
+    bool was_up = cyw43_is_ready && http_is_active && wifi_assoc_state == WIFI_ASSOC_HTTP_ACTIVE;
     http_is_active = false;
     wifi_assoc_state = WIFI_ASSOC_OFF;
     wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
@@ -5452,27 +5621,61 @@ void remote_http_init(void)
         return;
     }
 
-    if (!storage_mount()) {
+    static remote_auth_config_t new_cfg;  // large; keep off the stack
+    char err[96] = "";
+    bool mounted = storage_mount();
+    bool cfg_file = mounted && remote_auth_config_present();
+    bool loaded = cfg_file && remote_auth_load(&new_cfg, err, sizeof err);
+    if (loaded) {
+        if (was_up && http_cfg_loaded && wifi_link_settings_equal(&http_cfg, &new_cfg)) {
+            // Same network settings (e.g. the card was just reinserted): take the
+            // new auth/fetch settings but keep the existing association.
+            http_cfg = new_cfg;
+            load_cached_web_assets();
+            http_is_active = true;
+            wifi_assoc_state = WIFI_ASSOC_HTTP_ACTIVE;
+            return;
+        }
+        http_cfg = new_cfg;
+        http_cfg_loaded = true;
+    } else if (cfg_file && storage_is_mounted()) {
+        // The card has a config file but it can't be used: don't fall back to
+        // an older card's settings, and don't leave a half-up network behind.
+        http_cfg_loaded = false;
+        char reason[128];
+        snprintf(reason, sizeof reason, "remote=%s", err[0] ? err : "config invalid");
+        wifi_shutdown(reason);
+        return;
+    } else if (!http_cfg_loaded) {
+        // No card, or a card without a config file, and nothing cached yet.
+        if (mounted && storage_is_mounted()) {
+            snprintf(http_status_buf, sizeof http_status_buf,
+                     "wifi=disabled hardware=cyw43 remote=no config on sd");
+            return;
+        }
         wifi_schedule_recover("config-unavailable");
         return;
-    }
-
-    char err[96];
-    if (!remote_auth_load(&http_cfg, err, sizeof err)) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 remote=%s", err);
-        return;
+    } else {
+        // No card, or a card with no config file: keep the network we have.
+        remote_log(1, "+WIFI: %s, using cached config",
+                   mounted && storage_is_mounted() ? "no config on sd card" : "sd card unavailable");
+        if (was_up) {
+            http_is_active = true;
+            wifi_assoc_state = WIFI_ASSOC_HTTP_ACTIVE;
+            return;
+        }
     }
     if (machine_identity_board_rev() == 0u &&
         (http_cfg.fetch_board_rev == 3u || http_cfg.fetch_board_rev == 6u)) {
         machine_identity_set_board_rev(http_cfg.fetch_board_rev);
     }
     if (!http_cfg.http_enabled) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 http=0");
+        wifi_shutdown("http=0");
         return;
     }
-    load_cached_web_assets();
+    if (loaded) load_cached_web_assets();
     if (!http_cfg.wifi_ssid[0]) {
-        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 ssid=missing");
+        wifi_shutdown("ssid=missing");
         return;
     }
 

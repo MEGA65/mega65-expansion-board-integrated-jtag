@@ -20,6 +20,7 @@ const char *remote_http_download_status(void);
 void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override);
 void remote_http_autofetch_reset_schedule(void);
 void remote_http_autofetch_cancel(const char *reason);
+void remote_http_sd_removed(void);
 bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override);
 const char *remote_http_autofetch_status(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override);
 uint32_t remote_http_autofetch_last_success_seconds(void);

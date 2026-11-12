@@ -90,6 +90,22 @@
 #define M65_SD_PROBE_RETRIES              8u
 #define M65_SD_PROBE_RETRY_DELAY_MS       5u
 
+// Socket card-detect switch. GP13 (header pin 17), pulled low by the socket
+// when a card is inserted. Set M65_SD_CARD_DETECT_ENABLED to 0 for boards
+// without the CD line wired, otherwise they will never see a card.
+#ifndef M65_SD_CARD_DETECT_ENABLED
+#define M65_SD_CARD_DETECT_ENABLED        1
+#endif
+#ifndef M65_SD_CD_PIN
+#define M65_SD_CD_PIN                     13u
+#endif
+#ifndef M65_SD_CD_PRESENT_LEVEL
+#define M65_SD_CD_PRESENT_LEVEL           0u
+#endif
+#ifndef M65_SD_CD_DEBOUNCE_MS
+#define M65_SD_CD_DEBOUNCE_MS             50u
+#endif
+
 // Pico-side JTAG pins.
 #define M65_JTAG_TCK_PIN     6u
 #define M65_JTAG_TMS_PIN     7u

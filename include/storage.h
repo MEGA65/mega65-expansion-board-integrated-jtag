@@ -52,6 +52,20 @@ list_result_t storage_list_cores(const char *path, storage_list_cb_t cb, void *c
 list_result_t storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx, bool listing_continues);
 void storage_format_timestamp(const storage_timestamp_t *ts, char *out, size_t out_len);
 
+typedef enum {
+    STORAGE_SD_EVENT_NONE = 0,
+    STORAGE_SD_EVENT_REMOVED,   // card pulled; volume unmounted, open handles invalidated
+    STORAGE_SD_EVENT_INSERTED,  // card-detect settled to present; caller should mount
+} storage_sd_event_t;
+
+// True if a card is in the socket (always true when card detect is disabled).
+bool storage_sd_card_present(void);
+// Changes whenever the card is mounted, removed or unmounted. Lets clients
+// (e.g. the web UI) notice that what they last read may be stale.
+uint32_t storage_media_generation(void);
+// Debounced card-detect poll; call often from the main loop.
+storage_sd_event_t storage_sd_hotplug_poll(void);
+
 void storage_sd_probe(void);
 bool storage_sd_may_mount(void);
 bool storage_sd_set_transport(const char *name);

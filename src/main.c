@@ -43,7 +43,6 @@
 #endif
 
 #define AT_SETTINGS_PATH "AT_SETTINGS.cfg"
-static bool sd_mounted = false;
 static remote_auth_config_t remote_cfg;
 
 typedef enum {
@@ -75,6 +74,7 @@ static bool make_child_path(const char *dir, const char *name, char *out, size_t
 
 static char core_list_last_dir[256] = "/";
 static bool core_list_last_dir_valid;
+static uint32_t core_list_media_gen;  // card the numbered list was made from
 
 static list_state_t list_state;
 static int16_t list_bytes_returned;
@@ -138,27 +138,16 @@ static void usb_reconnect_poll(void)
 
 static bool ensure_mount(void)
 {
-    if (sd_mounted || storage_is_mounted()) {
-        sd_mounted = true;
-        return true;
-    }
     if (!storage_mount()) {
         uart_cmd_printf("ERR SD %s\n", storage_last_error());
         return false;
     }
-    sd_mounted = true;
     return true;
 }
 
 static bool ensure_mount_quiet(void)
 {
-    if (sd_mounted || storage_is_mounted()) {
-        sd_mounted = true;
-        return true;
-    }
-    if (!storage_mount()) return false;
-    sd_mounted = true;
-    return true;
+    return storage_mount();
 }
 
 static void uart_quoted(const char *s)
@@ -201,6 +190,7 @@ static void core_list_context_commit(const char *dir)
     if (!dir || !dir[0]) dir = "/";
     snprintf(core_list_last_dir, sizeof core_list_last_dir, "%s", dir);
     core_list_last_dir_valid = true;
+    core_list_media_gen = storage_media_generation();
 }
 
 static bool list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
@@ -643,8 +633,13 @@ static void at_settings_load(void)
 static void sd_backed_config_reload(bool announce)
 {
     if (!ensure_mount_quiet()) return;
+    char old_name[M65_MACHINE_NAME_MAX + 1u];
+    snprintf(old_name, sizeof old_name, "%s", machine_identity_name());
     at_settings_load();
-    if (machine_identity_name()[0]) usb_reconnect_schedule();
+    // Re-enumerate USB only if the advertised name actually changed.
+    if (machine_identity_name()[0] && strcmp(old_name, machine_identity_name()) != 0) {
+        usb_reconnect_schedule();
+    }
     remote_http_init();
     sd_config_loaded = true;
 
@@ -658,9 +653,29 @@ static void sd_backed_config_reload(bool announce)
     }
 }
 
+static void sd_card_removed(void)
+{
+    // Config already loaded from the card stays in RAM, so Wi-Fi and the
+    // remote interface keep running; it is reloaded when a card returns.
+    sd_config_loaded = false;
+    remote_http_sd_removed();
+    if (remote_http_verbose() > 0u) {
+        uart_cmd_log_puts_best_effort("+SDCARD: removed\r\n");
+    }
+}
+
 static void sd_hotplug_poll(void)
 {
+    storage_sd_event_t ev = storage_sd_hotplug_poll();
+    if (ev == STORAGE_SD_EVENT_REMOVED) {
+        sd_card_removed();
+        sd_hotplug_poll_at = get_absolute_time();  // a new card may already be in
+    } else if (ev == STORAGE_SD_EVENT_INSERTED) {
+        sd_hotplug_poll_at = get_absolute_time();  // try to mount right away
+    }
+
     if (!remote_init_done || sd_config_loaded) return;
+    if (!storage_sd_card_present()) return;
 
     absolute_time_t now = get_absolute_time();
     if (absolute_time_diff_us(now, sd_hotplug_poll_at) > 0) return;
@@ -751,6 +766,7 @@ static sdcard_state_t sdcard_state(void)
     if (storage_is_mounted()) {
         return SDCARD_STATE_ACTIVE;
     }
+    if (!storage_sd_card_present()) return SDCARD_STATE_NOT_PRESENT;
     return storage_sd_may_mount() ? SDCARD_STATE_PRESENT : SDCARD_STATE_NOT_PRESENT;
 }
 
@@ -957,11 +973,12 @@ static void cmd_sd_transport(char *arg)
 static void cmd_sdcard(void)
 {
     sdcard_state_t state = sdcard_state();
-    uart_cmd_printf("+SDCARD: state=%s mounted=%lu config_loaded=%lu transport=%s\r\n",
+    uart_cmd_printf("+SDCARD: state=%s mounted=%lu config_loaded=%lu transport=%s gen=%lu\r\n",
                     sdcard_state_token(state),
                     (unsigned long)(storage_is_mounted() ? 1u : 0u),
                     (unsigned long)(sd_config_loaded ? 1u : 0u),
-                    storage_sd_transport_name());
+                    storage_sd_transport_name(),
+                    (unsigned long)storage_media_generation());
     at_ok();
 }
 
@@ -1215,7 +1232,6 @@ static void cmd_authority(void)
 static void cmd_mount(void)
 {
     storage_unmount();
-    sd_mounted = false;
     sd_config_loaded = false;
     if (ensure_mount()) {
         if (remote_init_done) {
@@ -1804,6 +1820,12 @@ static bool core_list_resolve_number(uint16_t number, char *path_out, size_t pat
 {
     if (!core_list_last_dir_valid) {
         uart_cmd_puts("ERR P no numbered core list; run AT+CORELIST first\n");
+        return false;
+    }
+    if (core_list_media_gen != storage_media_generation()) {
+        // Entry N on a different card is a different core: never guess.
+        core_list_context_clear();
+        uart_cmd_puts("ERR P sd card changed; run AT+CORELIST again\n");
         return false;
     }
 

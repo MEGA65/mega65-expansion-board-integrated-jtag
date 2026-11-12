@@ -24,6 +24,9 @@ bool storage_mkdir(const char *path) { (void)path; return false; }
 bool storage_list_cores(const char *path, storage_list_cb_t cb, void *ctx) { (void)path; (void)cb; (void)ctx; return false; }
 bool storage_list_dir(const char *path, storage_list_cb_t cb, void *ctx) { (void)path; (void)cb; (void)ctx; return false; }
 void storage_format_timestamp(const storage_timestamp_t *ts, char *out, size_t out_len) { (void)ts; if (out && out_len) snprintf(out, out_len, "-"); }
+bool storage_sd_card_present(void) { return false; }
+uint32_t storage_media_generation(void) { return 0; }
+storage_sd_event_t storage_sd_hotplug_poll(void) { return STORAGE_SD_EVENT_NONE; }
 void storage_sd_probe(void) {}
 bool storage_sd_may_mount(void) { return false; }
 bool storage_sd_set_transport(const char *name) { (void)name; return false; }
