@@ -17,7 +17,6 @@
 #include "storage.h"
 #include "uart_cmd.h"
 #include "write_gate.h"
-#include "www_assets.h"
 
 #include "mbedtls/sha256.h"
 
@@ -131,7 +130,6 @@ void remote_http_autofetch_poll(int enabled_override, uint32_t interval_hours_ov
 }
 void remote_http_autofetch_reset_schedule(void) {}
 void remote_http_autofetch_cancel(const char *reason) { (void)reason; }
-void remote_http_sd_removed(void) {}
 bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
 {
     (void)enabled_override;
@@ -151,13 +149,6 @@ bool remote_http_autofetch_running(void) { return false; }
 const char *remote_http_firmware_status(void) { return "firmware=unsupported"; }
 bool remote_http_firmware_update(char *err, size_t err_len)
 {
-    if (err && err_len) snprintf(err, err_len, "wifi/SD firmware update support is not built");
-    return false;
-}
-void remote_http_firmware_reboot(uint32_t delay_ms) { (void)delay_ms; }
-bool remote_http_verify_firmware_package(const char *path, char *err, size_t err_len)
-{
-    (void)path;
     if (err && err_len) snprintf(err, err_len, "wifi/SD firmware update support is not built");
     return false;
 }
@@ -226,6 +217,9 @@ typedef struct {
     uint32_t file_offset;
     uint32_t file_size;
     const uint8_t *mem_data;   // HTTP_SEND_FILE from memory (built-in WWW file) instead of SD
+    char *send_buf;     /* heap response body streamed via tcp_sent; owned by conn */
+    size_t send_len;
+    size_t send_off;
     jtag_stream_writer_t jtag;
     signed_file_rx_t signed_rx;
 } http_conn_t;
@@ -284,7 +278,6 @@ typedef struct {
     char version[48];
     char build[64];
     char name[48];
-    bool universal;   // from a "#+" line: a universal (all-chip) firmware package
 } manifest_entry_t;
 
 typedef enum {
@@ -352,7 +345,6 @@ typedef struct {
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len);
 static int find_header_end(const char *buf, size_t len, size_t *end_len);
 static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms);
-static void download_cancel_all(const char *reason);
 static bool autofetch_start_manifest(uint8_t board_rev);
 static void close_http_listener(void);
 static bool ensure_parent_dirs(const char *path);
@@ -625,14 +617,13 @@ static const char default_top[] =
     "<nav class=\"boards\"><span>Showing: {BOARD_LABEL}</span><span>Path: {CURRENT_PATH}</span>{PARENT_LINK}<a href=\"{R3_URL}\">R3 cores</a> <a href=\"{R6_URL}\">R6 cores</a> <a class=\"fetch-now\" href=\"{FETCH_NOW_URL}\">Check for updated cores</a></nav>"
     "<table><thead><tr><th>Core</th><th>Modified</th><th>Bytes</th><th>Actions</th></tr></thead><tbody>\n";
 static const char default_row[] =
-    "<tr class=\"entry-row\" data-kind=\"{TYPE}\" data-name=\"{FILENAME_ESCAPED}\"><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
+    "<tr class=\"entry-row\" data-kind=\"{TYPE}\"><td><a class=\"start\" href=\"{PRIMARY_URL}\">{PRIMARY_LABEL}</a>"
     "<a class=\"core-name\" href=\"{PRIMARY_URL}\">{FILENAME}</a><div class=\"meta\">{CORE_META}</div></td>"
     "<td>{MODIFIED}</td><td>{SIZE}</td><td>{ACTIONS}</td></tr>\n";
 static const char default_bottom[] =
     "</tbody></table><script>"
     "function launchCoreLink(){return true;}"
     "function deleteCore(){alert('Delete requires the WWW interface files on the SD card.');}"
-    "function deleteFolder(){deleteCore();}"
     "</script></main></body></html>\n";
 static const char default_busy[] =
     "<!doctype html><html><head><meta charset=\"utf-8\">"
@@ -666,23 +657,6 @@ static const char default_busy[] =
 
 static bool ext_equal_ci(const char *a, const char *b);
 static bool ci_equal(const char *a, const char *b);
-
-// Built-in copy of a WWW/ file (tools/embed_www.py), or NULL
-static const m65_www_asset_t *www_builtin(const char *name)
-{
-    for (unsigned i = 0; name && i < m65_www_asset_count; i++) {
-        if (ci_equal(m65_www_assets[i].name, name)) return &m65_www_assets[i];
-    }
-    return NULL;
-}
-
-// Template to use when the card has none: the built-in copy of the default
-// web interface file, or the minimal text template if even that is missing
-static const char *www_builtin_text(const char *name, const char *minimal)
-{
-    const m65_www_asset_t *a = www_builtin(name);
-    return a ? (const char *)a->data : minimal;
-}
 
 static bool has_core_ext(const char *name)
 {
@@ -818,33 +792,6 @@ static bool safe_file_path(const char *path)
     if (strchr(path, '\\') || strchr(path, ':') || strchr(path, '*') || strchr(path, '?')) return false;
     if (path_starts_with_ci(path, "WWW/") || path_starts_with_ci(path, "DOWNLOADS/")) return false;
     return has_core_ext(path) || has_manifest_ext(path);
-}
-
-static bool path_is_or_under_ci(const char *path, const char *dir)
-{
-    size_t n = strlen(dir);
-    if (strncasecmp(path, dir, n) != 0) return false;
-    return path[n] == 0 || path[n] == '/';
-}
-
-// A folder the web UI may create or delete: relative, no "..", not the root,
-// and never one of the firmware's own folders.
-static bool safe_folder_path(const char *path)
-{
-    if (!path || !path[0]) return false;
-    size_t n = strlen(path);
-    if (n > 180) return false;
-    if (path[0] == '/' || path[n - 1] == '/') return false;
-    if (strstr(path, "..") || strstr(path, "//")) return false;
-    for (const char *p = path; *p; p++) {
-        unsigned char ch = (unsigned char)*p;
-        if (ch < 0x20 || strchr("\\:*?\"<>|", ch)) return false;
-    }
-    if (path_is_or_under_ci(path, "WWW") || path_is_or_under_ci(path, "DOWNLOADS") ||
-        path_is_or_under_ci(path, M65_THEME_DIR_PATH)) {
-        return false;
-    }
-    return true;
 }
 
 static bool safe_manifest_source_path(const char *path, manifest_kind_t kind)
@@ -1578,7 +1525,7 @@ static void load_cached_web_assets(void)
     busy_template_loaded = load_template("WWW/fetch_busy.html",
                                          busy_template,
                                          sizeof busy_template,
-                                         www_builtin_text("fetch_busy.html", default_busy));
+                                         default_busy);
     favicon_cache_loaded = load_binary_asset("WWW/favicon-32x32.png",
                                              favicon_cache,
                                              sizeof favicon_cache,
@@ -1712,26 +1659,6 @@ static bool pending_firmware_version_is_current(void)
            ci_equal(pending_firmware_version, M65_VERSION_STRING);
 }
 
-// Build markers are YYYY-MM-DD-<minutes since midnight>-<commit>. Offer a
-// package only when it is newer than what is running: after a USB install of
-// a later build, an older package left in DOWNLOADS/ must not be offered as
-// an "update". Markers that do not parse fall back to "different".
-static bool build_marker_key(const char *m, uint64_t *key)
-{
-    unsigned y, mo, d, min;
-    if (!m || sscanf(m, "%4u-%2u-%2u-%u", &y, &mo, &d, &min) != 4) return false;
-    if (mo < 1 || mo > 12 || d < 1 || d > 31 || min >= 1440) return false;
-    *key = (((uint64_t)y * 12u + (mo - 1u)) * 31u + (d - 1u)) * 1440u + min;
-    return true;
-}
-
-static bool firmware_build_is_newer(const char *pending, const char *current)
-{
-    uint64_t kp, kc;
-    if (build_marker_key(pending, &kp) && build_marker_key(current, &kc)) return kp > kc;
-    return strcmp(pending, current) != 0;
-}
-
 bool firmware_update_available(void)
 {
     if (!storage_file_exists(M65_FIRMWARE_PACKAGE_PATH)) {
@@ -1745,7 +1672,7 @@ bool firmware_update_available(void)
                                pending_firmware_source, sizeof pending_firmware_source);
         pending_firmware_seen = pending_firmware_version[0] || pending_firmware_build[0] || pending_firmware_source[0];
     }
-    if (pending_firmware_build[0]) return firmware_build_is_newer(pending_firmware_build, M65_BUILD_MARKER);
+    if (pending_firmware_build[0]) return strcmp(pending_firmware_build, M65_BUILD_MARKER) != 0;
     if (pending_firmware_version[0]) return !pending_firmware_version_is_current();
     return true;
 }
@@ -1769,7 +1696,7 @@ static bool theme_scan_cb(const char *name, uint32_t size, bool is_dir, const st
 static uint32_t theme_scan(theme_scan_ctx_t *out)
 {
     theme_scan_ctx_t ts = {0};
-    (void)storage_list_dir(M65_THEME_DIR_PATH, theme_scan_cb, &ts);
+    (void)storage_list_dir(M65_THEME_DIR_PATH, theme_scan_cb, &ts, false);
     if (out) *out = ts;
     return ts.count;
 }
@@ -2062,8 +1989,8 @@ static void substitution_value(const char *name,
 #ifdef M65_BOOTLOADER_APP
             snprintf(out, out_len,
                      "<section class=\"update-panel firmware-update\"><strong>New firmware is available: %s</strong>"
-                     "<span>Build %s</span><form onsubmit=\"return false\">"
-                     "<button type=\"button\" onclick=\"m65FwUpdate(this)\">Update and reboot</button></form></section>",
+                     "<span>Build %s</span><form method=\"get\" action=\"/firmware/update\">"
+                     "<button type=\"submit\">Update and reboot</button></form></section>",
                      version, build);
 #else
             snprintf(out, out_len,
@@ -2171,13 +2098,7 @@ static void substitution_value(const char *name,
             snprintf(out, out_len, "/delete?file=%s", encoded);
         }
     } else if (ci_equal(name, "ACTIONS")) {
-        if (is_dir && safe_folder_path(file_path)) {
-            url_encode(file_path, encoded, sizeof encoded);
-            js_string_escape(file_name ? file_name : "", js_name, sizeof js_name);
-            snprintf(out, out_len,
-                     "<button class=\"delete\" type=\"button\" onclick=\"deleteFolder('/rmdir?path=%s','%s')\">delete</button>",
-                     encoded, js_name);
-        } else if (is_dir || is_partial || is_theme) {
+        if (is_dir || is_partial || is_theme) {
             snprintf(out, out_len, "");
         } else {
             url_encode(file_path ? file_path : "", encoded, sizeof encoded);
@@ -2336,11 +2257,6 @@ static bool index_cb(const char *name, uint32_t size, bool is_dir, const storage
         return true;
     }
     if (is_dir && ci_equal(name, "WWW")) return true;
-    // Firmware update packages and fetch slots: nothing to launch or manage here
-    if (is_dir && ci_equal(name, "DOWNLOADS") &&
-        (!il->dir_path || !il->dir_path[0] || strcmp(il->dir_path, "/") == 0)) {
-        return true;
-    }
     if (il->rows >= M65_HTTP_INDEX_MAX_ROWS) {
         il->truncated = true;
         return true;
@@ -2494,7 +2410,7 @@ static err_t send_busy_page(http_conn_t *c)
     page_builder_t pb = { .buf = page_buf, .cap = M65_HTTP_BUSY_PAGE_MAX };
     page_buf[0] = 0;
     append_substituted(&pb,
-                       busy_template_loaded ? busy_template : www_builtin_text("fetch_busy.html", default_busy),
+                       busy_template_loaded ? busy_template : default_busy,
                        NULL,
                        NULL,
                        "/",
@@ -2666,15 +2582,11 @@ static err_t send_firmware_update(http_conn_t *c)
     if (!check_perm(c, REMOTE_AUTH_FILES)) {
         return send_error(c, 403, "Forbidden", "firmware updates are not authorised");
     }
-    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
     char err[128];
     if (!remote_http_firmware_update(err, sizeof err)) {
-        return send_error(c, 500, "Internal Server Error", err[0] ? err : "firmware update failed");
+        return send_error(c, 501, "Not Implemented", err[0] ? err : "firmware update failed");
     }
-    // Staged and verified: reply first, then restart into the bootloader
-    err_t ret = send_response(c, 200, "OK", "text/plain", "OK FWUPDATE STAGED; restarting\n");
-    remote_http_firmware_reboot(1500);
-    return ret;
+    return send_redirect(c, "/index.html");
 }
 
 static err_t send_theme_install(http_conn_t *c)
@@ -2694,125 +2606,6 @@ static err_t send_theme_install(http_conn_t *c)
     return send_redirect(c, location);
 }
 
-// Built into the firmware (not WWW/app.js) so it works whatever is, or isn't,
-// on the card. Polls /sd-state every 3 s and:
-//  - reloads the page when the SD generation changes (card swapped or removed,
-//    files added, deleted or renamed) or the boot ID changes (the Pico
-//    restarted, e.g. after a firmware update), so nobody has to click;
-//  - updates the "Write grant" line in place, so pressing the write-enable
-//    button shows up without a reload.
-// It holds off while window.m65Busy is set: the page's own upload/delete
-// sequence is running and will reload by itself when it finishes. The
-// server handles one connection at a time, so polling also pauses briefly
-// after any click/submit to keep the user's own request from colliding.
-// m65FwUpdate() drives the firmware panel's button: PUT /firmware/update,
-// then wait for the board to come back with a new boot ID and reload.
-static const char sd_watch_script_fmt[] =
-    "<script>(function(){"
-    "var g='%lu',bid='%08lx',quietUntil=0;"
-    "function quiet(){quietUntil=Date.now()+8000;}"
-    "document.addEventListener('click',quiet,true);"
-    "document.addEventListener('submit',quiet,true);"
-    "function field(t,k){var m=new RegExp('(?:^|\\\\s)'+k+'=(\\\\S+)').exec(t);return m?m[1]:null;}"
-    "function showGrant(t){"
-    "if(field(t,'grant_required')!=='1')return;"
-    "var s=document.querySelector('section.grant');if(!s)return;"
-    "var n=parseInt(field(t,'grant'),10)||0,on=n>0,spans=s.getElementsByTagName('span');"
-    "var policy=spans.length?spans[spans.length-1].outerHTML:'';"
-    "s.className=(s.className.replace(/\\bgrant-(active|inactive)\\b/g,'')+' grant-'+(on?'active':'inactive'))"
-    ".replace(/\\s+/g,' ').trim();"
-    "s.innerHTML='<strong>Write grant:</strong> '+(on?'active':'inactive')+' <span>'+"
-    "(on?n+' seconds remaining':'Press button above user-port to enable writing')+'</span>'+policy;}"
-    "function sdState(cb,timeout){"
-    "var x=new XMLHttpRequest();x.open('GET','/sd-state',true);x.timeout=timeout;"
-    "x.onload=function(){cb(x.status===200?x.responseText:null);};"
-    "x.onerror=x.ontimeout=function(){cb(null);};x.send();}"
-    "function poll(){"
-    "if(document.hidden||window.m65Busy||Date.now()<quietUntil)return;"
-    "sdState(function(t){if(!t||window.m65Busy)return;"
-    "var gen=field(t,'gen'),boot=field(t,'boot');"
-    "if((gen&&gen!==g)||(boot&&boot!==bid)){location.reload();return;}"
-    "showGrant(t);},4000);}"
-    "document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});"
-    "setInterval(poll,3000);"
-    "window.m65FwUpdate=function(b){"
-    "if(!confirm('Install the new firmware and restart the board?\\n\\n"
-    "Keep the power on until this page comes back.'))return;"
-    "window.m65Busy=true;b.disabled=true;b.textContent='Installing... keep the power on';"
-    "fetch('/firmware/update',{method:'PUT',cache:'no-store'}).then(function(r){"
-    "return r.text().then(function(t){if(!r.ok)throw new Error(t.split('\\n')[1]||t);"
-    "b.textContent='Restarting...';var t0=Date.now();"
-    "function wait(){sdState(function(s){var boot=s&&field(s,'boot');"
-    "if(boot&&boot!==bid){location.reload();return;}"
-    "if(Date.now()-t0>180000){b.textContent='Board did not come back; reload this page';return;}"
-    "setTimeout(wait,2000);},2500);}"
-    "setTimeout(wait,4000);});"
-    "}).catch(function(e){window.m65Busy=false;b.disabled=false;b.textContent='Update and reboot';"
-    "alert('Firmware update failed: '+e.message);});};"
-    "})();</script>\n";
-
-static void page_insert_before_body_end(page_builder_t *pb, const char *snippet)
-{
-    size_t n = strlen(snippet);
-    if (pb->len + n + 1u > pb->cap) return;
-    char *at = NULL;
-    for (char *p = pb->buf; (p = strstr(p, "</")) != NULL; p += 2) {
-        if (strncasecmp(p, "</body", 6) == 0) at = p;
-    }
-    if (!at) {
-        page_append(pb, snippet);
-        return;
-    }
-    size_t off = (size_t)(at - pb->buf);
-    memmove(pb->buf + off + n, pb->buf + off, pb->len - off + 1u);
-    memcpy(pb->buf + off, snippet, n);
-    pb->len += n;
-}
-
-static err_t send_sd_state(http_conn_t *c)
-{
-    if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
-        return send_error(c, 403, "Forbidden", "remote IP is not authorised");
-    }
-    char body[128];
-    snprintf(body, sizeof body, "present=%u mounted=%u gen=%lu boot=%08lx grant=%lu grant_required=%u\n",
-             storage_sd_card_present() ? 1u : 0u,
-             storage_is_mounted() ? 1u : 0u,
-             (unsigned long)storage_media_generation(),
-             (unsigned long)m65_boot_id(),
-             (unsigned long)(write_gate_remaining_ms() / 1000u),
-             http_cfg.require_write_grant ? 1u : 0u);
-    return send_response(c, 200, "OK", "text/plain", body);
-}
-
-// Explain why the core list is empty, in terms the user can act on.
-static void index_append_sd_problem(page_builder_t *pb, const char *dir_path)
-{
-    char err[160];
-    char dir[224];
-    char row[640];
-    html_escape(storage_last_error(), err, sizeof err);
-    html_escape(dir_path, dir, sizeof dir);
-
-    if (!storage_sd_card_present()) {
-        snprintf(row, sizeof row,
-                 "<tr><td colspan=\"4\"><strong>No SD card inserted.</strong>"
-                 "<div class=\"meta\">Insert a card with your cores on it. "
-                 "This page will reload by itself once the card is detected.</div></td></tr>\n");
-    } else if (!storage_is_mounted()) {
-        snprintf(row, sizeof row,
-                 "<tr><td colspan=\"4\"><strong>The SD card can't be read.</strong>"
-                 "<div class=\"meta\">Check that it is pushed fully into the slot and formatted "
-                 "as FAT32 or exFAT. Details: %s</div></td></tr>\n", err);
-    } else {
-        snprintf(row, sizeof row,
-                 "<tr><td colspan=\"4\"><strong>Couldn't read the folder %s.</strong>"
-                 "<div class=\"meta\">It may have been removed or renamed. Details: %s</div></td></tr>\n",
-                 dir, err);
-    }
-    page_append(pb, row);
-}
-
 static err_t send_index(http_conn_t *c, uint8_t board_rev)
 {
     if (!check_perm(c, REMOTE_AUTH_FILES) && !check_perm(c, REMOTE_AUTH_BITSTREAMS)) {
@@ -2823,8 +2616,7 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         return send_error(c, 400, "Bad Request", "unsafe index path");
     }
 
-    load_template("WWW/index_row.html", row_template, sizeof row_template,
-                  www_builtin_text("index_row.html", default_row));
+    load_template("WWW/index_row.html", row_template, sizeof row_template, default_row);
 
     char *page_buf = (char *)malloc(M65_HTTP_PAGE_MAX);
     if (!page_buf) {
@@ -2833,12 +2625,7 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
 
     page_builder_t pb = { .buf = page_buf, .cap = M65_HTTP_PAGE_MAX };
     page_buf[0] = 0;
-    // A card that was just inserted may not be mounted by the main loop yet.
-    if (storage_sd_card_present() && !storage_is_mounted()) (void)storage_mount();
-    // Sample before reading the card so a change mid-build still shows the banner.
-    uint32_t gen_at_listing = storage_media_generation();
-    append_template_or_fallback(&pb, "WWW/index_top.html", www_builtin_text("index_top.html", default_top),
-                                NULL, NULL, dir_path, 0, false, NULL, board_rev);
+    append_template_or_fallback(&pb, "WWW/index_top.html", default_top, NULL, NULL, dir_path, 0, false, NULL, board_rev);
 
     index_list_ctx_t il = {
         .pb = &pb,
@@ -2846,18 +2633,13 @@ static err_t send_index(http_conn_t *c, uint8_t board_rev)
         .dir_path = dir_path,
         .board_rev = board_rev,
     };
-    if (!storage_is_mounted() || !storage_list_cores(dir_path, index_cb, &il)) {
-        index_append_sd_problem(&pb, dir_path);
+    if (!storage_list_cores(dir_path, index_cb, &il, false)) {
+        page_append(&pb, "<tr><td colspan=\"4\">SD list failed</td></tr>\n");
     }
     if (il.truncated) {
         page_append(&pb, "<tr><td colspan=\"4\">List truncated</td></tr>\n");
     }
-    append_template_or_fallback(&pb, "WWW/index_bottom.html", www_builtin_text("index_bottom.html", default_bottom),
-                                NULL, NULL, dir_path, 0, false, NULL, board_rev);
-    static char sd_watch[sizeof sd_watch_script_fmt + 16];   // static: too big for the 2 KB stack
-    snprintf(sd_watch, sizeof sd_watch, sd_watch_script_fmt,
-             (unsigned long)gen_at_listing, (unsigned long)m65_boot_id());
-    page_insert_before_body_end(&pb, sd_watch);
+    append_template_or_fallback(&pb, "WWW/index_bottom.html", default_bottom, NULL, NULL, dir_path, 0, false, NULL, board_rev);
     err_t ret = send_response(c, 200, "OK", "text/html; charset=utf-8", page_buf);
     free(page_buf);
     return ret;
@@ -2873,15 +2655,6 @@ static err_t send_file_chunk(http_conn_t *c)
     size_t want = c->file_size - c->file_offset;
     if (want > M65_HTTP_IO_CHUNK) want = M65_HTTP_IO_CHUNK;
     if (want > snd) want = snd;
-
-    if (c->mem_data) {
-        err_t err = tcp_write(c->pcb, c->mem_data + c->file_offset, (u16_t)want, TCP_WRITE_FLAG_COPY);
-        if (err != ERR_OK) return ERR_OK;
-        c->file_offset += (uint32_t)want;
-        tcp_output(c->pcb);
-        if (c->file_offset >= c->file_size) return http_close(c);
-        return ERR_OK;
-    }
 
     static uint8_t io[M65_HTTP_IO_CHUNK];
     storage_file_t f = {0};
@@ -2954,27 +2727,7 @@ static err_t start_www_download(http_conn_t *c, const char *path)
     if (snprintf(full, sizeof full, "WWW/%s", path) >= (int)sizeof full) {
         return send_error(c, 400, "Bad Request", "path too long");
     }
-    if (storage_file_exists(full)) return start_download(c, full, content_type_for_path(full), false);
-
-    // Not on the card (no card, no WWW/, or a partial theme): the built-in copy
-    const m65_www_asset_t *a = www_builtin(path);
-    if (!a) return send_error(c, 404, "Not Found", "no such WWW file");
-    snprintf(c->content_type, sizeof c->content_type, "%s", content_type_for_path(full));
-    c->mem_data = a->data;
-    c->attachment = false;
-    c->file_size = a->size;
-    c->file_offset = 0;
-    c->state = HTTP_SEND_FILE;
-    char header[200];
-    snprintf(header, sizeof header,
-             "HTTP/1.0 200 OK\r\n"
-             "Connection: close\r\n"
-             "Content-Type: %s\r\n"
-             "Content-Length: %lu\r\n"
-             "\r\n",
-             c->content_type, (unsigned long)a->size);
-    if (!tcp_write_copy(c, header, strlen(header))) return http_close(c);
-    return send_file_chunk(c);
+    return start_download(c, full, content_type_for_path(full), false);
 }
 
 static err_t start_downloads_download(http_conn_t *c, const char *path)
@@ -3022,45 +2775,6 @@ static err_t delete_file(http_conn_t *c, const char *path)
     if (!safe_file_path(path)) return send_error(c, 400, "Bad Request", "unsafe or unsupported file path");
     if (!storage_delete(path)) return send_error(c, 500, "Internal Server Error", storage_last_error());
     return send_response(c, 200, "OK", "text/plain", "OK DELETE DONE\n");
-}
-
-static err_t make_folder(http_conn_t *c, const char *path)
-{
-    if (!check_perm(c, REMOTE_AUTH_FILES)) return send_error(c, 403, "Forbidden", "folder changes are not authorised");
-    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
-    if (!safe_folder_path(path)) return send_error(c, 400, "Bad Request", "unsafe or unsupported folder name");
-    int kind = storage_path_kind(path);
-    if (kind == STORAGE_KIND_ERROR) return send_error(c, 500, "Internal Server Error", storage_last_error());
-    if (kind != STORAGE_KIND_MISSING) return send_error(c, 409, "Conflict", "a file or folder with that name already exists");
-    if (!storage_mkdir(path)) return send_error(c, 500, "Internal Server Error", storage_last_error());
-    return send_response(c, 200, "OK", "text/plain", "OK MKDIR DONE\n");
-}
-
-// Entries removed per request when deleting a non-empty folder. The page
-// repeats the request until it reports DONE, so no single request blocks
-// the Pico (and WiFi) for long.
-#define M65_RMDIR_BATCH 32u
-
-static err_t remove_folder(http_conn_t *c, const char *path, bool recursive)
-{
-    if (!check_perm(c, REMOTE_AUTH_FILES)) return send_error(c, 403, "Forbidden", "folder changes are not authorised");
-    if (!check_write_grant()) return send_error(c, 423, "Locked", "write grant is not active");
-    if (!safe_folder_path(path)) return send_error(c, 400, "Bad Request", "unsafe or protected folder");
-    int kind = storage_path_kind(path);
-    if (kind == STORAGE_KIND_ERROR) return send_error(c, 500, "Internal Server Error", storage_last_error());
-    if (kind != STORAGE_KIND_DIR) return send_error(c, 404, "Not Found", "no such folder");
-
-    if (!recursive) {
-        int empty = storage_dir_is_empty(path);
-        if (empty < 0) return send_error(c, 500, "Internal Server Error", storage_last_error());
-        if (!empty) return send_error(c, 409, "Conflict", "folder is not empty");
-        if (!storage_delete(path)) return send_error(c, 500, "Internal Server Error", storage_last_error());
-        return send_response(c, 200, "OK", "text/plain", "OK RMDIR DONE\n");
-    }
-
-    int r = storage_delete_tree(path, M65_RMDIR_BATCH);
-    if (r < 0) return send_error(c, 500, "Internal Server Error", storage_last_error());
-    return send_response(c, 200, "OK", "text/plain", r ? "OK RMDIR DONE\n" : "OK RMDIR MORE\n");
 }
 
 static bool parse_query_value(const char *target, const char *key, char *out, size_t out_len)
@@ -3373,21 +3087,14 @@ static err_t parse_headers(http_conn_t *c)
         return send_redirect(c, "/index.html");
     }
 
-    if (ci_equal(target_path, "/firmware/update")) {
-        // PUT only: a GET link could be followed by a crawler or a browser prefetch
-        if (!ci_equal(c->method, "PUT")) {
-            return send_error(c, 405, "Method Not Allowed", "use the Update button (PUT) to install firmware");
-        }
+    if ((ci_equal(c->method, "GET") || ci_equal(c->method, "PUT")) &&
+        ci_equal(target_path, "/firmware/update")) {
         return send_firmware_update(c);
     }
 
     if ((ci_equal(c->method, "GET") || ci_equal(c->method, "PUT")) &&
         ci_equal(target_path, "/theme/install")) {
         return send_theme_install(c);
-    }
-
-    if (ci_equal(c->method, "GET") && ci_equal(target_path, "/sd-state")) {
-        return send_sd_state(c);
     }
 
     if (autofetch_web_busy() && ci_equal(c->method, "GET") &&
@@ -3450,17 +3157,6 @@ static err_t parse_headers(http_conn_t *c)
                 return send_error(c, 400, "Bad Request", "missing file query parameter");
             }
             return delete_file(c, file);
-        }
-        if (ci_equal(target_path, "/mkdir") || ci_equal(target_path, "/rmdir")) {
-            char folder[256];
-            if (!parse_query_value(c->target, "path", folder, sizeof folder)) {
-                return send_error(c, 400, "Bad Request", "missing path query parameter");
-            }
-            if (ci_equal(target_path, "/mkdir")) return make_folder(c, folder);
-            char recursive[4];
-            bool all = parse_query_value(c->target, "recursive", recursive, sizeof recursive) &&
-                       strcmp(recursive, "1") == 0;
-            return remove_folder(c, folder, all);
         }
         return send_error(c, 404, "Not Found", "unknown PUT endpoint");
     }
@@ -4440,16 +4136,11 @@ void remote_http_autofetch_reset_schedule(void)
 }
 
 typedef struct {
+    const char *dir;
     uint32_t deleted;
-    uint8_t depth;
 } partial_cleanup_ctx_t;
 
-// Each level costs a FatFs DIR and long-filename FILINFO on the 2 KB stack
-#define M65_PARTIAL_CLEANUP_MAX_DEPTH 4u
-// Folder being cleaned: "" is the root. Grown on the way down, cut back after.
-static char partial_path[256];
-
-static void delete_partial_level(partial_cleanup_ctx_t *pc);
+static void delete_partial_tree(const char *dir, uint32_t *deleted);
 
 static bool delete_partial_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
@@ -4458,39 +4149,23 @@ static bool delete_partial_cb(const char *name, uint32_t size, bool is_dir, cons
     partial_cleanup_ctx_t *pc = (partial_cleanup_ctx_t *)ctx;
     if (!pc || !name || !name[0]) return true;
 
-    size_t len = strlen(partial_path);
-    int n = snprintf(partial_path + len, sizeof partial_path - len, "%s%s", len ? "/" : "", name);
-    if (n < 0 || (size_t)n >= sizeof partial_path - len) {
-        partial_path[len] = 0;   // too deep a name: skip it
+    char path[256];
+    if (!make_child_path(pc->dir, name, path, sizeof path)) return true;
+    if (is_dir) {
+        if (!ci_equal(name, "WWW")) delete_partial_tree(path, &pc->deleted);
         return true;
     }
-    if (is_dir) {
-        if (!ci_equal(name, "WWW") && pc->depth < M65_PARTIAL_CLEANUP_MAX_DEPTH) {
-            pc->depth++;
-            delete_partial_level(pc);
-            pc->depth--;
-        }
-    } else if (is_partial_core_path(partial_path) && storage_delete(partial_path)) {
-        pc->deleted++;
-    }
-    partial_path[len] = 0;
+    if (is_partial_core_path(path) && storage_delete(path)) pc->deleted++;
     return true;
-}
-
-static void delete_partial_level(partial_cleanup_ctx_t *pc)
-{
-    storage_list_cores(partial_path[0] ? partial_path : "/", delete_partial_cb, pc);
 }
 
 static void delete_partial_tree(const char *dir, uint32_t *deleted)
 {
-    snprintf(partial_path, sizeof partial_path, "%s",
-             (dir && dir[0] && strcmp(dir, "/") != 0) ? dir : "");
     partial_cleanup_ctx_t ctx = {
+        .dir = (dir && dir[0]) ? dir : "/",
         .deleted = deleted ? *deleted : 0,
-        .depth = 0,
     };
-    delete_partial_level(&ctx);
+    storage_list_cores(ctx.dir, delete_partial_cb, &ctx, false);
     if (deleted) *deleted = ctx.deleted;
 }
 
@@ -4535,23 +4210,6 @@ static void autofetch_cancel(const char *reason, uint32_t retry_delay_ms)
 void remote_http_autofetch_cancel(const char *reason)
 {
     autofetch_cancel(reason ? reason : "operator activity", 900000u);
-}
-
-void remote_http_sd_removed(void)
-{
-    // Abort everything that writes to SD *now*, while no card is mounted.
-    // Their cleanup deletes temp files by path; if it ran later, after a new
-    // card was mounted, it would delete same-named files on the new card.
-    // (storage_mount() refuses to mount until this has run.)
-    http_conn_t *c = &http_conn;
-    if (c->in_use && c->pcb && c->state == HTTP_RECV_BODY &&
-        (c->put_op == HTTP_PUT_FILE || c->jtag_spool)) {
-        (void)send_error(c, 503, "Service Unavailable", "sd card removed during upload");
-    }
-    download_cancel_all("sd card removed");
-    if (autofetch_running || autofetch_state != AUTOFETCH_IDLE) {
-        autofetch_cancel("sd card removed", 60000u);
-    }
 }
 
 bool remote_http_autofetch_start_now(int enabled_override, uint32_t interval_hours_override, uint8_t board_rev_override)
@@ -4668,20 +4326,7 @@ static bool parse_manifest_entry(char *line,
 
     char *s = line;
     while (*s && isspace((unsigned char)*s)) s++;
-
-    // "#+" lines carry entries that firmware from before universal UF2s must
-    // not see: it skips every '#' line, while an unknown type on an ordinary
-    // line would abort its whole scan. Only universal firmware uses this so
-    // far; anything else after "#+" is skipped, so the mirror can add more
-    // later without breaking this firmware either.
-    bool extended = false;
-    if (s[0] == '#' && s[1] == '+') {
-        extended = true;
-        s += 2;
-        while (*s && isspace((unsigned char)*s)) s++;
-    } else if (!*s || *s == '#') {
-        return true;
-    }
+    if (!*s || *s == '#') return true;
 
     char *cursor = s;
     char *first = manifest_next_token(&cursor);
@@ -4692,14 +4337,7 @@ static bool parse_manifest_entry(char *line,
     char *rel = NULL;
     manifest_kind_t kind = MANIFEST_KIND_CORE;
 
-    if (extended) {
-        manifest_kind_t ext_kind;
-        if (!parse_manifest_kind(first, &ext_kind) || ext_kind != MANIFEST_KIND_FIRMWARE) return true;
-        kind = ext_kind;
-        payload_hash = manifest_next_token(&cursor);
-        transfer_hash = manifest_next_token(&cursor);
-        rel = manifest_next_token(&cursor);
-    } else if (is_hex64_token(first)) {
+    if (is_hex64_token(first)) {
         payload_hash = first;
         transfer_hash = manifest_next_token(&cursor);
         rel = manifest_next_token(&cursor);
@@ -4737,45 +4375,26 @@ static bool parse_manifest_entry(char *line,
     snprintf(entry->transfer_sha, sizeof entry->transfer_sha, "%s", transfer_hash);
     snprintf(entry->rel, sizeof entry->rel, "%s", rel);
     parse_manifest_attrs(cursor, entry);
-    entry->universal = extended;
     if (skip) *skip = false;
     return true;
-}
-
-// Set by count_manifest_entries() before each scan. When the manifest offers a
-// universal firmware package, this firmware takes it and ignores the
-// single-chip "firmware" entry kept for older firmware; both would otherwise
-// download to the same path and replace each other on every fetch.
-static bool autofetch_manifest_has_universal_fw;
-
-static bool manifest_entry_superseded(const manifest_entry_t *entry)
-{
-    return entry->kind == MANIFEST_KIND_FIRMWARE && !entry->universal &&
-           autofetch_manifest_has_universal_fw;
 }
 
 static uint32_t count_manifest_entries(void)
 {
     uint32_t offset = 0;
-    uint32_t total = 0, single_chip_fw = 0;
+    uint32_t total = 0;
     char line[512];
-    autofetch_manifest_has_universal_fw = false;
     for (;;) {
         bool eof = false;
-        if (!read_manifest_line(&offset, line, sizeof line, &eof) || eof) break;
+        if (!read_manifest_line(&offset, line, sizeof line, &eof)) return total;
+        if (eof) return total;
 
         manifest_entry_t entry;
         bool skip = true;
         char err[80];
-        if (!parse_manifest_entry(line, &entry, &skip, err, sizeof err)) break;
-        if (skip) continue;
-        total++;
-        if (entry.kind == MANIFEST_KIND_FIRMWARE) {
-            if (entry.universal) autofetch_manifest_has_universal_fw = true;
-            else single_chip_fw++;
-        }
+        if (!parse_manifest_entry(line, &entry, &skip, err, sizeof err)) return total;
+        if (!skip) total++;
     }
-    return autofetch_manifest_has_universal_fw ? total - single_chip_fw : total;
 }
 
 static bool autofetch_start_manifest(uint8_t board_rev)
@@ -5039,7 +4658,7 @@ static bool autofetch_scan_manifest(void)
                      "autofetch=failed stage=manifest-scan reason=\"%s\"", err);
             return false;
         }
-        if (skip || manifest_entry_superseded(&entry)) continue;
+        if (skip) continue;
 
         autofetch_checked_count++;
         const char *final_path = manifest_final_path(entry.kind, entry.rel);
@@ -5298,21 +4917,47 @@ const char *remote_http_firmware_status(void)
 
 
 
-// Deletes everything inside dir, and dir itself if delete_self. Uses
-// storage_delete_tree(): iterative, fixed RAM, whatever the depth. (It used
-// to recurse through nested listings with a 256-byte path per level.)
+typedef struct {
+    const char *dir;
+    bool ok;
+} delete_tree_ctx_t;
+
+static void delete_tree(const char *dir, bool delete_self, bool *ok);
+
+static bool delete_tree_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
+{
+    (void)size;
+    (void)modified;
+    delete_tree_ctx_t *dt = (delete_tree_ctx_t *)ctx;
+    if (!dt || !dt->ok || !name || !name[0]) return true;
+
+    char path[256];
+    if (!make_child_path(dt->dir, name, path, sizeof path)) {
+        dt->ok = false;
+        return true;
+    }
+    if (is_dir) {
+        delete_tree(path, true, &dt->ok);
+    } else if (!storage_delete(path)) {
+        dt->ok = false;
+    }
+    return true;
+}
+
 static void delete_tree(const char *dir, bool delete_self, bool *ok)
 {
     if (ok && !*ok) return;
-    const char *d = (dir && dir[0]) ? dir : "/";
-    bool good = true;
-    int r;
-    do {
-        r = storage_delete_tree(d, 64u);
-    } while (r == 0);
-    if (r < 0) good = false;
-    else if (!delete_self && !storage_mkdir(d)) good = false;   // keep the (now empty) folder
-    if (ok) *ok = good;
+    delete_tree_ctx_t ctx = {
+        .dir = (dir && dir[0]) ? dir : "/",
+        .ok = true,
+    };
+    if (!storage_list_dir(ctx.dir, delete_tree_cb, &ctx, false)) {
+        ctx.ok = false;
+    }
+    if (ctx.ok && delete_self && !storage_delete(ctx.dir)) {
+        ctx.ok = false;
+    }
+    if (ok) *ok = ctx.ok;
 }
 
 static bool tar_zero_block(const uint8_t block[512])
@@ -5572,132 +5217,31 @@ bool remote_http_theme_install_named(const char *theme_name, char *err, size_t e
     return true;
 }
 
-// The server handles one request at a time. A connection that arrives while
-// it is busy is parked rather than aborted: accepted, but its data left with
-// lwIP (the receive callback refuses it, so lwIP holds it and redelivers it
-// later) until the current request finishes. Browsers fetch a page's
-// stylesheet, script and images in parallel; aborting those made parts of
-// the page fail at random. A parked connection costs no RAM beyond the
-// lwIP PCB it already has; the queue is bounded and old entries time out.
-#define HTTP_PARK_SLOTS       4u
-#define HTTP_PARK_TIMEOUT_MS  15000u
-
-typedef struct {
-    struct tcp_pcb *pcb;
-    uint32_t since_ms;
-    uint32_t seq;
-} http_park_slot_t;
-
-static http_park_slot_t http_park[HTTP_PARK_SLOTS];
-static uint32_t http_park_seq;
-
-static void http_conn_attach(struct tcp_pcb *pcb)
-{
-    memset(&http_conn, 0, sizeof http_conn);
-    http_conn.pcb = pcb;
-    http_conn.in_use = true;
-    http_conn.state = HTTP_RECV_HEADERS;
-    http_conn.remote_ip = lwip_ip_to_host_u32(&pcb->remote_ip);
-
-    tcp_arg(pcb, &http_conn);
-    tcp_recv(pcb, http_recv);
-    tcp_sent(pcb, http_sent);
-    tcp_err(pcb, http_err);
-    tcp_poll(pcb, http_poll_cb, 2);
-}
-
-static void http_park_err(void *arg, err_t err)
-{
-    (void)err;
-    http_park_slot_t *slot = (http_park_slot_t *)arg;
-    if (slot) slot->pcb = NULL;   // lwIP has already freed the PCB
-}
-
-static err_t http_park_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
-{
-    (void)err;
-    http_park_slot_t *slot = (http_park_slot_t *)arg;
-    if (!p) {
-        // Client gave up before being served
-        if (slot) slot->pcb = NULL;
-        tcp_arg(pcb, NULL);
-        tcp_recv(pcb, NULL);
-        tcp_err(pcb, NULL);
-        if (tcp_close(pcb) != ERR_OK) {
-            tcp_abort(pcb);
-            return ERR_ABRT;
-        }
-        return ERR_OK;
-    }
-    return ERR_MEM;   // not yet: lwIP keeps the data and offers it again
-}
-
-static void http_park_drop(http_park_slot_t *slot)
-{
-    struct tcp_pcb *pcb = slot->pcb;
-    slot->pcb = NULL;
-    if (!pcb) return;
-    tcp_arg(pcb, NULL);
-    tcp_recv(pcb, NULL);
-    tcp_err(pcb, NULL);
-    tcp_abort(pcb);
-}
-
-// Main loop: serve the longest-waiting parked connection once the server is
-// free, and drop any that waited too long
-static void http_park_service(void)
-{
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    http_park_slot_t *next = NULL;
-    for (unsigned i = 0; i < HTTP_PARK_SLOTS; i++) {
-        http_park_slot_t *slot = &http_park[i];
-        if (!slot->pcb) continue;
-        if (now - slot->since_ms > HTTP_PARK_TIMEOUT_MS) {
-            http_park_drop(slot);
-            continue;
-        }
-        if (!next || slot->seq < next->seq) next = slot;
-    }
-    if (!next || http_conn.in_use) return;
-    struct tcp_pcb *pcb = next->pcb;
-    next->pcb = NULL;
-    http_conn_attach(pcb);
-    if (pcb->refused_data) tcp_process_refused_data(pcb);   // the request it already sent
-}
-
-static void http_park_drop_all(void)
-{
-    for (unsigned i = 0; i < HTTP_PARK_SLOTS; i++) http_park_drop(&http_park[i]);
-}
-
 static err_t http_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
     (void)arg;
     if (err != ERR_OK || !newpcb) return ERR_VAL;
     if (http_conn.in_use) {
-        for (unsigned i = 0; i < HTTP_PARK_SLOTS; i++) {
-            http_park_slot_t *slot = &http_park[i];
-            if (slot->pcb) continue;
-            slot->pcb = newpcb;
-            slot->since_ms = to_ms_since_boot(get_absolute_time());
-            slot->seq = ++http_park_seq;
-            tcp_arg(newpcb, slot);
-            tcp_recv(newpcb, http_park_recv);
-            tcp_err(newpcb, http_park_err);
-            tcp_sent(newpcb, NULL);
-            tcp_poll(newpcb, NULL, 0);
-            return ERR_OK;
-        }
-        tcp_abort(newpcb);   // queue full
+        tcp_abort(newpcb);
         return ERR_ABRT;
     }
-    http_conn_attach(newpcb);
+
+    memset(&http_conn, 0, sizeof http_conn);
+    http_conn.pcb = newpcb;
+    http_conn.in_use = true;
+    http_conn.state = HTTP_RECV_HEADERS;
+    http_conn.remote_ip = lwip_ip_to_host_u32(&newpcb->remote_ip);
+
+    tcp_arg(newpcb, &http_conn);
+    tcp_recv(newpcb, http_recv);
+    tcp_sent(newpcb, http_sent);
+    tcp_err(newpcb, http_err);
+    tcp_poll(newpcb, http_poll_cb, 2);
     return ERR_OK;
 }
 
 static void close_http_listener(void)
 {
-    http_park_drop_all();
     if (!listen_pcb) return;
     tcp_accept(listen_pcb, NULL);
     if (tcp_close(listen_pcb) == ERR_OK) listen_pcb = NULL;
@@ -5714,7 +5258,7 @@ static bool listen_http(uint16_t port)
         listen_pcb = NULL;
         return false;
     }
-    listen_pcb = tcp_listen_with_backlog(listen_pcb, HTTP_PARK_SLOTS + 1u);
+    listen_pcb = tcp_listen_with_backlog(listen_pcb, 1);
     if (!listen_pcb) return false;
     tcp_accept(listen_pcb, http_accept);
     return true;
@@ -5885,61 +5429,8 @@ static void remote_http_poll_wifi_join(void)
     }
 }
 
-// Last config successfully read from SD. Wi-Fi recovery and SD hot-swap use
-// it so a missing card never takes down a network that was already configured.
-static bool http_cfg_loaded;
-
-static bool wifi_link_settings_equal(const remote_auth_config_t *a, const remote_auth_config_t *b)
-{
-    return a->http_enabled == b->http_enabled &&
-           a->dhcp == b->dhcp &&
-           a->http_port == b->http_port &&
-           a->static_ip == b->static_ip &&
-           a->netmask == b->netmask &&
-           a->gateway == b->gateway &&
-           strcmp(a->wifi_ssid, b->wifi_ssid) == 0 &&
-           strcmp(a->wifi_psk, b->wifi_psk) == 0;
-}
-
-static void download_cancel_all(const char *reason)
-{
-    if (download_active_job >= 0 && download_active_job < (int)M65_DOWNLOAD_QUEUE_DEPTH) {
-        signed_file_receive_abort(&download_fc.signed_rx);
-        fetch_close(&download_fc, true);
-        storage_delete(download_fc.tmp_path);
-    }
-    for (unsigned i = 0; i < M65_DOWNLOAD_QUEUE_DEPTH; ++i) {
-        download_job_t *job = &download_jobs[i];
-        if (job->state == DOWNLOAD_JOB_QUEUED || job->state == DOWNLOAD_JOB_RUNNING) {
-            job->state = DOWNLOAD_JOB_FAILED;
-            snprintf(job->err, sizeof job->err, "%s", reason);
-        }
-    }
-    download_active_job = -1;
-    download_refresh_status();
-}
-
-// Take the network fully down so the reported state matches reality: no
-// association, no listener, no in-flight transfers, no recovery retries.
-static void wifi_shutdown(const char *reason)
-{
-    if (http_conn.in_use) (void)http_close(&http_conn);
-    close_http_listener();
-    download_cancel_all("wifi disabled by config");
-    if (autofetch_running || autofetch_state != AUTOFETCH_IDLE) {
-        autofetch_cancel("wifi disabled by config", 0u);
-    }
-    if (cyw43_is_ready) cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
-    http_is_active = false;
-    wifi_assoc_state = WIFI_ASSOC_OFF;
-    wifi_noip_timer_active = false;
-    wifi_clear_recover();
-    snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 %s", reason);
-}
-
 void remote_http_init(void)
 {
-    bool was_up = cyw43_is_ready && http_is_active && wifi_assoc_state == WIFI_ASSOC_HTTP_ACTIVE;
     http_is_active = false;
     wifi_assoc_state = WIFI_ASSOC_OFF;
     wifi_assoc_last_status = CYW43_LINK_DOWN - 99;
@@ -5965,61 +5456,27 @@ void remote_http_init(void)
         return;
     }
 
-    static remote_auth_config_t new_cfg;  // large; keep off the stack
-    char err[96] = "";
-    bool mounted = storage_mount();
-    bool cfg_file = mounted && remote_auth_config_present();
-    bool loaded = cfg_file && remote_auth_load(&new_cfg, err, sizeof err);
-    if (loaded) {
-        if (was_up && http_cfg_loaded && wifi_link_settings_equal(&http_cfg, &new_cfg)) {
-            // Same network settings (e.g. the card was just reinserted): take the
-            // new auth/fetch settings but keep the existing association.
-            http_cfg = new_cfg;
-            load_cached_web_assets();
-            http_is_active = true;
-            wifi_assoc_state = WIFI_ASSOC_HTTP_ACTIVE;
-            return;
-        }
-        http_cfg = new_cfg;
-        http_cfg_loaded = true;
-    } else if (cfg_file && storage_is_mounted()) {
-        // The card has a config file but it can't be used: don't fall back to
-        // an older card's settings, and don't leave a half-up network behind.
-        http_cfg_loaded = false;
-        char reason[128];
-        snprintf(reason, sizeof reason, "remote=%s", err[0] ? err : "config invalid");
-        wifi_shutdown(reason);
-        return;
-    } else if (!http_cfg_loaded) {
-        // No card, or a card without a config file, and nothing cached yet.
-        if (mounted && storage_is_mounted()) {
-            snprintf(http_status_buf, sizeof http_status_buf,
-                     "wifi=disabled hardware=cyw43 remote=no config on sd");
-            return;
-        }
+    if (!storage_mount()) {
         wifi_schedule_recover("config-unavailable");
         return;
-    } else {
-        // No card, or a card with no config file: keep the network we have.
-        remote_log(1, "+WIFI: %s, using cached config",
-                   mounted && storage_is_mounted() ? "no config on sd card" : "sd card unavailable");
-        if (was_up) {
-            http_is_active = true;
-            wifi_assoc_state = WIFI_ASSOC_HTTP_ACTIVE;
-            return;
-        }
+    }
+
+    char err[96];
+    if (!remote_auth_load(&http_cfg, err, sizeof err)) {
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 remote=%s", err);
+        return;
     }
     if (machine_identity_board_rev() == 0u &&
         (http_cfg.fetch_board_rev == 3u || http_cfg.fetch_board_rev == 6u)) {
         machine_identity_set_board_rev(http_cfg.fetch_board_rev);
     }
     if (!http_cfg.http_enabled) {
-        wifi_shutdown("http=0");
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 http=0");
         return;
     }
-    if (loaded) load_cached_web_assets();
+    load_cached_web_assets();
     if (!http_cfg.wifi_ssid[0]) {
-        wifi_shutdown("ssid=missing");
+        snprintf(http_status_buf, sizeof http_status_buf, "wifi=disabled hardware=cyw43 ssid=missing");
         return;
     }
 
@@ -6053,7 +5510,6 @@ void remote_http_init(void)
 void remote_http_poll(void)
 {
     remote_log_wifi_change();
-    if (http_is_active) http_park_service();
     absolute_time_t now = get_absolute_time();
     if (wifi_probe_retry_scheduled && absolute_time_diff_us(now, wifi_probe_retry_at) <= 0) {
         wifi_probe_retry_scheduled = false;
@@ -6144,20 +5600,6 @@ bool remote_http_firmware_update(char *err, size_t err_len)
     if (err && err_len) snprintf(err, err_len, "OTA firmware updates require M65_BOOTLOADER_APP");
     return false;
 }
-void remote_http_firmware_reboot(uint32_t delay_ms) { (void)delay_ms; }
 #endif
-
-bool remote_http_verify_firmware_package(const char *path, char *err, size_t err_len)
-{
-    // Mirror packages carry a signed trailer, kept on SD so it can be checked
-    // again here. A trailer that is present must verify; an unsigned package
-    // is accepted only when the config does not require signatures.
-    if (!signed_file_verify_stored(&http_cfg, path, M65_SIGNED_FILE_FIRMWARE,
-                                   http_cfg.require_signatures)) {
-        if (err && err_len) snprintf(err, err_len, "firmware signature check failed: %s", signed_file_last_error());
-        return false;
-    }
-    return true;
-}
 
 #endif
