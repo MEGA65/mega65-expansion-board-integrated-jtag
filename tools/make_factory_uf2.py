@@ -78,6 +78,13 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"app offset 0x{args.app_offset:x} overlaps bootloader length 0x{len(bootloader):x}"
         )
+    # The last sector before the app holds the OTA install record
+    # (include/ota_record.h); the bootloader must stay clear of it.
+    record_offset = args.app_offset - 4096
+    if len(bootloader) > record_offset:
+        raise SystemExit(
+            f"bootloader is {len(bootloader)} bytes and would overlap the OTA record sector at 0x{record_offset:x}"
+        )
 
     # Keep this UF2 contiguous from flash base through the app. The RP2040 ROM
     # UF2 loader should handle sparse address ranges, but contiguous blocks are

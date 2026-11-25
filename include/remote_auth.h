@@ -58,6 +58,8 @@ typedef struct {
 
 void remote_auth_reset(remote_auth_config_t *cfg);
 bool remote_auth_load(remote_auth_config_t *cfg, char *err, size_t err_len);
+// True if the mounted card has a remote config file (current or legacy name).
+bool remote_auth_config_present(void);
 bool remote_auth_allowed(const remote_auth_config_t *cfg, uint32_t remote_ip, remote_auth_perm_t perm);
 bool remote_auth_parse_ipv4(const char *s, uint32_t *ip_out);
 void remote_auth_format_ipv4(uint32_t ip, char *buf, size_t buflen);

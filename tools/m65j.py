@@ -73,6 +73,19 @@ CORE_FILE_EXTS = (".bit", ".cor", ".core", ".m65j")
 COR_MAGIC = b"MEGA65BITSTREAM0"
 PUBLIC_FIRMWARE_FILENAME = "mega65-pico-jtag.uf2"
 OTA_FIRMWARE_FILENAME = "mega65-integrated-jtag-firmware.uf2"
+# Universal (Pico W + Pico 2 W) firmware. Its manifest row starts with "#+",
+# which firmware from before universal UF2s skips as a comment; that firmware
+# keeps using the single-chip OTA_FIRMWARE_FILENAME row. The package is signed
+# for OTA_FIRMWARE_FILENAME because that is where the board stores it.
+PUBLIC_UNIVERSAL_FIRMWARE_FILENAME = "mega65-pico-jtag-universal.uf2"
+OTA_UNIVERSAL_FIRMWARE_FILENAME = "mega65-integrated-jtag-firmware-universal.uf2"
+MANIFEST_EXTENDED_PREFIX = "#+ "
+UF2_FAMILY_NAMES = {
+    0xE48BFF56: "RP2040",
+    0xE48BFF59: "RP2350-ARM-S",
+    0xE48BFF5A: "RP2350-RISCV",
+    0xE48BFF5B: "RP2350-ARM-NS",
+}
 SDCARD_BOOTSTRAP_FILENAME = "sdcard-files.zip"
 SDCARD_BOOTSTRAP_ALL_CORES_FILENAME = "sdcard-files-all-cores.zip"
 
@@ -1188,6 +1201,30 @@ class ManifestArtifact:
     version: str = ""
     build: str = ""
     name: str = ""
+    universal: bool = False   # universal firmware: written as a "#+" manifest row
+    sign_name: str = ""       # filename bound into the signature, if not path.name
+
+
+def uf2_chip_families(path: Path) -> set[int]:
+    """Chip families a UF2 file carries (ignoring the RP2350 errata block)."""
+    import struct
+    data = strip_signature_trailer(path.read_bytes())
+    if not data or len(data) % 512:
+        raise SystemExit(f"firmware artifact is not a UF2 file: {path}")
+    families: set[int] = set()
+    for off in range(0, len(data), 512):
+        m0, m1, flags = struct.unpack_from("<3I", data, off)
+        (family,) = struct.unpack_from("<I", data, off + 28)
+        if (m0, m1) != (0x0A324655, 0x9E5D5157):
+            raise SystemExit(f"firmware artifact has a bad UF2 block at {off // 512}: {path}")
+        if flags & 0x1 or not flags & 0x2000 or family == 0xE48BFF57:
+            continue
+        families.add(family)
+    return families
+
+
+def family_names(families: set[int]) -> str:
+    return ", ".join(sorted(UF2_FAMILY_NAMES.get(f, hex(f)) for f in families)) or "none"
 
 
 def core_file_paths(root: Path) -> list[Path]:
@@ -1855,14 +1892,14 @@ def extract_board_core(archive: Path, out_dir: Path, title: str, board: str, ove
     return dest, f"{'updated' if existed_before else 'extracted'} {member_name}{detail}"
 
 
-def bless_core(path, board, args):
+def bless_core(path, board, args, sign_name=None):
     board_id = "6" if board == "r6" else "3" if board == "r3" else "0"
     cmd = [
         "--bless",
         "--board",
         board_id,
         "--name",
-        Path(path).name,
+        sign_name or Path(path).name,
         "-o",
         str(path),
     ]
@@ -1931,6 +1968,22 @@ def copy_public_firmware(src: str | None, dest: Path, overwrite: bool) -> Path |
 
 def stage_manifest_artifacts(out_dir: Path, args: argparse.Namespace, boards: list[str]) -> list[ManifestArtifact]:
     artifacts: list[ManifestArtifact] = []
+    # The single-chip row is what firmware from before universal UF2s installs,
+    # and its updater ignores chip families: a multi-chip file there would be
+    # written into its update slot twice over. Refuse that here.
+    if args.firmware:
+        families = uf2_chip_families(Path(args.firmware))
+        if len(families) != 1:
+            raise SystemExit(
+                f"--firmware must be a single-chip factory UF2 (older boards install it); "
+                f"{args.firmware} has: {family_names(families)}. Use --firmware-universal for universal UF2s.")
+    universal_src = getattr(args, "firmware_universal", None)
+    if universal_src:
+        families = uf2_chip_families(Path(universal_src))
+        if len(families) < 2:
+            raise SystemExit(
+                f"--firmware-universal expects a UF2 for more than one chip (make universal); "
+                f"{universal_src} has: {family_names(families)}")
     copy_public_firmware(
         args.firmware,
         out_dir / PUBLIC_FIRMWARE_FILENAME,
@@ -1948,6 +2001,27 @@ def stage_manifest_artifacts(out_dir: Path, args: argparse.Namespace, boards: li
             rel=firmware.relative_to(out_dir).as_posix(),
             version=args.firmware_version or "",
             build=args.firmware_build or "",
+        ))
+
+    if universal_src:
+        copy_public_firmware(
+            universal_src,
+            out_dir / PUBLIC_UNIVERSAL_FIRMWARE_FILENAME,
+            args.overwrite,
+        )
+        universal = copy_artifact(
+            universal_src,
+            out_dir / OTA_UNIVERSAL_FIRMWARE_FILENAME,
+            args.overwrite,
+        )
+        artifacts.append(ManifestArtifact(
+            kind="firmware",
+            path=universal,
+            rel=universal.relative_to(out_dir).as_posix(),
+            version=getattr(args, "firmware_universal_version", "") or args.firmware_version or "",
+            build=getattr(args, "firmware_universal_build", "") or "",
+            universal=True,
+            sign_name=OTA_FIRMWARE_FILENAME,
         ))
 
     themes = args.theme or []
@@ -1977,7 +2051,10 @@ def stage_manifest_artifacts(out_dir: Path, args: argparse.Namespace, boards: li
         board_for_signature = boards[0] if boards else "r6"
         for artifact in artifacts:
             print(f"Blessing {artifact.kind}: {artifact.path}", flush=True)
-            status = bless_core(artifact.path, board_for_signature, args)
+            if artifact.sign_name:
+                status = bless_core(artifact.path, board_for_signature, args, sign_name=artifact.sign_name)
+            else:
+                status = bless_core(artifact.path, board_for_signature, args)
             print(f"BLESS {artifact.path}: {status}")
     return artifacts
 
@@ -2019,13 +2096,14 @@ def write_hash_file(out_dir: Path,
         body_lines.append(manifest_row_for_path(out_dir, path, "core", rel))
 
     for artifact in artifacts or []:
-        body_lines.append(manifest_row_for_path(
+        row = manifest_row_for_path(
             out_dir,
             artifact.path,
             artifact.kind,
             artifact.rel,
             artifact_attrs(artifact),
-        ))
+        )
+        body_lines.append(MANIFEST_EXTENDED_PREFIX + row if artifact.universal else row)
     aggregate = hashlib.sha256("".join(body_lines).encode("utf-8")).hexdigest()
 
     dest = Path(hash_file)
@@ -2040,6 +2118,7 @@ def write_hash_file(out_dir: Path,
         f.write("# format: <type> <payload-sha256> <transfer-sha256>  <relative-filename> [key=value...]\n")
         f.write("# payload-sha256 hashes the SD-stored file after signature stripping\n")
         f.write("# transfer-sha256 hashes the exact HTTP object, including any signature trailer\n")
+        f.write("# '#+' rows are for newer firmware only; older firmware skips them as comments\n")
         for line in body_lines:
             f.write(line)
     return dest
@@ -2245,7 +2324,9 @@ def write_mirror_index(out_dir: Path,
     for artifact in artifacts:
         rel = artifact.path.relative_to(out_dir).as_posix()
         label = artifact.kind
-        if artifact.kind == "firmware":
+        if artifact.kind == "firmware" and artifact.universal:
+            label = "signed OTA firmware package, Pico W + Pico 2 W (newer firmware)"
+        elif artifact.kind == "firmware":
             label = "signed OTA firmware package"
         elif artifact.kind == "theme":
             label = f"theme: {artifact.name or artifact.path.stem}"
@@ -2260,6 +2341,9 @@ def write_mirror_index(out_dir: Path,
     logo_html = f'<img class="logo" src="{link_href("WWW/mega65_320x64.png")}" alt="MEGA65">' if logo.exists() else "<h1>MEGA65</h1>"
     fw_link = (f'<a class="download" href="{link_href(PUBLIC_FIRMWARE_FILENAME)}">Download {html.escape(PUBLIC_FIRMWARE_FILENAME)}</a>'
                if public_fw.exists() else '<span class="empty">No plain UF2 firmware image was staged.</span>')
+    if (out_dir / PUBLIC_UNIVERSAL_FIRMWARE_FILENAME).exists():
+        fw_link += (f' <a class="download" href="{link_href(PUBLIC_UNIVERSAL_FIRMWARE_FILENAME)}">'
+                    f'Download {html.escape(PUBLIC_UNIVERSAL_FIRMWARE_FILENAME)} (Pico W + Pico 2 W)</a>')
     cfg_line = (f'<a href="{link_href("mega65-jtag.cfg.example")}">mega65-jtag.cfg.example</a>'
                 if cfg_example.exists() else '<code>mega65-jtag.cfg</code> from the firmware repository')
     starter_zip = out_dir / SDCARD_BOOTSTRAP_FILENAME
@@ -2473,6 +2557,10 @@ def latest_main(argv: list[str]) -> int:
     ap.add_argument("--firmware", help="signed or unsigned firmware artifact to publish under the fixed OTA filename")
     ap.add_argument("--firmware-version", default="", help="firmware version label to advertise in the manifest")
     ap.add_argument("--firmware-build", default="", help="firmware build marker to advertise in the manifest")
+    ap.add_argument("--firmware-universal",
+                    help="universal (multi-chip) firmware UF2 to publish for newer firmware; see make universal")
+    ap.add_argument("--firmware-universal-version", default="", help="version label for the universal firmware")
+    ap.add_argument("--firmware-universal-build", default="", help="build marker for the universal firmware")
     ap.add_argument("--theme", action="append", default=[],
                     help="uncompressed tar theme package to publish under THEMES/; repeatable")
     ap.add_argument("--theme-name", default="theme", help="theme display name to advertise in the manifest")
@@ -2688,6 +2776,10 @@ def add_mirror_options(ap, populate=False):
     ap.add_argument("--firmware", help="firmware UF2/bin package to publish under the fixed OTA filename")
     ap.add_argument("--firmware-version", default="", help="firmware version label for the mirror manifest")
     ap.add_argument("--firmware-build", default="", help="firmware build marker for the mirror manifest")
+    ap.add_argument("--firmware-universal",
+                    help="universal (Pico W + Pico 2 W) firmware UF2 for newer firmware; see make universal")
+    ap.add_argument("--firmware-universal-version", default="", help="version label for the universal firmware")
+    ap.add_argument("--firmware-universal-build", default="", help="build marker for the universal firmware")
     ap.add_argument("--theme", action="append", default=[],
                     help="uncompressed tar theme package to publish under THEMES/; repeatable")
     ap.add_argument("--theme-name", default="theme", help="theme display name for the mirror manifest")

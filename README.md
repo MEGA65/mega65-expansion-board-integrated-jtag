@@ -82,6 +82,14 @@ build-wifi/mega65-pico-jtag-factory.uf2
 contains a small resident RP2040 bootloader plus the same firmware linked into
 slot 0 at flash offset `0x10000`; this is the image to install on a fresh Pico.
 
+`make universal` builds the factory image for both the Pico W (RP2040) and the
+Pico 2 W (RP2350), stamped with one build marker, and combines them into
+`build-universal/mega65-pico-jtag-universal.uf2`. UF2 blocks carry a chip
+family ID, so each chip uses only its own half: the OTA updater skips the other
+chip's blocks. Each chip's USB (BOOTSEL) loader is expected to do the same, but
+check a BOOTSEL install of the universal file on both boards before relying on
+it; the single-chip factory UF2s remain the known-good USB install.
+
 The firmware build marker is generated at configure time as
 `YYYY-MM-DD-<minutes-since-midnight>-<git-commitish>` and is reported by
 `ATI`, `AT+VERSION?`, and the web UI.
@@ -428,6 +436,16 @@ The mirror root also contains `mega65-pico-jtag.uf2` for initial BOOTSEL
 installs; `make mirror` publishes the factory UF2 at that filename so fresh
 Picos get the resident bootloader. The signed OTA artifact remains
 `mega65-integrated-jtag-firmware.uf2`.
+
+`make mirror` also runs `make universal` and publishes the result for newer
+firmware: `mega65-integrated-jtag-firmware-universal.uf2` (signed, for OTA)
+and `mega65-pico-jtag-universal.uf2` (plain, for BOOTSEL). Its manifest row
+starts with `#+`, which older firmware skips as a comment, so older boards keep
+installing the single-chip package from `MIRROR_FIRMWARE`; firmware that knows
+`#+` rows takes the universal package instead and ignores the single-chip row.
+The mirror tool refuses a multi-chip UF2 as `MIRROR_FIRMWARE`, because older
+firmware would write both images into its update slot. Set
+`MIRROR_FIRMWARE_UNIVERSAL=` (empty) to publish only the single-chip package.
 It also writes `sdcard-files.zip` with the SD-card config, `WWW/`, and
 `THEMES/`. For each mirrored board revision it writes
 `sdcard-files-r3-cores.zip` and/or `sdcard-files-r6-cores.zip` with those files,
@@ -469,6 +487,14 @@ and signed manifests to the board SD card over HTTP.
 Fetched theme packages are stored under `THEMES/`. In the device web UI,
 `THEMES/` is shown as a normal directory; clicking a `.m65jtheme` or `.tar`
 package verifies it and installs it into `WWW/`, subject to the write grant.
+
+The firmware also carries a built-in copy of the default `sdcard/WWW/` files,
+embedded at build time by `tools/embed_www.py`. Any `WWW/` file missing from
+the card (or a missing card) is served from that copy, so the full web
+interface (upload, drag and drop, folders) works on a blank card; files on the
+card, such as an installed theme, take precedence. `DOWNLOADS/`, `WWW/` and
+`THEMES/` are hidden from the MEGA65-side core list (`AT+CORELIST`), and
+`DOWNLOADS/` and `WWW/` from the web root listing.
 
 `check` prints `[blessed]`, `[uncursed]`, or `[cursed]` for local files. A
 blessed file has a valid trailer according to the local keys, `--trusted-key`,
@@ -529,7 +555,7 @@ AT+FETCHSTATUS?                    show mirror fetch status
 AT+FETCHNOW[=3|6|remote]           start mirror fetch immediately
 AT+FETCHBOARD=3|6|remote           select autofetch board manifest
 AT+FWSTATUS?                       show staged firmware package status
-AT+FWUPDATE                        install staged verified firmware package
+AT+FWUPDATE                        install staged firmware package (USB + write enable)
 AT+THEMESTATUS?                    show staged WWW theme package status
 AT+THEMEINSTALL                    install staged verified WWW theme package
 AT+MACHINE[=name]                  show/set discovery machine name
@@ -546,11 +572,39 @@ When signatures are required, unsigned or badly signed uploads/fetches are
 deleted instead of being committed. `PUT /jtag` spools signed transfers to SD,
 verifies them, and only then programs JTAG.
 
-Factory installs include a small resident RP2040 bootloader and run the firmware
-from slot 0 at flash offset `0x10000`. OTA firmware package discovery and
-signature-checked staging are implemented, but the flash apply/reboot hook is
-still a follow-up step. Until that is linked, `AT+FWUPDATE` and
-`/firmware/update` verify the staged package and then report that the apply hook
-is not installed. The current recovery path remains the Pico BOOTSEL flow:
-connect USB, press the BOOTSEL button, and copy `mega65-pico-jtag-factory.uf2`
+### Firmware updates
+
+Factory installs include a small resident bootloader and run the firmware from
+slot 0 at flash offset `0x10000`. Updates are installed from
+`DOWNLOADS/mega65-integrated-jtag-firmware.uf2`, which the mirror fetch
+downloads and hash-checks. Start an install with the web page's **Update and
+reboot** button (`PUT /firmware/update`, needs the write grant) or with
+`AT+FWUPDATE` (USB only, with the write-enable input asserted).
+
+Before anything is written, the package's signed trailer is verified (mirror
+packages keep it on SD for this; an unsigned package is accepted only when
+`require_signatures=0`), then the whole UF2 file is checked: every block present
+and in order, built for this chip (RP2040 or RP2350), inside the update slot,
+and starting with a valid vector table, so a plain (non-factory) build is
+refused. The image is then written to slot 1 (offset `0x100000`), read back and
+CRC-checked, and an install record is written to the last sector before slot 0
+(`0xF000`). Any failure is reported and leaves the running firmware untouched.
+
+On restart the bootloader checks slot 1 against the record before erasing
+anything, copies it to slot 0, verifies the copy, and only then clears the
+record. If power is lost part way, the record survives and the copy runs again
+on the next boot. Bootloaders from before this change install the update too,
+but without that protection; reinstalling the factory UF2 over USB once gets
+the new bootloader (OTA updates never rewrite the bootloader itself).
+
+A universal UF2 (see `make universal`) works as an update package on either
+board. Do not give one to a board still running firmware from before these
+checks: its updater ignored chip families and would write both images into the
+slot.
+
+`tests/ota/run.sh` exercises the checks and cuts the power at every flash
+operation of both the staging and the install, on host, for both chips.
+
+If a Pico still ends up without working firmware, recovery is the BOOTSEL flow:
+connect USB, hold the BOOTSEL button, and copy `mega65-pico-jtag-factory.uf2`
 or the mirror's `mega65-pico-jtag.uf2` factory download.

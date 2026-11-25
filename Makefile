@@ -13,6 +13,10 @@ PROJECT          ?= mega65-pico-jtag
 CMAKE_TARGET     ?= pico_m65jtag
 BUILD_DIR        ?= build-wifi
 FACTORY_BUILD_DIR ?= $(BUILD_DIR)-factory
+UNIVERSAL_DIR    ?= build-universal
+# Normally empty: each configure stamps its own build time. `make universal`
+# sets it so both halves of the universal UF2 carry the same build marker.
+M65_BUILD_TIME_OVERRIDE ?=
 DEPS_DIR         ?= .deps
 PICO_BOARD       ?= pico_w
 PICO_SDK_PATH    ?= $(CURDIR)/$(DEPS_DIR)/pico-sdk
@@ -28,6 +32,11 @@ MIRROR_BOARD ?= all
 MIRROR_SOURCE_URL ?= https://files.mega65.org
 MIRROR_EXTRA_CORES ?= $(wildcard extra_cores)
 MIRROR_FIRMWARE ?= $(FACTORY_UF2)
+# Universal (Pico W + Pico 2 W) package for newer firmware, published alongside
+# the single-chip MIRROR_FIRMWARE that older firmware keeps using. Set it empty
+# to publish only the single-chip package.
+MIRROR_FIRMWARE_UNIVERSAL ?= $(UNIVERSAL_DIR)/$(PROJECT)-universal.uf2
+MIRROR_UNIVERSAL_MARKER_FILE ?= $(UNIVERSAL_DIR)/rp2040-factory/generated/generated_version.h
 MIRROR_THEME ?= $(MIRROR_DIR)/THEMES/mega65-jtag-default-theme.m65jtheme
 MIRROR_THEME_NAME ?= default
 MIRROR_EXTRA_THEMES ?=
@@ -72,6 +81,7 @@ CMAKE_FATFS_ARGS := -DM65_USE_FATFS=OFF
 CONFIGURE_DEPS := sdk
 endif
 
+CMAKE_BUILD_TIME_ARGS := -DM65_BUILD_TIME_OVERRIDE=$(M65_BUILD_TIME_OVERRIDE)
 CMAKE_REMOTE_ARGS := -DM65_ENABLE_WIFI_REMOTE=$(if $(filter 1 ON on true TRUE yes YES,$(ENABLE_WIFI_REMOTE)),ON,OFF)
 CMAKE_SD_MODE_ARGS := $(if $(strip $(M65_SD_MODE)),-DM65_SD_MODE=$(M65_SD_MODE),)
 CMAKE_PICOTOOL_ARGS := $(if $(strip $(PICOTOOL_FETCH_FROM_GIT_PATH)),-DPICOTOOL_FETCH_FROM_GIT_PATH=$(PICOTOOL_FETCH_FROM_GIT_PATH),)
@@ -97,7 +107,7 @@ endef
 
 .PHONY: all help deps check-tools sdk fatfs configure configure-factory build build-bare factory nofatfs clean distclean nuke \
         upload flash upload-picotool upload-uf2 picotool print-config terminal \
-        mirror mirror-setup \
+        mirror mirror-setup universal \
         wifi-probe wifi-probe-lwip wifi-probe-bg wifi-probe-manual wifi-probe-manual-bg upload-wifi-probe
 
 all: build
@@ -109,6 +119,7 @@ help:
 	@echo "  make deps              Install Ubuntu/Debian build dependencies with apt"
 	@echo "  make                   Clone SDK/FatFs if needed, build bare and factory UF2s"
 	@echo "  make factory           Build resident-bootloader factory UF2"
+	@echo "  make universal         Build one factory UF2 for both Pico W and Pico 2 W"
 	@echo "  make flash             Flash the factory UF2; alias for make upload"
 	@echo "  make upload            Try picotool first, then factory UF2 mass-storage copy"
 	@echo "  make upload-uf2        Copy factory UF2 to mounted RPI-RP2/RP2350 BOOTSEL drive"
@@ -143,6 +154,7 @@ help:
 	@echo "  MIRROR_SOURCE_URL=...  Source catalogue URL for make mirror"
 	@echo "  MIRROR_EXTRA_CORES=... Extra local .bit/.cor/.m65j files/dirs; default extra_cores/ if present"
 	@echo "  MIRROR_FIRMWARE=...    Firmware image staged into mirror; default factory UF2"
+	@echo "  MIRROR_FIRMWARE_UNIVERSAL=...  Universal firmware for newer boards; default make universal output, empty = none"
 	@echo "  MIRROR_EXTRA_THEMES=... Extra local .m65jtheme/.tar files to publish under THEMES/"
 	@echo "  PICO_MOUNT=...         Mount point for upload-uf2, if autodetect fails"
 	@echo "  PICO_BOARD=...         Set to pico2_w to support that board"
@@ -203,6 +215,7 @@ configure: $(CONFIGURE_DEPS)
 		$(CMAKE_REMOTE_ARGS) \
 		$(CMAKE_SD_MODE_ARGS) \
 		$(CMAKE_BOOT_DIAG_ARGS) \
+		$(CMAKE_BUILD_TIME_ARGS) \
 		$(CMAKE_PICOTOOL_ARGS)
 
 build: build-bare factory
@@ -224,6 +237,7 @@ configure-factory: $(CONFIGURE_DEPS)
 		$(CMAKE_REMOTE_ARGS) \
 		$(CMAKE_SD_MODE_ARGS) \
 		$(CMAKE_FACTORY_BOOT_DIAG_ARGS) \
+		$(CMAKE_BUILD_TIME_ARGS) \
 		$(CMAKE_PICOTOOL_ARGS) \
 		-DM65_BOOTLOADER_APP=ON \
 		-DM65_BUILD_FACTORY_BOOTLOADER=ON \
@@ -242,17 +256,43 @@ factory: configure-factory
 	@echo
 	@echo "Built: $(FACTORY_UF2)"
 
-mirror: factory
+# One UF2 for both the Pico W (RP2040) and Pico 2 W (RP2350): both factory
+# builds, stamped with one build marker, combined. Each chip's USB bootloader
+# and the OTA updater use only the blocks for their own chip.
+UNIVERSAL_UF2 := $(UNIVERSAL_DIR)/$(PROJECT)-universal.uf2
+UNIVERSAL_MARKER = sed -n 's/^\#define M65_BUILD_MARKER "\(.*\)"/\1/p'
+universal: $(CONFIGURE_DEPS)
+	@set -e; \
+	stamp="$$(date +%Y-%m-%d)-$$((10#$$(date +%H)*60 + 10#$$(date +%M)))"; \
+	$(MAKE) --no-print-directory PICO_BOARD=pico_w  BUILD_DIR="$(UNIVERSAL_DIR)/rp2040" M65_BUILD_TIME_OVERRIDE="$$stamp" factory; \
+	$(MAKE) --no-print-directory PICO_BOARD=pico2_w BUILD_DIR="$(UNIVERSAL_DIR)/rp2350" M65_BUILD_TIME_OVERRIDE="$$stamp" factory; \
+	marker="$$($(UNIVERSAL_MARKER) "$(UNIVERSAL_DIR)/rp2040-factory/generated/generated_version.h")"; \
+	marker2="$$($(UNIVERSAL_MARKER) "$(UNIVERSAL_DIR)/rp2350-factory/generated/generated_version.h")"; \
+	if [ -z "$$marker" ] || [ "$$marker" != "$$marker2" ]; then \
+		echo "ERROR: build markers differ: '$$marker' vs '$$marker2'"; exit 1; \
+	fi; \
+	python3 tools/make_universal_uf2.py --output "$(UNIVERSAL_UF2)" \
+		"$(UNIVERSAL_DIR)/rp2350/$(PROJECT)-factory.uf2" \
+		"$(UNIVERSAL_DIR)/rp2040/$(PROJECT)-factory.uf2"; \
+	echo; \
+	echo "Built: $(UNIVERSAL_UF2)"; \
+	echo "Build marker: $$marker"
+
+mirror: factory $(if $(filter $(UNIVERSAL_UF2),$(MIRROR_FIRMWARE_UNIVERSAL)),universal)
 	@set -e; \
 	mkdir -p "$(MIRROR_DIR)"; \
 	mkdir -p "$(MIRROR_DIR)/WWW" "$(dir $(MIRROR_THEME))"; \
 	echo "Copying default SD web assets into $(MIRROR_DIR)/WWW"; \
 	for asset in $(WWW_THEME_FILES); do \
-		cp "sdcard/WWW/$$asset" "$(MIRROR_DIR)/WWW/$$asset"; \
+		if [ -f "sdcard/WWW/$$asset" ]; then \
+			cp "sdcard/WWW/$$asset" "$(MIRROR_DIR)/WWW/$$asset"; \
+		else \
+			echo "WARNING: sdcard/WWW/$$asset not found; leaving it out of the mirror"; \
+		fi; \
 	done; \
 	cp sdcard/mega65-jtag.cfg "$(MIRROR_DIR)/mega65-jtag.cfg.example"; \
 	echo "Packing default WWW theme: $(MIRROR_THEME)"; \
-	tar -cf "$(MIRROR_THEME)" -C sdcard/WWW $(WWW_THEME_FILES); \
+	tar -cf "$(MIRROR_THEME)" -C sdcard/WWW $(notdir $(wildcard $(addprefix sdcard/WWW/,$(WWW_THEME_FILES)))); \
 	build_marker="$$(sed -n 's/^#define M65_BUILD_MARKER "\(.*\)"/\1/p' "$(MIRROR_BUILD_MARKER_FILE)")"; \
 	if [ -z "$$build_marker" ]; then \
 		echo "ERROR: could not read M65_BUILD_MARKER from $(MIRROR_BUILD_MARKER_FILE)"; \
@@ -265,6 +305,18 @@ mirror: factory
 		for extra in $$extra_items; do \
 			extra_args+=(--extra-core "$$extra"); \
 		done; \
+	fi; \
+	universal_args=(); \
+	if [ -n "$(strip $(MIRROR_FIRMWARE_UNIVERSAL))" ]; then \
+		universal_marker="$$(sed -n 's/^#define M65_BUILD_MARKER "\(.*\)"/\1/p' "$(MIRROR_UNIVERSAL_MARKER_FILE)")"; \
+		if [ -z "$$universal_marker" ]; then \
+			echo "ERROR: could not read M65_BUILD_MARKER from $(MIRROR_UNIVERSAL_MARKER_FILE)"; \
+			exit 1; \
+		fi; \
+		echo "Staging universal firmware image: $(MIRROR_FIRMWARE_UNIVERSAL) (build $$universal_marker)"; \
+		universal_args=(--firmware-universal "$(MIRROR_FIRMWARE_UNIVERSAL)" \
+			--firmware-universal-version "$(MIRROR_VERSION)" \
+			--firmware-universal-build "$$universal_marker"); \
 	fi; \
 	theme_args=(); \
 	theme_items="$(strip $(MIRROR_EXTRA_THEMES))"; \
@@ -284,6 +336,7 @@ mirror: factory
 		--firmware "$(MIRROR_FIRMWARE)" \
 		--firmware-version "$(MIRROR_VERSION)" \
 		--firmware-build "$$build_marker" \
+		"$${universal_args[@]}" \
 		--theme "$(MIRROR_THEME)" \
 		--theme-name "$(MIRROR_THEME_NAME)" \
 		--theme-version "$$build_marker" \

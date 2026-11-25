@@ -19,6 +19,7 @@
 #include "remote_auth.h"
 #include "remote_http.h"
 #include "write_gate.h"
+#include "pico/rand.h"
 
 #ifndef M65_WRITE_ENABLE_PIN
 #define M65_WRITE_ENABLE_PIN 255u
@@ -43,7 +44,6 @@
 #endif
 
 #define AT_SETTINGS_PATH "AT_SETTINGS.cfg"
-static bool sd_mounted = false;
 static remote_auth_config_t remote_cfg;
 
 typedef enum {
@@ -75,6 +75,7 @@ static bool make_child_path(const char *dir, const char *name, char *out, size_t
 
 static char core_list_last_dir[256] = "/";
 static bool core_list_last_dir_valid;
+static uint32_t core_list_media_gen;  // card the numbered list was made from
 
 static list_state_t list_state;
 static int16_t list_bytes_returned;
@@ -138,27 +139,16 @@ static void usb_reconnect_poll(void)
 
 static bool ensure_mount(void)
 {
-    if (sd_mounted || storage_is_mounted()) {
-        sd_mounted = true;
-        return true;
-    }
     if (!storage_mount()) {
         uart_cmd_printf("ERR SD %s\n", storage_last_error());
         return false;
     }
-    sd_mounted = true;
     return true;
 }
 
 static bool ensure_mount_quiet(void)
 {
-    if (sd_mounted || storage_is_mounted()) {
-        sd_mounted = true;
-        return true;
-    }
-    if (!storage_mount()) return false;
-    sd_mounted = true;
-    return true;
+    return storage_mount();
 }
 
 static void uart_quoted(const char *s)
@@ -201,11 +191,26 @@ static void core_list_context_commit(const char *dir)
     if (!dir || !dir[0]) dir = "/";
     snprintf(core_list_last_dir, sizeof core_list_last_dir, "%s", dir);
     core_list_last_dir_valid = true;
+    core_list_media_gen = storage_media_generation();
+}
+
+// The firmware's own folders at the root hold no cores. Every UART listing
+// that numbers entries (AT+CORELIST, AT+COREDETAIL, the numbered-load
+// resolver, BASIC mode) skips them through this one rule *before* counting,
+// so AT+JTAGLOAD=n always means the same entry the list showed as n.
+static bool ci_equal(const char *a, const char *b);
+
+static bool uart_list_hidden(const char *dir, const char *name, bool is_dir)
+{
+    if (!is_dir || !name) return false;
+    if (dir && dir[0] && strcmp(dir, "/") != 0) return false;   // root only
+    return ci_equal(name, "DOWNLOADS") || ci_equal(name, "WWW") || ci_equal(name, M65_THEME_DIR_PATH);
 }
 
 static bool list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     numbered_list_ctx_t *lc = (numbered_list_ctx_t *)ctx;
+    if (uart_list_hidden(lc ? lc->dir : "/", name, is_dir)) return true;
     uint16_t number = lc ? lc->next_number++ : 0;
     char path[256];
     char modified_text[24];
@@ -643,8 +648,13 @@ static void at_settings_load(void)
 static void sd_backed_config_reload(bool announce)
 {
     if (!ensure_mount_quiet()) return;
+    char old_name[M65_MACHINE_NAME_MAX + 1u];
+    snprintf(old_name, sizeof old_name, "%s", machine_identity_name());
     at_settings_load();
-    if (machine_identity_name()[0]) usb_reconnect_schedule();
+    // Re-enumerate USB only if the advertised name actually changed.
+    if (machine_identity_name()[0] && strcmp(old_name, machine_identity_name()) != 0) {
+        usb_reconnect_schedule();
+    }
     remote_http_init();
     sd_config_loaded = true;
 
@@ -658,9 +668,29 @@ static void sd_backed_config_reload(bool announce)
     }
 }
 
+static void sd_card_removed(void)
+{
+    // Config already loaded from the card stays in RAM, so Wi-Fi and the
+    // remote interface keep running; it is reloaded when a card returns.
+    sd_config_loaded = false;
+    remote_http_sd_removed();
+    if (remote_http_verbose() > 0u) {
+        uart_cmd_log_puts_best_effort("+SDCARD: removed\r\n");
+    }
+}
+
 static void sd_hotplug_poll(void)
 {
+    storage_sd_event_t ev = storage_sd_hotplug_poll();
+    if (ev == STORAGE_SD_EVENT_REMOVED) {
+        sd_card_removed();
+        sd_hotplug_poll_at = get_absolute_time();  // a new card may already be in
+    } else if (ev == STORAGE_SD_EVENT_INSERTED) {
+        sd_hotplug_poll_at = get_absolute_time();  // try to mount right away
+    }
+
     if (!remote_init_done || sd_config_loaded) return;
+    if (!storage_sd_card_present()) return;
 
     absolute_time_t now = get_absolute_time();
     if (absolute_time_diff_us(now, sd_hotplug_poll_at) > 0) return;
@@ -751,6 +781,7 @@ static sdcard_state_t sdcard_state(void)
     if (storage_is_mounted()) {
         return SDCARD_STATE_ACTIVE;
     }
+    if (!storage_sd_card_present()) return SDCARD_STATE_NOT_PRESENT;
     return storage_sd_may_mount() ? SDCARD_STATE_PRESENT : SDCARD_STATE_NOT_PRESENT;
 }
 
@@ -957,11 +988,13 @@ static void cmd_sd_transport(char *arg)
 static void cmd_sdcard(void)
 {
     sdcard_state_t state = sdcard_state();
-    uart_cmd_printf("+SDCARD: state=%s mounted=%lu config_loaded=%lu transport=%s\r\n",
+    uart_cmd_printf("+SDCARD: state=%s mounted=%lu config_loaded=%lu transport=%s gen=%lu boot=%08lx\r\n",
                     sdcard_state_token(state),
                     (unsigned long)(storage_is_mounted() ? 1u : 0u),
                     (unsigned long)(sd_config_loaded ? 1u : 0u),
-                    storage_sd_transport_name());
+                    storage_sd_transport_name(),
+                    (unsigned long)storage_media_generation(),
+                    (unsigned long)m65_boot_id());
     at_ok();
 }
 
@@ -1166,6 +1199,9 @@ static void cmd_firmware_status(void)
 
 static void cmd_firmware_update(void)
 {
+    // Same rule as the other write commands: USB only, with the physical
+    // write-enable asserted, so the MEGA65-side UART cannot replace firmware
+    if (!require_write_authority("FWUPDATE")) return;
     if (remote_http_autofetch_running()) {
         at_error("BUSY FETCHING");
         return;
@@ -1175,7 +1211,9 @@ static void cmd_firmware_update(void)
         at_error(err[0] ? err : "FIRMWARE UPDATE FAILED");
         return;
     }
+    uart_cmd_puts("+FWUPDATE: staged and verified; restarting to install\r\n");
     at_ok();
+    remote_http_firmware_reboot(500);
 }
 
 static void cmd_theme_status(void)
@@ -1215,7 +1253,6 @@ static void cmd_authority(void)
 static void cmd_mount(void)
 {
     storage_unmount();
-    sd_mounted = false;
     sd_config_loaded = false;
     if (ensure_mount()) {
         if (remote_init_done) {
@@ -1227,12 +1264,19 @@ static void cmd_mount(void)
     }
 }
 
+// A new AT+CORELIST/AT+COREDETAIL replaces any unfinished chunked listing.
+// Refusing instead ("IN PROGRESS") jammed every later listing whenever a
+// client stopped part way, e.g. a MEGA65 reset mid-list, until the Pico
+// was restarted.
+static void list_reset(void)
+{
+    storage_list_resumable_abort();
+    list_state = lsIdle;
+}
+
 static void cmd_list(char *arg)
 {
-    if (list_state != lsIdle) {
-        uart_cmd_printf("ERR L IN PROGRESS\n");
-        return;
-    }
+    list_reset();
     list_bytes_returned = 0;
 
     if (!ensure_mount()) return;
@@ -1245,9 +1289,10 @@ static void cmd_list(char *arg)
     uart_cmd_printf("OK L %s\n", path);
     core_list_context_clear();
     list_result_t list_result;
-    list_result = storage_list_cores(path, list_cb, &list_ctx, false);
+    list_result = storage_list_cores_resumable(path, list_cb, &list_ctx, false);
     if (lrFailed == list_result) {
         core_list_context_clear();
+        list_reset();
         uart_cmd_printf("ERR L %s\n", storage_last_error());
         return;
     } else if (lrSuccess == list_result) {
@@ -1305,6 +1350,7 @@ static bool send_list_buffer(void) {
 static bool detail_list_cb(const char *name, uint32_t size, bool is_dir, const storage_timestamp_t *modified, void *ctx)
 {
     numbered_list_ctx_t *dl = (numbered_list_ctx_t *)ctx;
+    if (uart_list_hidden(dl ? dl->dir : "/", name, is_dir)) return true;
     unsigned long number = dl ? dl->next_number++ : 0;
     char path[256];
     char qpath[64];
@@ -1376,14 +1422,7 @@ static bool detail_list_cb(const char *name, uint32_t size, bool is_dir, const s
 
 static void cmd_detail_list(char *arg)
 {
-    if (list_state != lsIdle) {
-        if ((list_state == lsDetail) || (list_state == lsDetailBuf)) {
-            uart_cmd_printf("ERR LD IN PROGRESS\n");
-        } else {
-            uart_cmd_printf("ERR L IN PROGRESS\n");
-        }
-        return;
-    }
+    list_reset();
     list_bytes_returned = 0;
 
     if (!ensure_mount()) return;
@@ -1395,9 +1434,10 @@ static void cmd_detail_list(char *arg)
     list_ctx.next_number = 1;
 
     core_list_context_clear();
-    list_result_t list_result = storage_list_cores(path, detail_list_cb, &list_ctx, false);
+    list_result_t list_result = storage_list_cores_resumable(path, detail_list_cb, &list_ctx, false);
     if (lrFailed == list_result) {
         core_list_context_clear();
+        list_reset();
         uart_cmd_printf("ERR LD %s\n", storage_last_error());
         return;
     } else if (lrSuccess == list_result) {
@@ -1423,14 +1463,17 @@ static void cmd_continue_list(char *arg)
             uart_cmd_printf("OK L %s\n", list_ctx.dir);
             if (send_list_buffer()) {
                 list_state = lsListing;
+                list_result = storage_list_cores_resumable(list_ctx.dir, list_cb, &list_ctx, true);
             } else {
+                // The held-over entry still did not fit: send the rest of it
+                // next time, before reading any further entries
                 list_state = lsListingBuf;
+                list_result = lrFull;
             }
-            list_result = storage_list_cores(list_ctx.dir, list_cb, &list_ctx, true);;
             break;
         case lsListing:
             uart_cmd_printf("OK L %s\n", list_ctx.dir);
-            list_result = storage_list_cores(list_ctx.dir, list_cb, &list_ctx, true);
+            list_result = storage_list_cores_resumable(list_ctx.dir, list_cb, &list_ctx, true);
             break;
         case lsDetailBuf:
             uart_cmd_printf("OK LD %s\n", list_ctx.dir);
@@ -1443,12 +1486,14 @@ static void cmd_continue_list(char *arg)
             break;
         case lsDetail:
             uart_cmd_printf("OK LD %s\n", list_ctx.dir);
-            list_result = storage_list_cores(list_ctx.dir, detail_list_cb, &list_ctx, true);
+            list_result = storage_list_cores_resumable(list_ctx.dir, detail_list_cb, &list_ctx, true);
             break;
     }
     if (lrFailed == list_result) {
         core_list_context_clear();
-        if ((list_state == lsDetail) || (list_state == lsDetailBuf)) {
+        bool detail = (list_state == lsDetail) || (list_state == lsDetailBuf);
+        list_reset();
+        if (detail) {
             uart_cmd_printf("ERR LD %s\n", storage_last_error());
         } else {
             uart_cmd_printf("ERR L %s\n", storage_last_error());
@@ -1786,6 +1831,7 @@ static bool numbered_resolve_cb(const char *name, uint32_t size, bool is_dir, co
     (void)modified;
     numbered_resolve_ctx_t *rc = (numbered_resolve_ctx_t *)ctx;
     if (!rc || rc->found) return true;
+    if (uart_list_hidden(rc->dir, name, is_dir)) return true;
 
     uint16_t number = rc->next_number++;
     if (number != rc->target_number) return true;
@@ -1806,6 +1852,12 @@ static bool core_list_resolve_number(uint16_t number, char *path_out, size_t pat
         uart_cmd_puts("ERR P no numbered core list; run AT+CORELIST first\n");
         return false;
     }
+    if (core_list_media_gen != storage_media_generation()) {
+        // Entry N on a different card is a different core: never guess.
+        core_list_context_clear();
+        uart_cmd_puts("ERR P sd card changed; run AT+CORELIST again\n");
+        return false;
+    }
 
     numbered_resolve_ctx_t ctx = {
         .dir = core_list_last_dir,
@@ -1813,7 +1865,7 @@ static bool core_list_resolve_number(uint16_t number, char *path_out, size_t pat
         .next_number = 1,
     };
 
-    if (!storage_list_cores(core_list_last_dir, numbered_resolve_cb, &ctx, false)) {
+    if (!storage_list_cores(core_list_last_dir, numbered_resolve_cb, &ctx)) {
         uart_cmd_printf("ERR P cannot rescan %s: %s\n", core_list_last_dir, storage_last_error());
         return false;
     }
@@ -1881,7 +1933,7 @@ static const char *core_list_resolve_bare_name(const char *name)
         .dir = core_list_last_dir,
         .name = name,
     };
-    if (!storage_list_cores(core_list_last_dir, bare_name_resolve_cb, &ctx, false)) return NULL;
+    if (!storage_list_cores(core_list_last_dir, bare_name_resolve_cb, &ctx)) return NULL;
 
     if (ctx.exact_path[0]) {
         snprintf(resolved_path, sizeof resolved_path, "%s", ctx.exact_path);
@@ -1971,6 +2023,7 @@ static bool basic_list_cb(const char *name, uint32_t size, bool is_dir, const st
 {
     (void)modified;
     basic_list_ctx_t *bl = (basic_list_ctx_t *)ctx;
+    if (uart_list_hidden("/", name, is_dir)) return true;
     if (!is_dir && is_partial_core_path(name)) return true;
     if (!is_dir && bl && (bl->board_rev == 3 || bl->board_rev == 6)) {
         core_file_t cf;
@@ -1996,7 +2049,7 @@ static void basic_load_directory(uint8_t board_rev)
 
     uart_cmd_puts("SEARCHING FOR $\r\nLOADING\r\n");
     basic_list_ctx_t ctx = { .board_rev = board_rev };
-    if (!storage_list_cores("/", basic_list_cb, &ctx, false)) {
+    if (!storage_list_cores("/", basic_list_cb, &ctx)) {
         basic_error("FILE NOT FOUND");
         return;
     }
@@ -2538,8 +2591,16 @@ static void dispatch(char *line)
 #endif
 }
 
+static uint32_t boot_id;
+
+uint32_t m65_boot_id(void)
+{
+    return boot_id;
+}
+
 int main(void)
 {
+    do boot_id = get_rand_32(); while (boot_id == 0);
 #if M65_BOOT_DIAG
     boot_diag_uart_init();
     boot_diag_pin_init();
@@ -2587,6 +2648,9 @@ int main(void)
     char line[256];
     for (;;) {
         bootsel_button_poll();
+        // Watch the write-enable button all the time: otherwise a press only
+        // counts if something happens to ask about the grant while it is held
+        write_gate_refresh_from_pin();
         if (uart_cmd_read_line(line, sizeof line)) {
             dispatch(line);
             continue;

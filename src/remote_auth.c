@@ -354,6 +354,16 @@ static bool parse_global(remote_auth_config_t *cfg, char *line)
     return false;
 }
 
+bool remote_auth_config_present(void)
+{
+    storage_file_t f = {0};
+    if (storage_open(&f, REMOTE_CONFIG_PATH) || storage_open(&f, REMOTE_CONFIG_LEGACY_PATH)) {
+        storage_close(&f);
+        return true;
+    }
+    return false;
+}
+
 bool remote_auth_load(remote_auth_config_t *cfg, char *err, size_t err_len)
 {
     remote_auth_reset(cfg);

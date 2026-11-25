@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,22 @@ import m65j
 CATALOGUE = "https://example.invalid/catalogue.html"
 FILE_ID = "12345678-1234-1234-1234-123456789abc"
 ARCHIVE_URL = "https://example.invalid/cores.zip"
+
+
+RP2040_FAMILY = 0xE48BFF56
+RP2350_ARM_S_FAMILY = 0xE48BFF59
+
+
+def uf2_payload(*families):
+    """A minimal UF2 image: one 256-byte block per chip family."""
+    blocks = []
+    for n, family in enumerate(families):
+        header = struct.pack("<8I", 0x0A324655, 0x9E5D5157, 0x2000, 0x10000000,
+                             256, n, len(families), family)
+        block = header + bytes([n + 1]) * 256
+        block += bytes(512 - 4 - len(block)) + struct.pack("<I", 0x0AB16F30)
+        blocks.append(block)
+    return b"".join(blocks)
 
 
 def cor_payload(board):
@@ -135,7 +152,7 @@ class MirrorTests(unittest.TestCase):
         self.extra = self.root / "bonus.bit"
         self.extra.write_bytes(b"extra bitstream")
         self.firmware = self.root / "firmware.uf2"
-        self.firmware.write_bytes(b"firmware payload")
+        self.firmware.write_bytes(uf2_payload(RP2040_FAMILY))
         self.theme = self.root / "default.m65jtheme"
         self.theme.write_bytes(b"theme payload")
         self.resources = {
@@ -192,6 +209,27 @@ class MirrorTests(unittest.TestCase):
             self.assertEqual(transfer_hash, hashlib.sha256(transfer).hexdigest())
             self.assertEqual(payload_hash, hashlib.sha256(m65j.strip_signature_trailer(transfer)).hexdigest())
         return rows
+
+    def test_mirror_publishes_universal_firmware_as_extended_row(self):
+        universal = self.root / "universal.uf2"
+        universal.write_bytes(uf2_payload(RP2040_FAMILY, RP2350_ARM_S_FAMILY))
+        self.assertEqual(self.mirror("--firmware-universal", str(universal)), 0)
+        self.assertEqual((self.output / m65j.PUBLIC_UNIVERSAL_FIRMWARE_FILENAME).read_bytes(),
+                         universal.read_bytes())
+        text = (self.output / "stable-r6.sha256").read_text()
+        extended = [line for line in text.splitlines() if line.startswith(m65j.MANIFEST_EXTENDED_PREFIX)]
+        self.assertEqual(len(extended), 1)
+        self.assertIn(m65j.OTA_UNIVERSAL_FIRMWARE_FILENAME, extended[0])
+        # Older firmware treats the row as a comment, so it must not appear as a normal row.
+        self.assert_manifest(6)
+
+    def test_mirror_rejects_mismatched_firmware_chip_counts(self):
+        multi = self.root / "multi.uf2"
+        multi.write_bytes(uf2_payload(RP2040_FAMILY, RP2350_ARM_S_FAMILY))
+        with self.assertRaises(SystemExit):
+            self.run_cli(["mirror", "stable", str(self.output), CATALOGUE, "--board", "r6", "--firmware", str(multi)])
+        with self.assertRaises(SystemExit):
+            self.mirror("--firmware-universal", str(self.firmware))
 
     def test_mirror_builds_board_specific_manifests_and_sd_bundles(self):
         self.assertEqual(self.mirror(), 0)

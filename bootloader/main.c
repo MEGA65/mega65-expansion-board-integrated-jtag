@@ -10,6 +10,8 @@
 #include "pico/bootrom.h"
 #include "pico/stdlib.h"
 
+#include "boot.h"
+
 #ifndef M65_BOOTLOADER_SLOT0_OFFSET
 #define M65_BOOTLOADER_SLOT0_OFFSET 0x10000u
 #endif
@@ -18,7 +20,6 @@
 #define M65_BOOTLOADER_SLOT_SIZE 0xF0000u
 #endif
 
-#define XIP_BASE_ADDR 0x10000000u
 #define SRAM_BASE_ADDR 0x20000000u
 #define SRAM_END_ADDR  SRAM_END          /* from the SDK: 0x20042000 on RP2040, 0x20082000 on RP2350 */
 #if PICO_RP2040
@@ -45,11 +46,6 @@
 #define M65_BOOT_DIAG_PIN 255u
 #endif
 #endif
-
-static inline uint32_t slot0_base(void)
-{
-    return XIP_BASE_ADDR + (uint32_t)M65_BOOTLOADER_SLOT0_OFFSET;
-}
 
 static bool in_range(uint32_t value, uint32_t base, uint32_t len)
 {
@@ -79,7 +75,7 @@ static void diag_init(void)
 #endif
 }
 
-static void diag_puts(const char *s)
+void diag_puts(const char *s)
 {
 #if M65_BOOT_DIAG
     uart_puts(DIAG_UART_ID, s);
@@ -116,7 +112,7 @@ static void diag_vectors(uint32_t initial_sp, uint32_t reset)
 #endif
 }
 
-static void diag_stage(unsigned stage, const char *label)
+void diag_stage(unsigned stage, const char *label)
 {
 #if M65_BOOT_DIAG
     uart_puts(DIAG_UART_ID, "M65BOOT ");
@@ -140,9 +136,12 @@ static void diag_stage(unsigned stage, const char *label)
 #endif
 }
 
-static bool slot_vectors_look_valid(uint32_t slot_base)
+// image_base: where the image sits now; link_base: where it is linked to run.
+// A staged image in slot 1 is linked for slot 0, so its reset vector points
+// into slot 0 even though it is read from slot 1.
+bool image_vectors_look_valid(uint32_t image_base, uint32_t link_base)
 {
-    const uint32_t *vectors = (const uint32_t *)(slot_base + PICO_BOOT2_LEN);
+    const uint32_t *vectors = (const uint32_t *)(image_base + PICO_BOOT2_LEN);
     uint32_t initial_sp = vectors[0];
     uint32_t reset = vectors[1];
 
@@ -151,7 +150,12 @@ static bool slot_vectors_look_valid(uint32_t slot_base)
     if ((reset & 0x1u) == 0) return false;
 
     uint32_t reset_addr = reset & ~0x1u;
-    return in_range(reset_addr, slot_base, (uint32_t)M65_BOOTLOADER_SLOT_SIZE);
+    return in_range(reset_addr, link_base, (uint32_t)M65_BOOTLOADER_SLOT_SIZE);
+}
+
+static bool slot_vectors_look_valid(uint32_t slot_base)
+{
+    return image_vectors_look_valid(slot_base, slot_base);
 }
 
 __attribute__((noreturn))
@@ -199,39 +203,14 @@ static void reboot_to_slot(uint32_t slot_base)
     }
 }
 
-static void do_ota_update(void)
-{
-    diag_stage(4, "ota-start");
-    uint32_t slot1_offset = M65_BOOTLOADER_SLOT0_OFFSET + M65_BOOTLOADER_SLOT_SIZE;
-    uint32_t slot0_offset = M65_BOOTLOADER_SLOT0_OFFSET;
-
-    uint32_t ints = save_and_disable_interrupts();
-
-    // Erase slot 0
-    for (uint32_t offset = 0; offset < M65_BOOTLOADER_SLOT_SIZE; offset += FLASH_SECTOR_SIZE) {
-        flash_range_erase(slot0_offset + offset, FLASH_SECTOR_SIZE);
-    }
-
-    // Copy slot 1 to slot 0
-    uint8_t page_buf[FLASH_PAGE_SIZE];
-    for (uint32_t offset = 0; offset < M65_BOOTLOADER_SLOT_SIZE; offset += FLASH_PAGE_SIZE) {
-        memcpy(page_buf, (void*)(XIP_BASE_ADDR + slot1_offset + offset), FLASH_PAGE_SIZE);
-        flash_range_program(slot0_offset + offset, page_buf, FLASH_PAGE_SIZE);
-    }
-
-    restore_interrupts(ints);
-    diag_stage(5, "ota-done");
-}
-
 int main(void)
 {
     diag_init();
     diag_stage(1, "start");
 
-    if (watchdog_hw->scratch[2] == 0x07A07A07) {
-        watchdog_hw->scratch[2] = 0;
-        do_ota_update();
-    }
+    bool legacy = watchdog_hw->scratch[2] == M65_OTA_LEGACY_SCRATCH_MAGIC;
+    watchdog_hw->scratch[2] = 0;
+    ota_boot_check(legacy);
 
     uint32_t slot = slot0_base();
     if (slot_vectors_look_valid(slot)) {
